@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Shared AIDL contract between HamelinPortsImsService (client) and the
+// per-device modem-bridge service (server). The bridge encapsulates
+// vendor-proprietary modem co-ordination that AOSP IRadioIms does
+// not model.
+//
+// Each device that needs a bridge ships its own implementing service
+// under its device tree. HamelinPortsImsService is unchanged across
+// devices.
+//
+// Lives inside the HamelinPortsImsService repo because the IMS service is
+// the spec owner of this contract; per-device bridges reference it
+// cross-repo via `static_libs: ["hamelinports-ims-aidl"]`.
+//
+// Not an aidl_interface (no VINTF stability needed — same UID both
+// sides, platform certificate). Plain java_library that compiles the
+// AIDL stubs for both consumers.
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+java_library {
+    name: "hamelinports-ims-aidl",
+    srcs: ["org/hamelinports/ims/modem/*.aidl"],
+    sdk_version: "system_current",
+    installable: false,
+}
