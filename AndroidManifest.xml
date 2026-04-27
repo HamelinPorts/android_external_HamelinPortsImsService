@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.hamelinports.ims"
+    android:sharedUserId="android.uid.system">
+
+    <uses-permission android:name="android.permission.CONNECTIVITY_USE_RESTRICTED_NETWORKS"/>
+    <uses-permission android:name="android.permission.READ_PHONE_STATE"/>
+    <uses-permission android:name="android.permission.READ_PRIVILEGED_PHONE_STATE"/>
+    <!-- SrvccStateListener requires READ_PRECISE_PHONE_STATE (@SystemApi,
+         signature|privileged). Needed for HamelinPortsMmTelFeature to watch
+         LTE→GSM/UMTS single-radio handover transitions on the active
+         IMS call. -->
+    <uses-permission android:name="android.permission.READ_PRECISE_PHONE_STATE"/>
+    <uses-permission android:name="android.permission.MODIFY_PHONE_STATE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"/>
+    <uses-permission android:name="android.permission.BIND_IMS_SERVICE"/>
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <!-- Media engine: mic capture for the MMTel audio TX leg and
+         audio-routing tweaks (speaker/in-call stream) for RX. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+    <!-- Bind to ImsMediaService (com.android.telephony.imsmedia).
+         signature|privileged — we qualify via platform-signed priv-app. -->
+    <uses-permission android:name="com.android.telephony.permission.USE_IMSMEDIA"/>
+
+    <application
+        android:label="HamelinPortsImsService"
+        android:allowBackup="false"
+        android:directBootAware="true"
+        android:persistent="true">
+
+        <service
+            android:name=".HamelinPortsImsService"
+            android:exported="true"
+            android:directBootAware="true"
+            android:permission="android.permission.BIND_IMS_SERVICE">
+            <intent-filter>
+                <action android:name="android.telephony.ims.ImsService"/>
+            </intent-filter>
+        </service>
+
+        <!-- Self-bootstrap for ImsResolver binding chain. See
+             ImsResolverKickReceiver for the rationale. -->
+        <receiver
+            android:name=".ImsResolverKickReceiver"
+            android:exported="true"
+            android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED"/>
+            </intent-filter>
+        </receiver>
+
+    </application>
+</manifest>

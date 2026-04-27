@@ -1,0 +1,90 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+android_app {
+    name: "HamelinPortsImsService",
+    srcs: ["src/**/*.java"],
+    asset_dirs: ["assets"],
+    manifest: "AndroidManifest.xml",
+    platform_apis: true,
+    certificate: "platform",
+    privileged: true,
+    jni_libs: ["libhamelinports_ims_jni"],
+    use_embedded_native_libs: true,
+    /* ImsMediaFramework is an android_library (not an SDK jar) that
+     * exports android.telephony.imsmedia.*; static_libs pulls the
+     * classes into our APK so HamelinPortsImsMediaSession can link them. */
+    static_libs: [
+        "ImsMediaFramework",
+        "hamelinports-ims-aidl",
+    ],
+    required: ["privapp-permissions-org.hamelinports.ims"],
+    optimize: {
+        enabled: false,
+    },
+}
+
+// Native bridge into reSIProcate. Scaffolding — the Java SipClient
+// still handles all real traffic. See jni/hamelinports_ims_jni.cpp.
+cc_library_shared {
+    name: "libhamelinports_ims_jni",
+    srcs: ["jni/hamelinports_ims_jni.cpp"],
+    cppflags: [
+        "-std=gnu++17",
+        "-fexceptions",
+    ],
+    cflags: [
+        // Pulling in reSIProcate headers triggers a blob of upstream
+        // style warnings that AOSP turns into errors. Quiet them for
+        // this consumer without poking each header.
+        "-Wno-error=non-virtual-dtor",
+        "-Wno-non-virtual-dtor",
+        "-Wno-ignored-qualifiers",
+        "-Wno-unused-parameter",
+        "-Wno-unused-variable",
+    ],
+    rtti: true,
+
+    // whole_static_libs pulls dum → stack → rutil transitively. Listing
+    // the other two here would double-link and cause duplicate symbols.
+    whole_static_libs: [
+        "libresip_dum",
+    ],
+    static_libs: [
+        "libcares",
+    ],
+    shared_libs: [
+        "liblog",
+        "libssl",
+        "libcrypto",
+    ],
+
+    stl: "c++_shared",
+}
+
+cc_binary {
+    name: "ims_ipsec_setup",
+    srcs: ["ims_oemipc/ims_ipsec_setup.c"],
+    cflags: ["-Wall"],
+}
+
+cc_binary {
+    name: "ims_xfrm",
+    srcs: ["ims_xfrm/ims_xfrm.c"],
+    cflags: ["-Wall", "-Werror"],
+    init_rc: ["ims_xfrm.rc"],
+}
+
+prebuilt_etc {
+    name: "privapp-permissions-org.hamelinports.ims",
+    filename: "privapp-permissions-org.hamelinports.ims.xml",
+    src: "privapp-permissions-org.hamelinports.ims.xml",
+    sub_dir: "permissions",
+}
+
+cc_binary {
+    name: "portS_test",
+    srcs: ["ims_oemipc/portS_test.c"],
+    cflags: ["-Wall"],
+}
