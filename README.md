@@ -20,6 +20,8 @@ Telefónica DE:
 - MO + MT VoLTE calls with AMR-WB audio (via `imsmedia`)
 - MO + MT SMS over SIP MESSAGE
 - MMTel video (H.264 Constrained Baseline)
+- VoWiFi (ePDG) — MO + MT calls and mid-call cellular ↔ Wi-Fi
+  handover (audio preserved by carrier IP continuity)
 - 5xx REGISTER refresh handling per RFC 3261 §21.5.4 / §20.33
 - IMS PDN onLost recovery (re-REGISTER on LTE return)
 
@@ -27,7 +29,6 @@ Not yet:
 
 - SRVCC (handler exists; modem doesn't yet drive the dispatch — see
   [project_srvcc_not_wired memory][1])
-- WiFi calling (ePDG)
 
 ## Layout
 
