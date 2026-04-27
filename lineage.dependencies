@@ -1,0 +1,14 @@
+[
+    {
+        "repository": "android_external_resiprocate",
+        "target_path": "external/resiprocate",
+        "remote": "hamelinports",
+        "branch": "lineage-23.2"
+    },
+    {
+        "repository": "android_external_c-ares",
+        "target_path": "external/c-ares",
+        "remote": "hamelinports",
+        "branch": "lineage-23.2"
+    }
+]
