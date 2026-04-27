@@ -1,0 +1,26 @@
+# SELinux policy for ims_xfrm helper binary.
+type ims_xfrm, domain, coredomain;
+type ims_xfrm_exec, system_file_type, exec_type, file_type;
+
+init_daemon_domain(ims_xfrm)
+
+# Properties: reads lineage.ims.xfrm.* set by HamelinPortsImsService
+# (system_app via lineage_ims_prop) to configure the helper.
+get_prop(ims_xfrm, lineage_ims_prop)
+
+# Capabilities: root uid + network admin
+allow ims_xfrm self:capability { setuid net_admin };
+
+# xfrm netlink
+allow ims_xfrm self:netlink_xfrm_socket { create read write nlmsg_write getattr setattr setopt bind };
+# `ip` uses rtnetlink to resolve address/link info before xfrm ops.
+# `setopt` covers setsockopt(SOL_NETLINK, NETLINK_EXT_ACK, ...) which
+# recent iproute2 sets on every netlink socket for better error diagnostics;
+# without it `ip xfrm policy add` exits non-zero before installing anything.
+allow ims_xfrm self:netlink_route_socket { create read write nlmsg_read nlmsg_write getattr setattr setopt bind };
+
+# Execute /system/bin/ip (labeled system_file on this device)
+allow ims_xfrm system_file:file { read open execute execute_no_trans getattr map };
+
+# Process
+allow ims_xfrm self:process { fork };

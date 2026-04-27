@@ -1,0 +1,12 @@
+# SELinux policy for the HamelinPorts IRadioIms ack-only stub. Used on
+# devices whose vendor RIL doesn't expose IRadioIms — see
+# radio-ims-shim/hamelinports-ims-shim.mk.
+
+type hal_radio_ims_shim, domain;
+type hal_radio_ims_shim_exec, exec_type, vendor_file_type, file_type;
+
+init_daemon_domain(hal_radio_ims_shim)
+
+# Grants the hal_telephony_server attribute, binder_call to/from client,
+# and add_service permission on hal_radio_service (where IRadioIms lives).
+hal_server_domain(hal_radio_ims_shim, hal_telephony)

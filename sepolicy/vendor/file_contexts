@@ -1,0 +1,1 @@
+/(vendor|system/vendor)/bin/hw/android\.hardware\.radio\.ims-service\.hamelinports_shim  u:object_r:hal_radio_ims_shim_exec:s0

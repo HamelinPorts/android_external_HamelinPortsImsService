@@ -1,0 +1,8 @@
+# Type for the lineage.ims.* property namespace (HamelinPortsImsService →
+# init root-helper triggers).
+#
+# Declared in the public dir so vendor-side domains (e.g. ims_oemipc,
+# which runs from /vendor/bin/) can reference the type. Access
+# control rules — "only system_app writes it" — live in
+# private/lineage_ims_prop.te.
+system_public_prop(lineage_ims_prop)

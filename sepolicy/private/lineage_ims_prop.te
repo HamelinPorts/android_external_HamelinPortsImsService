@@ -1,0 +1,20 @@
+# Access-control rules for the lineage_ims_prop type. The type itself
+# is declared in public/lineage_ims_prop.te so vendor sepolicy can
+# reference it (ims_oemipc, etc.).
+#
+# Why this namespace exists at all:
+#   The earlier `debug.ims.*` properties mapped to `debug_prop`, which
+#   meant `adb shell setprop`, `dumpsys`, and any app with the broad
+#   debug-prop permission could fire arbitrary IMS xfrm/ipsec/OEM-IPC
+#   commands as root via the init.rc trigger chain — a real privilege
+#   escalation surface. `lineage.ims.*` narrows that to:
+#     - HamelinPortsImsService (system_app, platform-signed) is the
+#       only userspace domain that can SET the values and bump the
+#       trigger.
+#     - init.rc reads them when its property trigger fires (init has
+#       implicit read on all properties).
+#     - Vendor helpers (ims_oemipc) read them via get_prop below.
+#     - Nothing else can write.
+
+# Only HamelinPortsImsService writes these.
+set_prop(system_app, lineage_ims_prop)

@@ -1,0 +1,6 @@
+service vendor.radio-ims-shim /vendor/bin/hw/android.hardware.radio.ims-service.hamelinports_shim
+    class hal
+    user radio
+    group radio
+    capabilities BLOCK_SUSPEND
+    task_profiles ServiceCapacityLow

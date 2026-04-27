@@ -1,0 +1,3 @@
+# Property namespace for HamelinPortsImsService → init root-helper triggers.
+# See lineage_ims_prop.te for the access-control rationale.
+lineage.ims.            u:object_r:lineage_ims_prop:s0

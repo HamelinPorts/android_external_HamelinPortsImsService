@@ -1,0 +1,50 @@
+# com.android.telephony.imsmedia (the AOSP ImsMediaService) runs in
+# the radio domain. libimsmedia's SocketMonitorThread (the only thread
+# that ever calls recvfrom on the RTP/RTCP sockets) calls
+# IImsMediaThread::SetThreadPriority before entering its select() loop;
+# that resolves to android::requestPriority(...) which has an
+# UNCONDITIONAL infinite retry loop in
+# frameworks/av/media/utils/SchedulingPolicyService.cpp:47-56:
+#
+#   for (;;) {
+#       sp<IBinder> binder = defaultServiceManager()->checkService(
+#                                _scheduling_policy);
+#       if (binder == 0) { sleep(1); continue; }
+#       ...
+#   }
+#
+# The asynchronous=true flag does NOT short-circuit this loop. So if
+# `radio` cannot find scheduling_policy_service, SocketMonitorThread
+# loops forever in sleep(1), never reaches select(), never reads from
+# the RTP socket, the kernel rx_queue saturates within seconds, and
+# the remote BYEs the call at ~30s for "no audio".
+#
+# Granting `find` is safe: scheduling_policy_service only honours
+# requestPriority for callers whitelisted by uid in the service
+# itself (system/audio/media/etc.); the worst we expose to radio is
+# a no-op rejection.
+allow radio scheduling_policy_service:service_manager find;
+
+# When HamelinPortsImsService (system_app) passes its RTP/RTCP
+# DatagramSocket FDs to ImsMediaService (radio) via binder
+# (android.telephony.imsmedia.ImsMediaManager.openSession), the
+# kernel tries to dup the FDs into the radio process. SELinux
+# denies radio reading/writing a udp_socket owned by system_app,
+# so the binder transaction aborts with DeadObjectException on
+# the caller side and the openSession never reaches the service.
+# Allow the cross-domain FD transfer for UDP sockets only.
+allow radio system_app:udp_socket { read write getattr getopt setopt };
+
+# libimsmedia shuts down the RTP/RTCP UDP sockets when the audio
+# session ends (ImsMediaSocket::Close via ImsMediaEventHa). The socket
+# file descriptors are owned by HamelinPortsImsService (system_app)
+# and passed across binder to imsmedia (radio) via openSession.
+# Without this rule, the teardown path hits:
+#   avc: denied { shutdown } for comm="ImsMediaEventHa"
+#       scontext=u:r:radio:s0 tcontext=u:r:system_app:s0
+#       tclass=udp_socket
+# which leaves the socket half-closed and logs noise on every call
+# end. Shutdown is cosmetic (file is still closed after unbind) but
+# the denial also prevents the graceful FIN and can matter for
+# future call paths we haven't tested.
+allow radio system_app:udp_socket shutdown;
