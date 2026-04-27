@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- IMS voice on devices that inherit hamelinports-ims.mk is handled
+         entirely in userspace (HamelinPortsImsService driving the AOSP
+         android.telephony.imsmedia service). There is no vendor-side
+         HAL doing modem audio mixing for the IMS path, so Telecom must
+         pick MODE_IN_COMMUNICATION (VOIP) rather than the default
+         MODE_IN_CALL. The latter routes audio to a "voice_call" device
+         that on these devices does not exist — call connects via SIP
+         INVITE but the user hears silence.
+
+         Setting config_use_voip_mode_for_ims=true makes
+         ImsPhoneConnection flag in-progress IMS calls as VOIP, so
+         CallAudioModeStateMachine enters its FOREGROUND_VOIP_MODE
+         branch and imsmedia's AudioRecord/AudioTrack route through
+         the regular mic/speaker path.
+
+         Devices that one day pair HamelinPortsImsService with a real
+         vendor IMS audio HAL can override this back to false in their
+         own device-tree overlay. -->
+    <bool name="config_use_voip_mode_for_ims">true</bool>
+
+    <!-- Bind AOSP's QualifiedNetworksService so AccessNetworksManager
+         actually evaluates WWAN-vs-WLAN per APN type. Without a QNS
+         bound the framework defaults every IMS request to WWAN and
+         IwlanDataService is never asked to bring up a tunnel — Wi-Fi
+         Calling cannot activate regardless of carrier-config or user-
+         pref state. The QualifiedNetworksService PRODUCT_PACKAGE in
+         hamelinports-ims.mk ships the APK that this string targets.
+         Carriers can still override per-sub via
+         KEY_CARRIER_QUALIFIED_NETWORKS_SERVICE_PACKAGE_OVERRIDE_STRING. -->
+    <string name="config_qualified_networks_service_package" translatable="false">com.android.telephony.qns</string>
+
+    <!-- Bind AOSP's Iwlan APK as the WLAN-side data-call + network-state
+         provider. The framework reads these two strings to discover the
+         IwlanDataService (setupDataCall over IKEv2/IPsec to the carrier
+         ePDG) and the IwlanNetworkService (which feeds WLAN coverage /
+         signal info back to QNS so it can do handover-policy checks).
+         Both default to empty in AOSP and have no carrier-config
+         counterpart for the data-service path that's reachable without
+         a full custom CarrierConfigService. Carriers can still override
+         per-sub via KEY_CARRIER_{DATA,NETWORK}_SERVICE_WLAN_PACKAGE_
+         OVERRIDE_STRING. -->
+    <string name="config_wlan_data_service_package" translatable="false">com.google.android.iwlan</string>
+    <string name="config_wlan_network_service_package" translatable="false">com.google.android.iwlan</string>
+
+</resources>
