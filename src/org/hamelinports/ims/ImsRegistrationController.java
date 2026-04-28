@@ -338,7 +338,23 @@ public class ImsRegistrationController {
         if (mRunning) return;
         mRunning = true;
         Log.i(TAG, "start: requesting IMS PDN");
+        if (!requestImsNetwork()) {
+            mRunning = false;
+            return;
+        }
+        registerImsPdnWatchdog();
+    }
 
+    /** Build + register the IMS NetworkCallback. Idempotent — if a
+     *  prior callback is registered, unregister it first. The watchdog
+     *  uses this to force the framework to re-evaluate after a wedged
+     *  IMS PDN handover; the fresh request kicks DataNetworkController
+     *  into bringing up either WWAN or ePDG, whichever is available. */
+    private boolean requestImsNetwork() {
+        if (mNetCallback != null) {
+            try { mCm.unregisterNetworkCallback(mNetCallback); } catch (Exception e) {}
+            mNetCallback = null;
+        }
         NetworkRequest req = new NetworkRequest.Builder()
                 .addCapability(NetworkCapabilities.NET_CAPABILITY_IMS)
                 .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
@@ -434,12 +450,12 @@ public class ImsRegistrationController {
 
         try {
             mCm.requestNetwork(req, mNetCallback);
+            return true;
         } catch (Exception e) {
             Log.e(TAG, "requestNetwork failed", e);
-            mRunning = false;
+            mNetCallback = null;
+            return false;
         }
-
-        registerImsPdnWatchdog();
     }
 
     private void registerImsPdnWatchdog() {
@@ -606,6 +622,15 @@ public class ImsRegistrationController {
         mTrialTornDown = false;
         mPcscfAttempt = 0;
         mRegRetryCount = 0;
+        /* Re-request the IMS network. Tearing down our callback alone
+         * isn't enough — the framework's DataNetworkController also
+         * needs the kick to re-evaluate which transport (WWAN if cell
+         * recovers, WLAN/ePDG if WFC enabled in airplane) it should
+         * try to bring up. Empirically the unregister+requestNetwork
+         * cycle is what unwedges a stuck handover. */
+        if (mRunning) {
+            requestImsNetwork();
+        }
     };
 
     /** Long-tail recovery after a hard dereg. Resets the trial latches
