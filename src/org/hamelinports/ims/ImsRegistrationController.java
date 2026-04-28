@@ -212,6 +212,15 @@ public class ImsRegistrationController {
      *  because the trial-latches stay closed until a network event
      *  resets them — none of which fire on idle. */
     private static final long REG_LONG_TAIL_RETRY_MS = 30 * 60 * 1000L;
+    /** Watchdog: if the IMS APN's PreciseDataConnectionState stays
+     *  non-CONNECTED on every transport for this long, force a
+     *  controller teardown. Catches the framework wedge where a
+     *  WWAN↔WLAN handover collides with a radio-state transition
+     *  (e.g. airplane-mode toggle mid-handover) and leaves the IMS
+     *  PDN stuck — NetworkAgent reports half-alive, onLost never
+     *  fires, our binding sits on a dead bearer until the next
+     *  refresh tick (~30 min) would otherwise notice. */
+    private static final long IMS_PDN_WATCHDOG_MS = 15_000L;
 
     /** True while a 5xx-retry or long-tail-retry runnable is mid-execution
      *  (HamelinPortsSipStack stopped, fresh REGISTER cycle in flight).
@@ -429,12 +438,83 @@ public class ImsRegistrationController {
             Log.e(TAG, "requestNetwork failed", e);
             mRunning = false;
         }
+
+        registerImsPdnWatchdog();
+    }
+
+    private void registerImsPdnWatchdog() {
+        android.telephony.TelephonyManager tm =
+                mContext.getSystemService(android.telephony.TelephonyManager.class);
+        if (tm == null) return;
+        int subId = android.telephony.SubscriptionManager
+                .getSubscriptionId(mSlotId);
+        if (!android.telephony.SubscriptionManager.isValidSubscriptionId(subId)) {
+            return;
+        }
+        mTelCallback = new ImsPdnWatchdogCallback();
+        try {
+            tm.createForSubscriptionId(subId).registerTelephonyCallback(
+                    mRefreshHandler::post, mTelCallback);
+            Log.i(TAG, "IMS PDN watchdog registered for subId=" + subId);
+        } catch (Exception e) {
+            Log.w(TAG, "registerTelephonyCallback failed", e);
+            mTelCallback = null;
+        }
+    }
+
+    private final class ImsPdnWatchdogCallback
+            extends android.telephony.TelephonyCallback
+            implements android.telephony.TelephonyCallback.PreciseDataConnectionStateListener {
+        @Override public void onPreciseDataConnectionStateChanged(
+                android.telephony.PreciseDataConnectionState s) {
+            onImsPdnState(s);
+        }
+    }
+
+    private void onImsPdnState(android.telephony.PreciseDataConnectionState s) {
+        android.telephony.data.ApnSetting apn = s.getApnSetting();
+        if (apn == null) return;
+        if ((apn.getApnTypeBitmask()
+                & android.telephony.data.ApnSetting.TYPE_IMS) == 0) {
+            return;
+        }
+        int t = s.getTransportType();
+        int st = s.getState();
+        if (t == android.telephony.AccessNetworkConstants.TRANSPORT_TYPE_WWAN) {
+            mLastWwanImsState = st;
+        } else if (t == android.telephony.AccessNetworkConstants.TRANSPORT_TYPE_WLAN) {
+            mLastWlanImsState = st;
+        }
+        boolean anyHealthy =
+                mLastWwanImsState == android.telephony.TelephonyManager.DATA_CONNECTED
+             || mLastWlanImsState == android.telephony.TelephonyManager.DATA_CONNECTED;
+        if (anyHealthy) {
+            if (mImsPdnWatchdogArmed) {
+                mRefreshHandler.removeCallbacks(mImsPdnWatchdogRunnable);
+                mImsPdnWatchdogArmed = false;
+            }
+        } else if (!mImsPdnWatchdogArmed) {
+            mImsPdnWatchdogArmed = true;
+            mRefreshHandler.postDelayed(
+                    mImsPdnWatchdogRunnable, IMS_PDN_WATCHDOG_MS);
+        }
     }
 
     void stop() {
         mRunning = false;
         mRefreshHandler.removeCallbacks(mRefreshRunnable);
         mRefreshHandler.removeCallbacks(mLongTailRetryRunnable);
+        mRefreshHandler.removeCallbacks(mImsPdnWatchdogRunnable);
+        if (mTelCallback != null) {
+            try {
+                android.telephony.TelephonyManager tm =
+                        mContext.getSystemService(android.telephony.TelephonyManager.class);
+                if (tm != null) tm.unregisterTelephonyCallback(mTelCallback);
+            } catch (Exception e) {
+                Log.w(TAG, "unregisterTelephonyCallback failed", e);
+            }
+            mTelCallback = null;
+        }
         if (mNetCallback != null) {
             try { mCm.unregisterNetworkCallback(mNetCallback); } catch (Exception e) {}
             mNetCallback = null;
@@ -498,6 +578,35 @@ public class ImsRegistrationController {
         }
         try { mCm.bindProcessToNetwork(null); } catch (Exception e) {}
     }
+
+    /** TelephonyCallback watching the IMS APN's PreciseDataConnectionState
+     *  on both transports. {@code mImsPdnWatchdogRunnable} fires when both
+     *  transports stay non-CONNECTED for {@link #IMS_PDN_WATCHDOG_MS}. */
+    private android.telephony.TelephonyCallback mTelCallback;
+    private int mLastWwanImsState = android.telephony.TelephonyManager.DATA_DISCONNECTED;
+    private int mLastWlanImsState = android.telephony.TelephonyManager.DATA_DISCONNECTED;
+    private boolean mImsPdnWatchdogArmed = false;
+
+    private final Runnable mImsPdnWatchdogRunnable = () -> {
+        mImsPdnWatchdogArmed = false;
+        Log.w(TAG, "IMS PDN stuck non-CONNECTED on both transports for "
+                + (IMS_PDN_WATCHDOG_MS / 1000) + " s — forcing teardown so "
+                + "the next onLinkPropertiesChanged (WWAN return or fresh "
+                + "ePDG bring-up) re-arms REGISTER");
+        mImsNetwork = null;
+        mPcscfs = null;
+        /* Drop any pending 5xx-retry / long-tail / refresh runnables so
+         * they don't fire after the watchdog-driven recovery completes.
+         * Refresh re-schedules on next onRegistered; long-tail rearms on
+         * the next hard dereg; 5xx retry is one-shot. SMS deferred queue
+         * lives in mDeferredOnRegister, not on this handler — survives. */
+        mRefreshHandler.removeCallbacksAndMessages(null);
+        tearDown();
+        mTrialAttempted = false;
+        mTrialTornDown = false;
+        mPcscfAttempt = 0;
+        mRegRetryCount = 0;
+    };
 
     /** Long-tail recovery after a hard dereg. Resets the trial latches
      *  and re-attempts REGISTER from cold. Idempotent — if we're already
