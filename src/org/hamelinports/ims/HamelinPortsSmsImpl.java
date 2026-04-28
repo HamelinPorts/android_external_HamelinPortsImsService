@@ -156,6 +156,20 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
                 + " format=" + format + " pduLen=" + pdu.length);
 
         if (!mRegController.isRegistered()) {
+            if (mRegController.isRetryInFlight()) {
+                /* Stack is being rebuilt mid-5xx-retry (~1-2 s window
+                 * per refresh cycle). Defer rather than fail — the
+                 * rebuild's onRegistered drains us and we re-call. */
+                Log.i(TAG, "sendSms token=" + token
+                        + ": retry in flight, deferring until REGISTER completes");
+                final int fToken = token, fMessageRef = messageRef;
+                final String fFormat = format, fSmsc = smsc;
+                final boolean fIsRetry = isRetry;
+                final byte[] fPdu = pdu;
+                mRegController.runOnNextRegister(() ->
+                        sendSms(fToken, fMessageRef, fFormat, fSmsc, fIsRetry, fPdu));
+                return;
+            }
             Log.e(TAG, "sendSms: not registered");
             onSendSmsResultError(token, messageRef, SEND_STATUS_ERROR,
                     SmsManager.RESULT_ERROR_GENERIC_FAILURE, 0);
