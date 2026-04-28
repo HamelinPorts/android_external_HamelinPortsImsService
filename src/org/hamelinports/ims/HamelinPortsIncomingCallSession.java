@@ -404,7 +404,7 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
                         + mSavedAudioMode + " → MODE_IN_COMMUNICATION");
             }
         } catch (Exception e) {
-            Log.w(TAG, "MT setMode(IN_CALL) failed", e);
+            Log.w(TAG, "MT setMode(IN_COMMUNICATION) failed", e);
         }
         try {
             mImsMedia = new HamelinPortsImsMediaSession(mRegController.getContext(),
