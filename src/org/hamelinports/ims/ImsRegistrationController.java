@@ -213,6 +213,35 @@ public class ImsRegistrationController {
      *  resets them — none of which fire on idle. */
     private static final long REG_LONG_TAIL_RETRY_MS = 30 * 60 * 1000L;
 
+    /** True while a 5xx-retry or long-tail-retry runnable is mid-execution
+     *  (HamelinPortsSipStack stopped, fresh REGISTER cycle in flight).
+     *  MO callers use this to defer rather than fail with a stack-down
+     *  error — the deferred runnable is dispatched once REGISTER completes
+     *  (or drained on terminal failure, where it sees mRegistered=false
+     *  and falls through to its own error path). */
+    private volatile boolean mRetryInFlight = false;
+    private final java.util.List<Runnable> mDeferredOnRegister =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    public boolean isRetryInFlight() { return mRetryInFlight; }
+
+    /** Queue a one-shot Runnable to fire on the next REGISTER outcome
+     *  (success or terminal failure). Caller's runnable should re-check
+     *  isRegistered() and route to the success or failure path itself. */
+    public void runOnNextRegister(Runnable r) {
+        mDeferredOnRegister.add(r);
+    }
+
+    private void drainDeferredRegisterOps() {
+        if (mDeferredOnRegister.isEmpty()) return;
+        java.util.List<Runnable> drain = new java.util.ArrayList<>(mDeferredOnRegister);
+        mDeferredOnRegister.clear();
+        Log.i(TAG, "draining " + drain.size() + " deferred MO ops");
+        for (Runnable r : drain) {
+            try { r.run(); } catch (Throwable t) { Log.w(TAG, "deferred op threw", t); }
+        }
+    }
+
     private HamelinPortsMmTelFeature mMmTelFeature;
     private HamelinPortsAkaProviderImpl mAkaProvider;
 
@@ -478,6 +507,7 @@ public class ImsRegistrationController {
         if (!mRunning || mRegistered) return;
         Log.i(TAG, "long-tail retry: clearing trial latches and "
                 + "re-attempting REGISTER from cold");
+        mRetryInFlight = true;
         mTrialAttempted = false;
         mTrialTornDown = false;
         mRegRetryCount = 0;
@@ -614,6 +644,11 @@ public class ImsRegistrationController {
                 mRegRetryCount = 0;
                 /* Cancel any pending long-tail recovery — we're back. */
                 mRefreshHandler.removeCallbacks(mLongTailRetryRunnable);
+                /* Retry runnable's stack-rebuild window is over — drain
+                 * any MO ops (sendSms, …) that came in while the stack
+                 * was down. They re-check isRegistered() and dispatch. */
+                mRetryInFlight = false;
+                drainDeferredRegisterOps();
                 mDiag.onRegistered(mNegotiatedExpiresSec);
                 mRegImpl.onRegistered(currentRegistrationTech());
                 if (mMmTelFeature != null) mMmTelFeature.onRegistered();
@@ -718,6 +753,7 @@ public class ImsRegistrationController {
                         mRefreshHandler.postDelayed(() -> {
                             if (!mRunning) return;
                             Log.i(TAG, "5xx retry firing — fresh REGISTER cycle");
+                            mRetryInFlight = true;
                             try { HamelinPortsSipStack.stop(); } catch (Exception e) {}
                             if (mAkaProvider != null) {
                                 try { mAkaProvider.close(); } catch (Exception e) {}
@@ -734,6 +770,12 @@ public class ImsRegistrationController {
                 }
 
                 mAssociatedUri = null;
+                /* Terminal failure — clear retry-in-flight and drain any
+                 * MO ops queued during the rebuild. They re-check
+                 * isRegistered() (now false), see no retry pending, and
+                 * fall through to their own error path. */
+                mRetryInFlight = false;
+                drainDeferredRegisterOps();
                 if (mRegistered) {
                     mRegistered = false;
                     mRegImpl.onDeregistered(new ImsReasonInfo(
