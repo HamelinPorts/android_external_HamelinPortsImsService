@@ -139,17 +139,33 @@ likely ships nothing at all.
 
 ## Porting to a new device
 
-For an AOSP-conformant modem (most modern Qualcomm, MediaTek with
-recent vendor): no bridge needed. `HamelinPortsImsService` runs as-is, the
-no-op bridge stays in place, AOSP `IRadioIms` handles MT routing,
-SRVCC, etc. Add to `device.mk`:
+### Decision tree
+
+```
+Does the device's vendor RIL publish AOSP's android.hardware.radio.ims.IRadioIms?
+├─ Yes (most modern Qualcomm / MediaTek): no bridge needed; AOSP IRadioIms
+│       handles MT routing, SRVCC, etc. NoOpImsModemBridge stays in place.
+└─ No  → does the device run a Samsung-derived RIL (Shannon, secril,
+         secril-on-Unisoc)?
+        ├─ Yes: implement an IImsModemBridge that emits Samsung IIL byte frames
+        │       on top of vendor.samsung.hardware.radio.channel — see "Samsung
+        │       IIL bridge" below; the byte protocol is shared, only transport
+        │       and header size vary per chipset family.
+        └─ No  → write a fully custom bridge against whatever vendor surface
+                 the modem actually exposes (QMI, AT-over-vendor-binder, etc.).
+                 No shared infrastructure helps here.
+```
+
+### AOSP-conformant modems
+
+Drop into `device.mk`:
 
 ```mk
 PRODUCT_PACKAGES += HamelinPortsImsService privapp-permissions-org.hamelinports.ims
 PRODUCT_PROPERTY_OVERRIDES += persist.dbg.volte_avail_ovr=1
 ```
 
-For a device that needs a vendor-proprietary modem-coordination bridge:
+### Custom-bridge devices (non-Samsung, non-AOSP)
 
 1. Create `device/<vendor>/<device>/<Vendor>ImsModemBridge/`.
 2. `static_libs: ["hamelinports-ims-aidl"]` in the bridge's `Android.bp`.
@@ -157,6 +173,120 @@ For a device that needs a vendor-proprietary modem-coordination bridge:
    sendRegistration + sendPreference methods, plus a `Service`
    declaring an `<intent-filter>` for the `BIND_BRIDGE` action.
 4. Add the APK to `device.mk` PRODUCT_PACKAGES.
+
+### Samsung IIL bridge — byte protocol shared, transport varies
+
+All Samsung-RIL devices we've seen route IMS-state notifications to the
+modem through the same opaque "IIL" byte-frame channel, but the binder
+transport that carries the bytes — and the size of the IIL frame header
+itself — differs per chipset family.
+
+**Transport.** Look up the vendor RIL's published service in
+`/vendor/etc/vintf/manifest/vendor.samsung.hardware.sehradio_manifest_*.xml`:
+
+| Stack / chipset family            | Transport      | Service name                                                                  | Java API                                  |
+|-----------------------------------|---------------|--------------------------------------------------------------------------------|--------------------------------------------|
+| Shannon (e.g. Exynos 9611, A51)   | **AIDL**      | `vendor.samsung.hardware.radio.channel.ISehRadioChannel/imsd{,2}`              | `ServiceManager.checkService` + `Parcel`   |
+| Samsung-RIL on Unisoc (e.g. UMS512, gta8) | **HIDL**  | `vendor.samsung.hardware.radio.channel@2.0::ISehChannel/imsd{,2}`              | `HwBinder.getService` + `HwParcel`         |
+
+Both expose the same two functional methods on top of HIDL/AIDL housekeeping:
+
+- `setCallback(ISehChannelCallback)` — transaction code 1 (HIDL: `FIRST_CALL_TRANSACTION`)
+- `send(vec<uint8>)` — transaction code 2
+
+`send()` carries one opaque IIL frame; the modem-side firmware parses
+the bytes inside the proprietary `secril_*` modules.
+
+**IIL frame format.** The frame is `[header] + [body]`, where the header
+size depends on the chipset family:
+
+| Stack family               | Header size | Header layout                                                          |
+|----------------------------|-------------|------------------------------------------------------------------------|
+| Shannon                    | **5 bytes** | `[len_lo, len_hi, mainCmd=0x70, subCmd, cmdType=0x03 EXEC]`            |
+| Samsung-RIL on Unisoc      | **7 bytes** | `[len_lo, len_hi, seq=0, aseq=0, mainCmd=0x70, subCmd, cmdType=0x03]`  |
+
+`len` is total frame length (header + body) as little-endian u16.
+`seq`/`aseq` are unused on uplink (always zero on uplink frames; modem
+uses them for paired req/rsp tracking which we don't need for
+fire-and-forget NOTIs).
+
+**Sub-command bodies are identical** across the two families. The
+load-bearing ones for MT IMS-call routing are:
+
+- `IPC_IIL_REGISTRATION` (sub=0x01, cmdType=3 NOTI), 268-byte body:
+  - `body[0]` LimitedMode (0)
+  - `body[1]` capability flags bitmap (VOLTE 0x01 / SMSIP 0x02 / RCS 0x04 / PSVT 0x08 / CDPN 0x20)
+  - `body[2]` PdnType (0)
+  - `body[3]` FeatureTag bitmap (CS 0x01 / SMSIP 0x02 / VOLTE 0x04 / VIDEO 0x08 / MMTEL 0x10)
+  - `body[4..9]` zeros / Ecmp / EpdgMode / ErrorCode / reserved
+  - `body[10]` IMPU UTF-8 length (max 256)
+  - `body[11..n]` IMPU UTF-8 bytes
+  - `body[0x10B]` RegiRat (`RAT_LTE=14`, `RAT_NR=20`, `RAT_IWLAN=18`)
+- `IPC_IIL_PREFERENCE` (sub=0x06, cmdType=3 NOTI), 14-byte body — VoLTE / VT / SMS-over-IMS preference flags. Recommended on bridge bind to advertise capabilities.
+- `IPC_IIL_CONNECTED` (sub=0x12) — handshake on bridge bind. Not strictly required but stock Samsung sends it.
+
+Everything else (`RETRYOVER`, `SSAC`, `ISIM_LOADED`, `EMC_ATTACH_AUTH`,
+`VONR_USER_STATUS`, `SIP_SUSPEND`) is informational and can be no-op'd
+for first bring-up.
+
+**Implementation pattern.** Two reference implementations live in-tree:
+
+- `device/samsung/a51/SamsungImsModemBridge/` — Shannon AIDL transport, 5-byte IIL header.
+- `device/samsung/gta8/SamsungImsModemBridge/` — Samsung-RIL-on-Unisoc HIDL transport, 7-byte IIL header.
+
+Both share the same `IImsModemBridge.aidl` contract and the same
+sub-command body layouts; they diverge only in the binder transport
+helpers and the `HEADER_LEN`/`TOTAL_LEN` constants. New Samsung-derived
+ports should pick whichever reference matches their chipset family,
+copy it, and bump the framing constants if needed. Once two devices
+have shipped working ports the shared bits are due to be extracted into
+an external repo (see memory note `project_samsung_ims_bridge_shared_repo_question`).
+
+**Sepolicy.** Per-device bridges should bundle their sepolicy files
+next to the bridge source rather than scatter rules across the device
+tree's `sepolicy/` directory. The recommended layout (used by
+gta8's `SamsungImsModemBridge/`):
+
+```
+SamsungImsModemBridge/
+├── BoardConfig.mk              # registers the dirs below
+└── sepolicy/
+    ├── system_ext_public/      # types shared with vendor
+    ├── system_ext/             # platform_app/system_app rules
+    └── vendor/                 # rild ↔ bridge binder round-trip rules
+```
+
+The device `BoardConfig.mk` then `include`s the bridge's `BoardConfig.mk`,
+which appends to `SYSTEM_EXT_PUBLIC_SEPOLICY_DIRS`,
+`SYSTEM_EXT_PRIVATE_SEPOLICY_DIRS`, and `BOARD_VENDOR_SEPOLICY_DIRS`.
+This keeps the bridge self-contained and easier to extract to a
+shared repo later.
+
+Rules needed (in addition to whatever the bridge implementation
+specifically requires):
+
+AIDL transport (Shannon, A51-style):
+
+```
+allow system_app hal_radio_service:service_manager find;
+binder_call(system_app, rild)
+allow rild system_app:binder call;
+```
+
+HIDL transport (Samsung-RIL-on-Unisoc, gta8-style — with the bridge
+running as `platform_app` because `sharedUserId="android.uid.system"`
+silently breaks the AM bind on A16+):
+
+```
+hwbinder_use(platform_app)
+allow platform_app hal_sehradio_channel_hwservice:hwservice_manager find;
+binder_call(platform_app, rild)
+allow rild platform_app:binder call;
+```
+
+The `hal_sehradio_channel_hwservice` type itself must be declared in
+`system_ext_public/` so both the system-side `find` rule and the
+vendor-side `add_hwservice()` see the same type at compile time.
 
 ## Build dependencies
 
