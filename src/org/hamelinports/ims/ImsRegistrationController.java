@@ -206,6 +206,12 @@ public class ImsRegistrationController {
      *  the binding (RFC 3261 §21.5 transient semantics), so MT calls
      *  during the wait may still land via the live binding. */
     private static final int REG_QUIET_RETRY_SEC = 300;
+    /** Long-tail recovery cadence after a hard dereg (cap-exceeded
+     *  Retry-After, retry-budget exhausted, non-5xx terminal error).
+     *  Without this, an idle device on stable network never retries
+     *  because the trial-latches stay closed until a network event
+     *  resets them — none of which fire on idle. */
+    private static final long REG_LONG_TAIL_RETRY_MS = 30 * 60 * 1000L;
 
     private HamelinPortsMmTelFeature mMmTelFeature;
     private HamelinPortsAkaProviderImpl mAkaProvider;
@@ -399,6 +405,7 @@ public class ImsRegistrationController {
     void stop() {
         mRunning = false;
         mRefreshHandler.removeCallbacks(mRefreshRunnable);
+        mRefreshHandler.removeCallbacks(mLongTailRetryRunnable);
         if (mNetCallback != null) {
             try { mCm.unregisterNetworkCallback(mNetCallback); } catch (Exception e) {}
             mNetCallback = null;
@@ -463,6 +470,21 @@ public class ImsRegistrationController {
         try { mCm.bindProcessToNetwork(null); } catch (Exception e) {}
     }
 
+    /** Long-tail recovery after a hard dereg. Resets the trial latches
+     *  and re-attempts REGISTER from cold. Idempotent — if we're already
+     *  registered or stopped, no-op. Re-armed on every hard-dereg event
+     *  so we keep poking at the network until it accepts us back. */
+    private final Runnable mLongTailRetryRunnable = () -> {
+        if (!mRunning || mRegistered) return;
+        Log.i(TAG, "long-tail retry: clearing trial latches and "
+                + "re-attempting REGISTER from cold");
+        mTrialAttempted = false;
+        mTrialTornDown = false;
+        mRegRetryCount = 0;
+        new Thread(() -> attemptRegistration(),
+                "HamelinPortsIms-longtail").start();
+    };
+
     /** Post-trial tear-down. Kills the native stack a couple of seconds
      *  after the terminal outcome so DUM's refresh timer and keepalive
      *  can't keep hitting the network. Idempotent. */
@@ -481,6 +503,15 @@ public class ImsRegistrationController {
                 mAkaProvider = null;
             }
             try { mCm.bindProcessToNetwork(null); } catch (Exception e) {}
+            /* Schedule long-tail recovery. On stable idle network the
+             * trial latches are otherwise only reset by PDN onLost or
+             * iface swap — neither of which fire on a charging device.
+             * Without this, post-failure means dead-until-reboot. */
+            mRefreshHandler.removeCallbacks(mLongTailRetryRunnable);
+            mRefreshHandler.postDelayed(mLongTailRetryRunnable,
+                    REG_LONG_TAIL_RETRY_MS);
+            Log.i(TAG, "long-tail recovery armed at +"
+                    + (REG_LONG_TAIL_RETRY_MS / 1000) + " s");
         }, "HamelinPortsIms-teardown").start();
     }
 
@@ -581,6 +612,8 @@ public class ImsRegistrationController {
                 /* Healthy REGISTER — reset the 5xx retry budget so a
                  * future transient failure gets its full allowance. */
                 mRegRetryCount = 0;
+                /* Cancel any pending long-tail recovery — we're back. */
+                mRefreshHandler.removeCallbacks(mLongTailRetryRunnable);
                 mDiag.onRegistered(mNegotiatedExpiresSec);
                 mRegImpl.onRegistered(currentRegistrationTech());
                 if (mMmTelFeature != null) mMmTelFeature.onRegistered();
