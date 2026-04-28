@@ -192,10 +192,20 @@ public class ImsRegistrationController {
      *  still yields better behaviour than immediate dereg). */
     private static final int REG_DEFAULT_RETRY_SEC = 30;
     private static final int REG_MIN_RETRY_SEC = 5;
-    /** Upper clamp on server-provided Retry-After. Anything longer than
-     *  this is indistinguishable from "server is down"; we prefer to
-     *  fall through to the normal dereg + fresh trial path. */
-    private static final int REG_MAX_RETRY_SEC = 300;
+    /** Sanity cap on server-provided Retry-After. Anything longer than
+     *  this (24 h) is indistinguishable from "server is permanently
+     *  down"; we fall through to the normal dereg + fresh trial path
+     *  and let the next IMS PDN event drive recovery. Inside this cap
+     *  we honour the network-requested wait verbatim per RFC 3261
+     *  §21.5.4 SHOULD-wait-Retry-After — anything else risks the
+     *  P-CSCF treating us as misbehaving and escalating. */
+    private static final int REG_MAX_RETRY_SEC = 86400;
+    /** Threshold above which a long Retry-After is logged as a warning
+     *  for diagnostics. Framework state is NOT touched — IMS stays in
+     *  REGISTERED for the duration; a 503+Retry-After does not destroy
+     *  the binding (RFC 3261 §21.5 transient semantics), so MT calls
+     *  during the wait may still land via the live binding. */
+    private static final int REG_QUIET_RETRY_SEC = 300;
 
     private HamelinPortsMmTelFeature mMmTelFeature;
     private HamelinPortsAkaProviderImpl mAkaProvider;
@@ -641,14 +651,25 @@ public class ImsRegistrationController {
                             ? retryAfterSec : REG_DEFAULT_RETRY_SEC;
                     if (waitSec < REG_MIN_RETRY_SEC) waitSec = REG_MIN_RETRY_SEC;
                     if (waitSec > REG_MAX_RETRY_SEC) {
-                        /* Server asked for longer than we're willing
-                         * to hold MmTel in REGISTERED state without
-                         * actual on-wire confirmation — fall through
-                         * to dereg + normal trial handling. */
+                        /* Pathologically long Retry-After (>24 h) —
+                         * treat as "server is gone", fall through to
+                         * the normal dereg + trial-tear-down path. */
                         Log.w(TAG, "Retry-After=" + retryAfterSec
-                                + " s exceeds cap "
+                                + " s exceeds sanity cap "
                                 + REG_MAX_RETRY_SEC + " — treating as hard dereg");
                     } else {
+                        if (waitSec > REG_QUIET_RETRY_SEC) {
+                            /* Long but reasonable wait. Framework
+                             * stays in REGISTERED — Mavenir's 503
+                             * does not destroy the binding, MT may
+                             * still land. Diagnostic warning only. */
+                            Log.w(TAG, "Retry-After=" + waitSec
+                                    + " s exceeds quiet cap "
+                                    + REG_QUIET_RETRY_SEC
+                                    + " — long wait, framework left"
+                                    + " in REGISTERED while we honour"
+                                    + " the network's hold-off");
+                        }
                         mRegRetryCount++;
                         final int delaySec = waitSec;
                         Log.i(TAG, "5xx on active registration — retry "
