@@ -3,22 +3,42 @@
 
     <!-- IMS voice on devices that inherit hamelinports-ims.mk is handled
          entirely in userspace (HamelinPortsImsService driving the AOSP
-         android.telephony.imsmedia service). There is no vendor-side
-         HAL doing modem audio mixing for the IMS path, so Telecom must
-         pick MODE_IN_COMMUNICATION (VOIP) rather than the default
-         MODE_IN_CALL. The latter routes audio to a "voice_call" device
-         that on these devices does not exist — call connects via SIP
-         INVITE but the user hears silence.
+         android.telephony.imsmedia service via AAudio). There is no
+         vendor-side HAL doing modem audio mixing for the IMS path, so
+         Telecom must pick MODE_IN_COMMUNICATION (VOIP) rather than the
+         default MODE_IN_CALL.
+
+         Empirically verified on Samsung-RIL/Unisoc UMS512 (gta8,
+         2026-04-29 — see test/in-call-mode branch and
+         project_x205_volte_audio_mode_test_pending memory): under
+         MODE_IN_CALL the SPRD audio HAL routes the AAudio capture
+         stream to the cellular CS-voice bearer (the modem voice path).
+         AAudio_open returns no error, the source thread runs, the
+         encoder produces AMR — but the bytes the source delivers are
+         silence because there is no real CS bearer behind our VoIP
+         call. Result: gta8 RX still works (speaker output device is
+         shared across modes) but the *callee* hears silence on every
+         call. The output side is fine; only capture breaks.
 
          Setting config_use_voip_mode_for_ims=true makes
          ImsPhoneConnection flag in-progress IMS calls as VOIP, so
-         CallAudioModeStateMachine enters its FOREGROUND_VOIP_MODE
-         branch and imsmedia's AudioRecord/AudioTrack route through
-         the regular mic/speaker path.
+         CallAudioModeStateMachine enters VoipCallFocusState
+         (MODE_IN_COMMUNICATION) directly on call activation — no
+         brief MODE_IN_CALL window — and imsmedia's AAudio source/sink
+         route through the regular mic/speaker path.
+
+         A second, independent safety net lives in
+         HamelinPortsCallSession.doOutgoingCall and
+         HamelinPortsIncomingCallSession.startMediaEngine: both call
+         am.setMode(MODE_IN_COMMUNICATION) defensively before opening
+         the imsmedia session. Together they cover Telecom races and
+         carrier-config edge cases. Keep both layers unless and until
+         a vendor IMS audio HAL replaces the AAudio path.
 
          Devices that one day pair HamelinPortsImsService with a real
          vendor IMS audio HAL can override this back to false in their
-         own device-tree overlay. -->
+         own device-tree overlay AND remove the defensive setMode in
+         HamelinPortsCallSession / HamelinPortsIncomingCallSession. -->
     <bool name="config_use_voip_mode_for_ims">true</bool>
 
     <!-- Bind AOSP's QualifiedNetworksService so AccessNetworksManager
