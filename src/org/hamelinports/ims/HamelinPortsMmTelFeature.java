@@ -150,6 +150,13 @@ public class HamelinPortsMmTelFeature extends MmTelFeature implements IncomingCa
         ImsCallProfile profile = new ImsCallProfile(
                 ImsCallProfile.SERVICE_TYPE_NORMAL,
                 ImsCallProfile.CALL_TYPE_VOICE);
+        /* Stamp the offered codec onto the profile so the dialer's
+         * "HD" / "HD+" call badge renders correctly when the framework
+         * fires callSessionInitiated after the user accepts. */
+        android.telephony.ims.ImsStreamMediaProfile media = profile.getMediaProfile();
+        if (media != null) {
+            media.mAudioQuality = HamelinPortsCallSession.audioQualityFor(codecName, clockRate);
+        }
         String telUser = extractTelUser(fromUri);
         if (telUser != null) {
             profile.setCallExtra(ImsCallProfile.EXTRA_OI, telUser);
