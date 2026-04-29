@@ -441,6 +441,13 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
                 mRemoteAudio = new RemoteAudio(remoteIp, remoteRtpPort, remoteRtcpPort,
                                                pt, clockRate,
                                                codecName, fmtp);
+                /* Stamp the negotiated codec onto the profile so the
+                 * dialer's "HD" / "HD+" call badge renders correctly
+                 * once callSessionInitiated fires from onConnected. */
+                ImsStreamMediaProfile media = mProfile.getMediaProfile();
+                if (media != null) {
+                    media.mAudioQuality = audioQualityFor(codecName, clockRate);
+                }
                 /* C.4 downgrade path: re-INVITE 200 OK with no video
                  * m-line (or port=0) arrives — audio onAnswer fires
                  * but onAnswerVideo does not. Clear mRemoteVideo and
@@ -858,6 +865,33 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
             case android.telecom.VideoProfile.STATE_PAUSED:        return "PAUSED";
             default:                                                return "?(" + state + ")";
         }
+    }
+
+    /** Map a negotiated audio codec to the corresponding
+     *  {@link ImsStreamMediaProfile} {@code AUDIO_QUALITY_*} constant.
+     *  The dialer's "HD" / "HD+" call badge is gated on this — without
+     *  a non-NONE value the Telecom UI never decorates the active call
+     *  even when the wire is AMR-WB or EVS. Defaults to {@code AMR}
+     *  (8 kHz narrowband) so the badge never falsely promotes; codecs
+     *  we don't recognise stay safe-narrowband. */
+    static int audioQualityFor(String codecName, int clockRate) {
+        if (codecName == null) return ImsStreamMediaProfile.AUDIO_QUALITY_AMR;
+        String c = codecName.trim();
+        if (c.equalsIgnoreCase("AMR-WB") || c.equalsIgnoreCase("AMRWB")) {
+            return ImsStreamMediaProfile.AUDIO_QUALITY_AMR_WB;
+        }
+        if (c.equalsIgnoreCase("AMR")) return ImsStreamMediaProfile.AUDIO_QUALITY_AMR;
+        if (c.equalsIgnoreCase("EVS")) {
+            // EVS uses sample rate to distinguish bandwidths.
+            switch (clockRate) {
+                case 8000:  return ImsStreamMediaProfile.AUDIO_QUALITY_EVS_NB;
+                case 16000: return ImsStreamMediaProfile.AUDIO_QUALITY_EVS_WB;
+                case 32000: return ImsStreamMediaProfile.AUDIO_QUALITY_EVS_SWB;
+                case 48000: return ImsStreamMediaProfile.AUDIO_QUALITY_EVS_FB;
+                default:    return ImsStreamMediaProfile.AUDIO_QUALITY_EVS_WB;
+            }
+        }
+        return ImsStreamMediaProfile.AUDIO_QUALITY_AMR;
     }
 
     /** Translate the profile's call type to imsmedia RtpConfig
