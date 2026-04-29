@@ -170,6 +170,20 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
         return mProfile;
     }
 
+    /** ImsPhoneConnection's HD-badge logic reads from the local /
+     *  remote profile getters, not getCallProfile. Without overriding
+     *  these, audioQuality stamped on mProfile is invisible to the
+     *  framework's PROPERTY_HIGH_DEF_AUDIO computation. */
+    @Override
+    public ImsCallProfile getLocalCallProfile() {
+        return mProfile;
+    }
+
+    @Override
+    public ImsCallProfile getRemoteCallProfile() {
+        return mProfile;
+    }
+
     @Override
     public void accept(int callType, ImsStreamMediaProfile profile) {
         Log.i(TAG, "MT accept callType=" + callType + " callId=" + mCallId);
