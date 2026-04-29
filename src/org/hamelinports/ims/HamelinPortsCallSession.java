@@ -196,6 +196,25 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
         return mProfile;
     }
 
+    /** ImsPhoneConnection.updateMediaCapabilities reads the audio
+     *  quality from the LOCAL profile (not the main getCallProfile)
+     *  to set Connection#PROPERTY_HIGH_DEF_AUDIO. Default returns
+     *  null, so without this override the HD badge never renders
+     *  even when we've stamped the codec onto mProfile. */
+    @Override
+    public ImsCallProfile getLocalCallProfile() {
+        return mProfile;
+    }
+
+    /** Same profile object reused. ImsPhoneConnection's HD-detection
+     *  reads {@code remoteCallProfile.getRestrictCause()} alongside the
+     *  local audio quality; the default {@code CALL_RESTRICT_CAUSE_NONE}
+     *  on our profile satisfies that check. */
+    @Override
+    public ImsCallProfile getRemoteCallProfile() {
+        return mProfile;
+    }
+
     /** Framework fetches this once the call becomes active; returns
      *  null for voice-only calls. Lazy-initialised: the Provider
      *  wraps {@code this} as the SurfaceTarget, forwarding Telecom-
