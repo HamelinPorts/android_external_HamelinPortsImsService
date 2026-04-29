@@ -200,6 +200,18 @@ final class CarrierConfigInjector {
         Log.i(TAG, "kernel-supported IPsec integrity algos = "
                 + integrityIds + " (SoC defaults applied to every sub)");
 
+        /* Show the carrier name with a "Wi-Fi Calling" suffix in the
+         * status bar / lock screen whenever IMS is registered over the
+         * ePDG tunnel — index 1 of {@code wfcSpnFormats} resolves to
+         * "%s Wi-Fi Calling". AOSP defaults to 0 (no suffix); 1 is
+         * carrier-agnostic and is what most stock OEM firmwares pick.
+         * Applied to every active sub so users can see at a glance
+         * whether they're on VoLTE or VoWiFi without per-carrier
+         * config files. */
+        b.putInt(CarrierConfigManager.KEY_WFC_SPN_FORMAT_IDX_INT, 1);
+        b.putInt(CarrierConfigManager.KEY_WFC_DATA_SPN_FORMAT_IDX_INT, 1);
+        b.putInt(CarrierConfigManager.KEY_WFC_FLIGHT_MODE_SPN_FORMAT_IDX_INT, 1);
+
         mKernelDefaults = b;
         return b;
     }
