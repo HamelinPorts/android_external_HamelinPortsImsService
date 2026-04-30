@@ -66,7 +66,6 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
     private RemoteVideo mRemoteVideo;
     private HamelinPortsImsMediaSession mImsMedia;
     private HamelinPortsImsMediaVideoSession mImsMediaVideo;
-    private int mSavedAudioMode = android.media.AudioManager.MODE_INVALID;
     private HamelinPortsVideoCallProvider mVideoProvider;
     private String mCurrentCameraId;
     private android.view.Surface mPendingPreviewSurface;
@@ -570,24 +569,105 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
             mRtcpSocketVideo.close();
             mRtcpSocketVideo = null;
         }
-        if (mSavedAudioMode != android.media.AudioManager.MODE_INVALID) {
-            try {
-                android.media.AudioManager am = mRegController.getContext()
-                        .getSystemService(android.media.AudioManager.class);
-                if (am != null) {
-                    am.setMode(mSavedAudioMode);
-                    Log.i(TAG, "MO AudioManager mode restored to " + mSavedAudioMode);
-                }
-            } catch (Exception e) {
-                Log.w(TAG, "MO restoreMode failed", e);
+        // Release any communication-device pin we installed in
+        // applyCommunicationRoute. Per AudioManager docs, the selection
+        // stays active for the requesting process until cleared or the
+        // process dies — we don't want a hung-up call to keep
+        // routing the system's notification beeps over BT SCO.
+        try {
+            android.media.AudioManager am = mRegController.getContext()
+                    .getSystemService(android.media.AudioManager.class);
+            if (am != null) {
+                am.clearCommunicationDevice();
             }
-            mSavedAudioMode = android.media.AudioManager.MODE_INVALID;
+        } catch (Exception e) {
+            Log.w(TAG, "MO clearCommunicationDevice failed", e);
         }
         /* Tell the MmTelFeature this session is gone so its
          * mActiveCall reference clears immediately — without this the
          * next createCallSession sees a still-live "prior" pointer
          * and re-runs terminate() on a dead session. */
         fireGoneOnce();
+    }
+
+    /**
+     * Self-managed VoIP integration: AAudio streams opened by
+     * libimsmedia don't auto-follow Telecom's BluetoothHeadset
+     * legacy SCO routing — they bind to the system default unless
+     * an explicit setCommunicationDevice has been issued. Mirror
+     * the route the user selected in the dialer by pinning the
+     * matching device before the imsmedia session opens its streams.
+     *
+     * Selection priority:
+     *   - Honor any existing setCommunicationDevice (e.g. a custom
+     *     ConnectionService running on a build with sco_managed_by_audio
+     *     enabled, or a third-party app that pinned a route)
+     *   - Else prefer a connected BT SCO / BLE headset
+     *   - Else leave the system default (earpiece/speaker)
+     *
+     * @param tag log prefix ("MO" or "MT") so call-flow direction
+     *            is visible in logcat without splitting the helper.
+     */
+    private void applyCommunicationRoute(String tag) {
+        try {
+            android.media.AudioManager am = mRegController.getContext()
+                    .getSystemService(android.media.AudioManager.class);
+            if (am == null) return;
+
+            // Don't early-out on getCommunicationDevice() != null. Telecom
+            // pins the device on every audio-route transition (BT_DEVICE_REMOVED
+            // → earpiece, BT_DEVICE_ADDED → bt_sco_hs, etc.) but the value
+            // can be stale: e.g. Telecom set earpiece on a transient BT
+            // disconnect ~hours ago and never updated when BT reconnected.
+            // We scan the *currently available* comm devices and bind to BT
+            // if the user's headset is connected — matches Telecom's
+            // CallAudioRouteController's `route=BLUETOOTH` state, which is
+            // what the dialer UI reflects.
+            android.media.AudioDeviceInfo current = am.getCommunicationDevice();
+            // Diagnostic enumeration so we can tell apart "BT not paired"
+            // from "BT registered but not advertised as a comm device" —
+            // the latter means we need a different routing API.
+            StringBuilder commDevList = new StringBuilder();
+            android.media.AudioDeviceInfo target = null;
+            for (android.media.AudioDeviceInfo d : am.getAvailableCommunicationDevices()) {
+                if (commDevList.length() > 0) commDevList.append(", ");
+                commDevList.append("[type=").append(d.getType())
+                        .append(" ").append(d.getProductName()).append("]");
+                int t = d.getType();
+                if (t == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                        || t == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET) {
+                    target = d;
+                    break;
+                }
+            }
+            if (target == null) {
+                StringBuilder outDevList = new StringBuilder();
+                for (android.media.AudioDeviceInfo d : am.getDevices(
+                        android.media.AudioManager.GET_DEVICES_OUTPUTS)) {
+                    if (outDevList.length() > 0) outDevList.append(", ");
+                    outDevList.append("[type=").append(d.getType())
+                            .append(" ").append(d.getProductName()).append("]");
+                }
+                Log.i(TAG, tag + " no BT in comm-devices list; current="
+                        + (current == null ? "null" : "type=" + current.getType()
+                                + " " + current.getProductName())
+                        + "; comm-devices=" + commDevList
+                        + "; output-devices=" + outDevList);
+                return;
+            }
+            if (current != null && current.getId() == target.getId()) {
+                Log.i(TAG, tag + " comm device already on BT: type=" + current.getType()
+                        + " " + current.getProductName());
+                return;
+            }
+            boolean ok = am.setCommunicationDevice(target);
+            Log.i(TAG, tag + " setCommunicationDevice(type=" + target.getType()
+                    + " " + target.getProductName() + ") = " + ok
+                    + " (was: " + (current == null ? "null"
+                            : "type=" + current.getType()) + ")");
+        } catch (Exception e) {
+            Log.w(TAG, tag + " applyCommunicationRoute failed", e);
+        }
     }
 
     /** Start the RTP media engine on the socket we already bound,
@@ -603,20 +683,33 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
             Log.w(TAG, "onConnected but RTP socket is closed");
             return;
         }
-        /* Audio mode → IN_COMMUNICATION (VoIP). IN_CALL is the CS-voice
-         * mode and the audio HAL times out AudioSource start without a
-         * real modem bearer. */
-        try {
-            android.media.AudioManager am = mRegController.getContext()
-                    .getSystemService(android.media.AudioManager.class);
-            if (am != null) {
-                mSavedAudioMode = am.getMode();
-                am.setMode(android.media.AudioManager.MODE_IN_COMMUNICATION);
-                Log.i(TAG, "MO AudioManager mode: " + mSavedAudioMode + " → MODE_IN_COMMUNICATION");
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "MO setMode(IN_COMMUNICATION) failed", e);
-        }
+        // AudioManager mode is owned by Telecom: with
+        // config_use_voip_mode_for_ims=true (HPS framework-overlay),
+        // ImsPhoneConnection.audioModeIsVoip is true, Telecom enters
+        // VoipCallFocusState directly on call activation, and the
+        // global mode is MODE_IN_COMMUNICATION before this point.
+        //
+        // Bind the AAudio streams to the user's chosen communication
+        // device. Telecom only calls setCommunicationDevice itself
+        // when sco_managed_by_audio is enabled (a trunk_staging-only
+        // aconfig flag in current AOSP — bp4a leaves it disabled and
+        // there's no LOS/AOSP release config that flips it to ENABLED;
+        // see project_x205_volte_audio_mode_test_pending memory). Per
+        // Android's self-managed call guide, a VoIP app that opens its
+        // own AAudio voice streams must call setCommunicationDevice
+        // itself or the policy resolves the streams to the system
+        // default (built-in earpiece/speaker on a tablet) regardless
+        // of which device the user picked in the dialer.
+        //
+        // Order matters for BT_SCO. We start imsmedia first so its
+        // AAudio output stream is already open & active when we pin BT
+        // — AudioPolicy's setCommunicationDevice then re-routes a live
+        // stream (audio HAL gets BT_SCO=on with PCM already flowing).
+        // Stream-first / route-second avoids a ~500ms framework
+        // dispatch window between eSCO acceptance and BT_SCO=on
+        // reaching the HAL, in which some HFP headsets (Jabra Evolve2,
+        // etc.) terminate the SCO link with HCI 0x13
+        // REMOTE_USER_TERMINATED_CONNECTION because no PCM is flowing.
         try {
             mImsMedia = new HamelinPortsImsMediaSession(mRegController.getContext(),
                     mRtpSocket, mRtcpSocket,
@@ -627,6 +720,7 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
         } catch (Exception e) {
             Log.e(TAG, "imsmedia audio start failed", e);
         }
+        applyCommunicationRoute("MO");
         /* C.2 — open a parallel SESSION_TYPE_VIDEO imsmedia session
          * when the peer accepted our video offer. Without surfaces
          * (set up in C.3 via VideoCallProvider) this just exercises

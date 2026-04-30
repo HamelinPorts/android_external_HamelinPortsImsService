@@ -2,7 +2,6 @@
 package org.hamelinports.ims;
 
 import android.content.Context;
-import android.media.AudioManager;
 import android.net.ConnectivityManager;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
@@ -72,7 +71,6 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
     private HamelinPortsImsMediaSession mImsMedia;
     private boolean mAccepted = false;
     private boolean mGoneFired = false;
-    private int mSavedAudioMode = AudioManager.MODE_INVALID;
 
     /* Video state — populated by {@link #setRemoteVideo} when the
      *  incoming SDP offer included an m=video block. Sockets are
@@ -399,27 +397,16 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
             Log.w(TAG, "MT onConnected but RTP socket is closed");
             return;
         }
-        /* Ensure AudioManager is in MODE_IN_COMMUNICATION (the VoIP mode)
-         * before opening the imsmedia session. Telecom normally sets
-         * this on call activation but timing depends on the focus
-         * transition; doing it here defensively avoids the race where
-         * openAudioStream() sees MODE_NORMAL and routes through the
-         * media path — which then gets yanked with AAUDIO_ERROR_DISCONNECTED
-         * when Telecom updates the focus. MODE_IN_CALL (the CS-voice
-         * mode) must NOT be used: the audio HAL expects an actual
-         * modem voice bearer and AudioSource starts time-out. */
-        try {
-            AudioManager am = mRegController.getContext()
-                    .getSystemService(AudioManager.class);
-            if (am != null) {
-                mSavedAudioMode = am.getMode();
-                am.setMode(AudioManager.MODE_IN_COMMUNICATION);
-                Log.i(TAG, "MT AudioManager mode: "
-                        + mSavedAudioMode + " → MODE_IN_COMMUNICATION");
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "MT setMode(IN_COMMUNICATION) failed", e);
-        }
+        // AudioManager mode is owned by Telecom: with
+        // config_use_voip_mode_for_ims=true (HPS framework-overlay),
+        // ImsPhoneConnection.audioModeIsVoip is true, Telecom enters
+        // VoipCallFocusState directly on call activation, and the
+        // global mode is MODE_IN_COMMUNICATION before this point.
+        //
+        // For BT headset routing, see the matching applyCommunicationRoute
+        // path in HamelinPortsCallSession.startMediaEngine — same
+        // rationale applies on MT, including the stream-first /
+        // route-second ordering for the BT_SCO PCM pre-warm window.
         try {
             mImsMedia = new HamelinPortsImsMediaSession(mRegController.getContext(),
                     mRtpSocket, mRtcpSocket,
@@ -430,6 +417,7 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
         } catch (Exception e) {
             Log.e(TAG, "MT imsmedia audio engine start failed", e);
         }
+        applyCommunicationRoute("MT");
         /* MT C.5 — when the incoming offer carried video, open a
          * parallel SESSION_TYPE_VIDEO imsmedia session using the
          * sockets allocated in doAccept. No VideoCallProvider yet
@@ -461,23 +449,60 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
         if (mRtcpSocket != null) { mRtcpSocket.close(); mRtcpSocket = null; }
         if (mRtpSocketVideo != null) { mRtpSocketVideo.close(); mRtpSocketVideo = null; }
         if (mRtcpSocketVideo != null) { mRtcpSocketVideo.close(); mRtcpSocketVideo = null; }
-        /* Restore the audio mode we captured in startMediaEngine.
-         * MODE_INVALID means setMode never ran, so nothing to restore. */
-        if (mSavedAudioMode != AudioManager.MODE_INVALID) {
-            try {
-                AudioManager am = mRegController.getContext()
-                        .getSystemService(AudioManager.class);
-                if (am != null) {
-                    am.setMode(mSavedAudioMode);
-                    Log.i(TAG, "MT AudioManager mode restored to "
-                            + mSavedAudioMode);
-                }
-            } catch (Exception e) {
-                Log.w(TAG, "MT restoreMode failed", e);
+        // Release any communication-device pin we installed in
+        // applyCommunicationRoute (MT side). Same rationale as in
+        // HamelinPortsCallSession.cleanup.
+        try {
+            android.media.AudioManager am = mRegController.getContext()
+                    .getSystemService(android.media.AudioManager.class);
+            if (am != null) {
+                am.clearCommunicationDevice();
             }
-            mSavedAudioMode = AudioManager.MODE_INVALID;
+        } catch (Exception e) {
+            Log.w(TAG, "MT clearCommunicationDevice failed", e);
         }
         fireGoneOnce();
+    }
+
+    /**
+     * MT counterpart to HamelinPortsCallSession.applyCommunicationRoute —
+     * see that method for the full rationale.
+     */
+    private void applyCommunicationRoute(String tag) {
+        try {
+            android.media.AudioManager am = mRegController.getContext()
+                    .getSystemService(android.media.AudioManager.class);
+            if (am == null) return;
+
+            android.media.AudioDeviceInfo current = am.getCommunicationDevice();
+            android.media.AudioDeviceInfo target = null;
+            for (android.media.AudioDeviceInfo d : am.getAvailableCommunicationDevices()) {
+                int t = d.getType();
+                if (t == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                        || t == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET) {
+                    target = d;
+                    break;
+                }
+            }
+            if (target == null) {
+                Log.i(TAG, tag + " no BT comm device available; current="
+                        + (current == null ? "null" : "type=" + current.getType()
+                                + " " + current.getProductName()));
+                return;
+            }
+            if (current != null && current.getId() == target.getId()) {
+                Log.i(TAG, tag + " comm device already on BT: type=" + current.getType()
+                        + " " + current.getProductName());
+                return;
+            }
+            boolean ok = am.setCommunicationDevice(target);
+            Log.i(TAG, tag + " setCommunicationDevice(type=" + target.getType()
+                    + " " + target.getProductName() + ") = " + ok
+                    + " (was: " + (current == null ? "null"
+                            : "type=" + current.getType()) + ")");
+        } catch (Exception e) {
+            Log.w(TAG, tag + " applyCommunicationRoute failed", e);
+        }
     }
 
     private synchronized void fireGoneOnce() {
