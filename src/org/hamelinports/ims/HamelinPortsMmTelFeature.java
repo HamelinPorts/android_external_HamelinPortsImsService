@@ -421,9 +421,10 @@ public class HamelinPortsMmTelFeature extends MmTelFeature implements IncomingCa
         /* Registration / IPsec context from the property namespace set
          * by ims_xfrm. Useful to correlate SRVCC events against
          * P-CSCF IPsec lifetime. */
-        sb.append(" pcscf=").append(SystemProperties.get("lineage.ims.xfrm.pcscf", ""));
-        sb.append(" portC=").append(SystemProperties.get("lineage.ims.xfrm.ue_portc", ""));
-        sb.append(" portS=").append(SystemProperties.get("lineage.ims.xfrm.ue_ports", ""));
+        String slotPrefix = "lineage.ims.xfrm." + mSlotId + ".";
+        sb.append(" pcscf=").append(SystemProperties.get(slotPrefix + "pcscf", ""));
+        sb.append(" portC=").append(SystemProperties.get(slotPrefix + "ue_portc", ""));
+        sb.append(" portS=").append(SystemProperties.get(slotPrefix + "ue_ports", ""));
         /* Radio context. Wrapped because TelephonyManager can throw on
          * stale sub-ids during teardown. */
         try {
