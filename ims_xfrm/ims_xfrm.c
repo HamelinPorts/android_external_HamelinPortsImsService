@@ -70,9 +70,22 @@ static void del_policy(const char *src, const char *dst,
 }
 
 /*
+ * Reqid that binds our policy templates to the SAs that AOSP
+ * IpSecManager (via IpSecService → netd XfrmController) installs.
+ * On bp4a the framework currently passes reqid 1000 for every
+ * resource-id transform; the kernel's xfrm_tmpl_resolve_one does a
+ * strict equality check (tmpl->reqid != x->props.reqid → no match),
+ * so dropping this value or setting it to 0 silently breaks outbound
+ * encapsulation (REGISTER 2 leaves cleartext, TAS times us out at
+ * 408). If a future AOSP bump changes the constant, the symptom is
+ * the same: revisit by reading the actual reqid off the SA via the
+ * netlink XFRM_MSG_GETSA dump and threading it into the prop bag.
+ */
+#define IMS_XFRM_REQID "1000"
+
+/*
  * Add an outbound xfrm policy with SPI pinned. The kernel will select
- * the SA whose (dst, spi, proto) matches this template; reqid 1000
- * matches AOSP IpSecManager's default allocation.
+ * the SA whose (dst, spi, proto, reqid) matches this template.
  */
 static int add_out_policy(const char *local, const char *pcscf,
                           const char *sport, const char *dport,
@@ -92,7 +105,7 @@ static int add_out_policy(const char *local, const char *pcscf,
         "tmpl",
         "src", (char*)local, "dst", (char*)pcscf,
         "proto", "esp", "spi", (char*)spi,
-        "reqid", "1000", "mode", "transport", NULL};
+        "reqid", IMS_XFRM_REQID, "mode", "transport", NULL};
     return run_ip(argv);
 }
 
@@ -113,7 +126,7 @@ static int add_in_policy(const char *pcscf, const char *local,
         "tmpl",
         "src", (char*)pcscf, "dst", (char*)local,
         "proto", "esp",
-        "reqid", "1000", "mode", "transport", NULL};
+        "reqid", IMS_XFRM_REQID, "mode", "transport", NULL};
     return run_ip(argv);
 }
 
