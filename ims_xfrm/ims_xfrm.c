@@ -43,6 +43,10 @@ static int valid_port(const char *s) {
     return n > 0;
 }
 
+static int valid_slot(const char *s) {
+    return s && (s[0] == '0' || s[0] == '1') && s[1] == '\0';
+}
+
 /*
  * Delete a 5-tuple policy if it exists. Ignore errors (likely "not found" on
  * first run). Must use the exact same selectors that add used, otherwise the
@@ -152,9 +156,19 @@ static int do_flush(const char *pcscf, const char *local,
     return 0;
 }
 
+/*
+ * Read a per-slot property. Slot is "0" or "1"; the resulting key is
+ * "lineage.ims.xfrm.<slot>.<suffix>". Returns 1 on hit, 0 otherwise.
+ */
+static int get_slot_prop(const char *slot, const char *suffix, char *out) {
+    char key[PROP_NAME_MAX];
+    snprintf(key, sizeof(key), "lineage.ims.xfrm.%s.%s", slot, suffix);
+    return __system_property_get(key, out) > 0;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "usage: ims_xfrm addprop | add ... | del ... | flush ...\n");
+        fprintf(stderr, "usage: ims_xfrm addprop <slot> | flushprop <slot> | add ... | flush ...\n");
         return 1;
     }
 
@@ -163,7 +177,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (strcmp(argv[1], "addprop") == 0) {
+    if (strcmp(argv[1], "addprop") == 0 && argc >= 3) {
+        const char *slot = argv[2];
+        if (!valid_slot(slot)) { fprintf(stderr, "invalid slot\n"); return 1; }
+
         char pcscf[PROP_VALUE_MAX]      = {0};
         char local[PROP_VALUE_MAX]      = {0};
         char ue_portc[PROP_VALUE_MAX]   = {0};
@@ -172,14 +189,14 @@ int main(int argc, char *argv[]) {
         char pc_ports[PROP_VALUE_MAX]   = {0};
         char server_spic[PROP_VALUE_MAX] = {0};
         char server_spis[PROP_VALUE_MAX] = {0};
-        __system_property_get("lineage.ims.xfrm.pcscf",       pcscf);
-        __system_property_get("lineage.ims.xfrm.local",       local);
-        __system_property_get("lineage.ims.xfrm.ue_portc",    ue_portc);
-        __system_property_get("lineage.ims.xfrm.ue_ports",    ue_ports);
-        __system_property_get("lineage.ims.xfrm.pcscf_portc", pc_portc);
-        __system_property_get("lineage.ims.xfrm.pcscf_ports", pc_ports);
-        __system_property_get("lineage.ims.xfrm.server_spic", server_spic);
-        __system_property_get("lineage.ims.xfrm.server_spis", server_spis);
+        get_slot_prop(slot, "pcscf",       pcscf);
+        get_slot_prop(slot, "local",       local);
+        get_slot_prop(slot, "ue_portc",    ue_portc);
+        get_slot_prop(slot, "ue_ports",    ue_ports);
+        get_slot_prop(slot, "pcscf_portc", pc_portc);
+        get_slot_prop(slot, "pcscf_ports", pc_ports);
+        get_slot_prop(slot, "server_spic", server_spic);
+        get_slot_prop(slot, "server_spis", server_spis);
 
         if (!valid_ipv6(pcscf) || !valid_ipv6(local)) {
             fprintf(stderr, "invalid ipv6\n"); return 1;
@@ -193,6 +210,31 @@ int main(int argc, char *argv[]) {
         }
         return do_install(pcscf, local, ue_portc, ue_ports,
                           pc_portc, pc_ports, server_spic, server_spis);
+    }
+
+    if (strcmp(argv[1], "flushprop") == 0 && argc >= 3) {
+        const char *slot = argv[2];
+        if (!valid_slot(slot)) { fprintf(stderr, "invalid slot\n"); return 1; }
+
+        char pcscf[PROP_VALUE_MAX]    = {0};
+        char local[PROP_VALUE_MAX]    = {0};
+        char ue_portc[PROP_VALUE_MAX] = {0};
+        char ue_ports[PROP_VALUE_MAX] = {0};
+        char pc_portc[PROP_VALUE_MAX] = {0};
+        char pc_ports[PROP_VALUE_MAX] = {0};
+        get_slot_prop(slot, "pcscf",       pcscf);
+        get_slot_prop(slot, "local",       local);
+        get_slot_prop(slot, "ue_portc",    ue_portc);
+        get_slot_prop(slot, "ue_ports",    ue_ports);
+        get_slot_prop(slot, "pcscf_portc", pc_portc);
+        get_slot_prop(slot, "pcscf_ports", pc_ports);
+
+        /* If the bag is empty (no install ever ran for this slot), nothing
+         * to flush — bail cleanly so init's exec doesn't log a failure. */
+        if (!valid_ipv6(pcscf) || !valid_ipv6(local)) return 0;
+        if (!valid_port(ue_portc) || !valid_port(ue_ports)
+         || !valid_port(pc_portc) || !valid_port(pc_ports)) return 0;
+        return do_flush(pcscf, local, ue_portc, ue_ports, pc_portc, pc_ports);
     }
 
     if (strcmp(argv[1], "add") == 0 && argc >= 10) {
@@ -219,7 +261,8 @@ int main(int argc, char *argv[]) {
     }
 
     fprintf(stderr,
-        "usage: ims_xfrm addprop\n"
+        "usage: ims_xfrm addprop <slot>\n"
+        "       ims_xfrm flushprop <slot>\n"
         "       ims_xfrm add <pcscf> <local> <ue_portc> <ue_ports> <pc_portc> <pc_ports> <server_spic> <server_spis>\n"
         "       ims_xfrm del <pcscf> <local> <ue_portc> <ue_ports> <pc_portc> <pc_ports>\n"
         "       ims_xfrm flush <pcscf> <local> <ue_portc> <ue_ports> <pc_portc> <pc_ports>\n");

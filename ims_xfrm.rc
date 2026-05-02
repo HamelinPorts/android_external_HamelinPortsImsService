@@ -1,2 +1,11 @@
-on property:lineage.ims.xfrm.trigger=*
-    exec - root root -- /system/bin/ims_xfrm addprop
+on property:lineage.ims.xfrm.0.trigger=*
+    exec - root root -- /system/bin/ims_xfrm addprop 0
+
+on property:lineage.ims.xfrm.1.trigger=*
+    exec - root root -- /system/bin/ims_xfrm addprop 1
+
+on property:lineage.ims.xfrm.0.flush=*
+    exec - root root -- /system/bin/ims_xfrm flushprop 0
+
+on property:lineage.ims.xfrm.1.flush=*
+    exec - root root -- /system/bin/ims_xfrm flushprop 1

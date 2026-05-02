@@ -761,7 +761,7 @@ public class ImsRegistrationController {
             return;
         }
         mAkaProvider = new HamelinPortsAkaProviderImpl(
-                mContext, ueSec, pcscf, localAddr, localIp);
+                mContext, mSlotId, ueSec, pcscf, localAddr, localIp);
         HamelinPortsSipStack.setAkaProvider(mAkaProvider);
         HamelinPortsSipStack.setRegistrationListener(new RegistrationListener() {
             @Override public void onExpiresReported(int expires) {

@@ -26,9 +26,14 @@ public final class EspRoutingFix {
      * Install the four TS 33.203 §7.4 IPsec xfrm policies by poking the
      * ims_xfrm root helper via init property-trigger. All eight parameters
      * (two IPv6 addrs, four ports, two server SPIs) are passed through
-     * separate lineage.ims.xfrm.* properties, and the helper reads them via
-     * __system_property_get — this avoids any init.rc argument-expansion
-     * injection and is the same pattern used for ims_ipsec_setup.
+     * separate lineage.ims.xfrm.&lt;slot&gt;.* properties, and the helper
+     * reads them via __system_property_get on the matching slot prefix —
+     * this avoids any init.rc argument-expansion injection.
+     *
+     * The prop bag is per-slot so two concurrent registrations (dual-SIM)
+     * cannot interleave at the property level. The whole eight-prop write
+     * + trigger bump runs under a class-wide lock so two slots cannot
+     * even contend on the property service round-trip in the wrong order.
      *
      * Parameters correspond to Security-Client and Security-Server in the
      * REGISTER CSeq 2 / 401 exchange:
@@ -36,36 +41,56 @@ public final class EspRoutingFix {
      *   pcscfPortC/pcscfPortS = P-CSCF Security-Server port-c / port-s
      *   serverSpiC/serverSpiS = P-CSCF Security-Server spi-c / spi-s
      */
-    public static void addXfrmPolicy(String localIpv6, String pcscfIpv6,
+    public static void addXfrmPolicy(int slotId, String localIpv6, String pcscfIpv6,
                                      int uePortC, int uePortS,
                                      int pcscfPortC, int pcscfPortS,
                                      int serverSpiC, int serverSpiS) {
-        try {
-            android.os.SystemProperties.set("lineage.ims.xfrm.pcscf", pcscfIpv6);
-            android.os.SystemProperties.set("lineage.ims.xfrm.local", localIpv6);
-            android.os.SystemProperties.set("lineage.ims.xfrm.ue_portc",    Integer.toString(uePortC));
-            android.os.SystemProperties.set("lineage.ims.xfrm.ue_ports",    Integer.toString(uePortS));
-            android.os.SystemProperties.set("lineage.ims.xfrm.pcscf_portc", Integer.toString(pcscfPortC));
-            android.os.SystemProperties.set("lineage.ims.xfrm.pcscf_ports", Integer.toString(pcscfPortS));
-            android.os.SystemProperties.set("lineage.ims.xfrm.server_spic", String.format("0x%08x", serverSpiC));
-            android.os.SystemProperties.set("lineage.ims.xfrm.server_spis", String.format("0x%08x", serverSpiS));
-            // Trigger — monotonic value so the property always changes
-            android.os.SystemProperties.set("lineage.ims.xfrm.trigger",
-                    String.valueOf(System.currentTimeMillis()));
-            Log.i(TAG, "xfrm 4-policy trigger set: "
-                    + pcscfIpv6 + "[" + pcscfPortC + "/" + pcscfPortS + "] <-> "
-                    + localIpv6 + "[" + uePortC + "/" + uePortS + "]");
-        } catch (Exception e) {
-            Log.w(TAG, "xfrm policy trigger failed", e);
+        if (slotId != 0 && slotId != 1) {
+            Log.w(TAG, "xfrm: refusing addXfrmPolicy with slotId=" + slotId);
+            return;
+        }
+        synchronized (EspRoutingFix.class) {
+            try {
+                String p = "lineage.ims.xfrm." + slotId + ".";
+                android.os.SystemProperties.set(p + "pcscf",       pcscfIpv6);
+                android.os.SystemProperties.set(p + "local",       localIpv6);
+                android.os.SystemProperties.set(p + "ue_portc",    Integer.toString(uePortC));
+                android.os.SystemProperties.set(p + "ue_ports",    Integer.toString(uePortS));
+                android.os.SystemProperties.set(p + "pcscf_portc", Integer.toString(pcscfPortC));
+                android.os.SystemProperties.set(p + "pcscf_ports", Integer.toString(pcscfPortS));
+                android.os.SystemProperties.set(p + "server_spic", String.format("0x%08x", serverSpiC));
+                android.os.SystemProperties.set(p + "server_spis", String.format("0x%08x", serverSpiS));
+                /* Trigger — monotonic value so the property always changes
+                 * and init re-fires the on-property action. */
+                android.os.SystemProperties.set(p + "trigger",
+                        String.valueOf(System.currentTimeMillis()));
+                Log.i(TAG, "xfrm 4-policy trigger set: slot=" + slotId + " "
+                        + pcscfIpv6 + "[" + pcscfPortC + "/" + pcscfPortS + "] <-> "
+                        + localIpv6 + "[" + uePortC + "/" + uePortS + "]");
+            } catch (Exception e) {
+                Log.w(TAG, "xfrm policy trigger failed", e);
+            }
         }
     }
 
-    private static void exec(String... cmd) throws Exception {
-        Process p = Runtime.getRuntime().exec(cmd);
-        int rc = p.waitFor();
-        if (rc != 0) {
-            byte[] err = p.getErrorStream().readAllBytes();
-            Log.w(TAG, "cmd rc=" + rc + ": " + new String(err));
+    /**
+     * Tear down the four xfrm policies for {@code slotId}. The helper reads
+     * the same per-slot prop bag the install used, so the selectors match
+     * exactly and the kernel can locate them. Called from
+     * {@code HamelinPortsAkaProviderImpl.close()} to keep the policy table
+     * from accumulating one quartet per REGISTER cycle.
+     */
+    public static void removeXfrmPolicy(int slotId) {
+        if (slotId != 0 && slotId != 1) return;
+        synchronized (EspRoutingFix.class) {
+            try {
+                String p = "lineage.ims.xfrm." + slotId + ".";
+                android.os.SystemProperties.set(p + "flush",
+                        String.valueOf(System.currentTimeMillis()));
+                Log.i(TAG, "xfrm flush trigger set: slot=" + slotId);
+            } catch (Exception e) {
+                Log.w(TAG, "xfrm flush trigger failed", e);
+            }
         }
     }
 

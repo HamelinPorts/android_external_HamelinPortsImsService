@@ -32,6 +32,7 @@ public final class HamelinPortsAkaProviderImpl
     private static final String TAG = "HamelinPortsIms";
 
     private final Context  mContext;
+    private final int      mSlotId;
     private final SipClient.UeSecurityParams mUeSec;
     private final InetAddress mPcscf;
     private final InetAddress mLocalAddr;
@@ -39,11 +40,13 @@ public final class HamelinPortsAkaProviderImpl
     private IpsecHelper.IpsecResult mIpsec;
 
     public HamelinPortsAkaProviderImpl(Context ctx,
+                                  int slotId,
                                   SipClient.UeSecurityParams ueSec,
                                   InetAddress pcscf,
                                   InetAddress localAddr,
                                   String localIp) {
         mContext   = ctx;
+        mSlotId    = slotId;
         mUeSec     = ueSec;
         mPcscf     = pcscf;
         mLocalAddr = localAddr;
@@ -84,7 +87,7 @@ public final class HamelinPortsAkaProviderImpl
             // kernel ESP-wrap reSIProcate's plain TCP traffic).
             String pcscfStr = stripScope(mPcscf.getHostAddress());
             EspRoutingFix.addRule(mLocalIp);
-            EspRoutingFix.addXfrmPolicy(mLocalIp, pcscfStr,
+            EspRoutingFix.addXfrmPolicy(mSlotId, mLocalIp, pcscfStr,
                     mUeSec.portC, mUeSec.portS,
                     serverPortC, serverPortS,
                     (int) serverSpiC, (int) serverSpiS);
@@ -105,6 +108,11 @@ public final class HamelinPortsAkaProviderImpl
         if (mLocalIp != null) {
             EspRoutingFix.removeRule(mLocalIp);
         }
+        /* Tear down the four kernel xfrm policies installed at AKA time.
+         * Without this, the per-cycle random (uePortC, uePortS) selectors
+         * accumulate one stale quartet per REGISTER cycle (next cycle's
+         * del-then-add only matches its own ports). */
+        EspRoutingFix.removeXfrmPolicy(mSlotId);
     }
 
     private static String stripScope(String ip) {
