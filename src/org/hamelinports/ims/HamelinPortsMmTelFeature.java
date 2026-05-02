@@ -16,7 +16,6 @@ import android.telephony.ims.stub.ImsSmsImplBase;
 import android.util.Log;
 
 import org.hamelinports.ims.sip.IncomingCallListener;
-import org.hamelinports.ims.sip.HamelinPortsSipStack;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -342,7 +341,7 @@ public class HamelinPortsMmTelFeature extends MmTelFeature implements IncomingCa
         /* Only drop the listener if we are currently the bound one —
          * otherwise a race during slot handover could clear another
          * slot's active binding. */
-        HamelinPortsSipStack.clearIncomingCallListenerIfSelf(this);
+        mRegController.stack().clearIncomingCallListenerIfSelf(this);
         Log.i(TAG, "notified capabilities: none; MT listener released slot=" + mSlotId);
     }
 
