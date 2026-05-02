@@ -1,5 +1,2 @@
 on property:lineage.ims.xfrm.trigger=*
     exec - root root -- /system/bin/ims_xfrm addprop
-
-on property:lineage.ims.ipsec.trigger=*
-    exec - root root -- /system/bin/ims_ipsec_setup readprop
