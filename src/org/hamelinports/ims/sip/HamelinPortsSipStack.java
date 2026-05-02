@@ -3,9 +3,17 @@ package org.hamelinports.ims.sip;
 import android.util.Log;
 
 /**
- * Thin wrapper around the native reSIProcate SIP stack.
+ * Per-slot wrapper around the native reSIProcate SIP stack.
  *
- * Drives the full IMS REGISTER cycle through reSIProcate's DUM:
+ * One instance per SIM slot; {@code ImsRegistrationController} owns it
+ * and threads it through {@code HamelinPortsMmTelFeature},
+ * {@code HamelinPortsCallSession}, {@code HamelinPortsIncomingCallSession}
+ * and {@code HamelinPortsSmsImpl}. The instance carries a {@code mSlotId}
+ * which is currently bookkeeping only — the underlying native methods
+ * still operate on a process-wide singleton; phase 4B will fan that out
+ * to a per-slot Bridge map keyed on this id.
+ *
+ * <p>Drives the full IMS REGISTER cycle through reSIProcate's DUM:
  *   1. {@link #start()} — native SipStack + DialogUsageManager up
  *   2. {@link #addSipTransports} — TCP transports bound to UE port-c
  *      and port-s (kernel xfrm SAs are NOT installed yet — they get
@@ -14,9 +22,6 @@ import android.util.Log;
  *   4. {@link #startRegister} — native sends REGISTER 1 cleartext to
  *      pcscf:5060; on 401 the auth manager AKAs, installs SAs (via the
  *      Java provider), retargets REGISTER 2 to pcscf:port-s
- *
- * This is the ONLY SIP path. The previous Java SipClient.buildRegister
- * code path is being removed alongside this migration.
  */
 public final class HamelinPortsSipStack {
 
@@ -33,7 +38,15 @@ public final class HamelinPortsSipStack {
         }
     }
 
-    private HamelinPortsSipStack() {}
+    private final int mSlotId;
+
+    public HamelinPortsSipStack(int slotId) {
+        mSlotId = slotId;
+    }
+
+    public int getSlotId() {
+        return mSlotId;
+    }
 
     private static native String  nativeGetStackVersion();
     private static native boolean nativeStart();
@@ -64,12 +77,13 @@ public final class HamelinPortsSipStack {
     private static native boolean nativeAcceptIncomingCall(String callId, String sdpAnswer);
     private static native boolean nativeRejectIncomingCall(String callId, int sipCode);
 
-    /** True if libnative_ims_jni.so loaded successfully. */
+    /** True if libnative_ims_jni.so loaded successfully. Process-global. */
     public static boolean isAvailable() {
         return sNativeAvailable;
     }
 
-    /** Banner string from the native stack, or null on failure. */
+    /** Banner string from the native stack, or null on failure.
+     *  Process-global — the banner is the resiprocate library version. */
     public static String getStackVersion() {
         if (!sNativeAvailable) return null;
         try {
@@ -80,7 +94,7 @@ public final class HamelinPortsSipStack {
     }
 
     /** Bring the native stack up (no transport yet). Idempotent. */
-    public static boolean start() {
+    public boolean start() {
         if (!sNativeAvailable) return false;
         try {
             return nativeStart();
@@ -90,7 +104,7 @@ public final class HamelinPortsSipStack {
     }
 
     /** Tear the native stack down. */
-    public static void stop() {
+    public void stop() {
         if (!sNativeAvailable) return;
         try {
             nativeStop();
@@ -100,7 +114,7 @@ public final class HamelinPortsSipStack {
     }
 
     /** Returns "stopped" or "started; transports=N" */
-    public static String getStatus() {
+    public String getStatus() {
         if (!sNativeAvailable) return "unavailable";
         try {
             return nativeGetStatus();
@@ -123,7 +137,7 @@ public final class HamelinPortsSipStack {
      * @return true on success, false if the bridge isn't started or
      *         the bind failed.
      */
-    public static boolean addSipTransports(String localIp, int portC, int portS) {
+    public boolean addSipTransports(String localIp, int portC, int portS) {
         if (!sNativeAvailable) return false;
         try {
             return nativeAddSipTransports(localIp, portC, portS);
@@ -140,7 +154,7 @@ public final class HamelinPortsSipStack {
      * Must be called before {@link #start()} returns 200 OK on a
      * REGISTER, otherwise the first auth challenge will fail.
      */
-    public static void setAkaProvider(AkaProvider provider) {
+    public void setAkaProvider(AkaProvider provider) {
         if (!sNativeAvailable) return;
         try {
             nativeSetAkaProvider(provider);
@@ -150,7 +164,7 @@ public final class HamelinPortsSipStack {
     }
 
     /** Register the listener that native fires on REGISTER success/failure. */
-    public static void setRegistrationListener(RegistrationListener listener) {
+    public void setRegistrationListener(RegistrationListener listener) {
         if (!sNativeAvailable) return;
         try {
             nativeSetRegistrationListener(listener);
@@ -161,7 +175,7 @@ public final class HamelinPortsSipStack {
 
     /** Register the listener that native fires on call lifecycle events.
      *  Only one active outbound call is supported at a time. */
-    public static void setCallSessionListener(CallSessionListener listener) {
+    public void setCallSessionListener(CallSessionListener listener) {
         if (!sNativeAvailable) return;
         try { nativeSetCallSessionListener(listener); }
         catch (UnsatisfiedLinkError e) {}
@@ -173,7 +187,7 @@ public final class HamelinPortsSipStack {
      *  on this — set it to the current LTE cell before
      *  {@link #startCall} or the call will land on the announcement
      *  TAS as UNALLOCATED_NUMBER. Format: MCC+MNC+TAC(4 hex)+CI(7 hex). */
-    public static void setCellIdForPani(String value) {
+    public void setCellIdForPani(String value) {
         if (!sNativeAvailable) return;
         try { nativeSetCellIdForPani(value); }
         catch (UnsatisfiedLinkError e) {}
@@ -188,7 +202,7 @@ public final class HamelinPortsSipStack {
      *  side clears the other when this is set, so callers should
      *  pick the right setter for the bound underlying access type and
      *  not try to keep both warm. */
-    public static void setIwlanNodeIdForPani(String value) {
+    public void setIwlanNodeIdForPani(String value) {
         if (!sNativeAvailable) return;
         try { nativeSetIwlanNodeIdForPani(value); }
         catch (UnsatisfiedLinkError e) {}
@@ -204,14 +218,14 @@ public final class HamelinPortsSipStack {
      * @return true if the INVITE was queued; outcome arrives via the
      *         registered {@link CallSessionListener}.
      */
-    public static boolean startCall(String targetUri, String sdpOffer) {
+    public boolean startCall(String targetUri, String sdpOffer) {
         if (!sNativeAvailable) return false;
         try { return nativeStartCall(targetUri, sdpOffer); }
         catch (UnsatisfiedLinkError e) { return false; }
     }
 
     /** End the active outbound call (BYE if connected, CANCEL if early). */
-    public static void endCall() {
+    public void endCall() {
         if (!sNativeAvailable) return;
         try { nativeEndCall(); }
         catch (UnsatisfiedLinkError e) {}
@@ -220,7 +234,7 @@ public final class HamelinPortsSipStack {
     /** End the MT server-side call keyed on Call-ID. Required for the
      *  local-hangup path on an answered MT call because {@link #endCall}
      *  only acts on the MO {@code ClientInviteSessionHandle}. */
-    public static boolean endCallByCallId(String callId) {
+    public boolean endCallByCallId(String callId) {
         if (!sNativeAvailable) return false;
         try { return nativeEndCallByCallId(callId); }
         catch (UnsatisfiedLinkError e) { return false; }
@@ -233,7 +247,7 @@ public final class HamelinPortsSipStack {
      *  false. Response arrives via
      *  {@link CallSessionListener#onAnswer} /
      *  {@link CallSessionListener#onAnswerVideo}. */
-    public static boolean reinvite(String sdpOffer) {
+    public boolean reinvite(String sdpOffer) {
         if (!sNativeAvailable) return false;
         try { return nativeReinvite(sdpOffer); }
         catch (UnsatisfiedLinkError e) { return false; }
@@ -242,7 +256,7 @@ public final class HamelinPortsSipStack {
     /** Phase C.4.3 — respond 200 OK with {@code sdpAnswer} to a
      *  remote-initiated re-INVITE that arrived via
      *  {@link CallSessionListener#onRemoteReinvite}. */
-    public static boolean provideReinviteAnswer(String sdpAnswer) {
+    public boolean provideReinviteAnswer(String sdpAnswer) {
         if (!sNativeAvailable) return false;
         try { return nativeProvideReinviteAnswer(sdpAnswer); }
         catch (UnsatisfiedLinkError e) { return false; }
@@ -254,11 +268,13 @@ public final class HamelinPortsSipStack {
      *  {@code HamelinPortsMmTelFeature}) that can create a fresh
      *  {@code HamelinPortsIncomingCallSession} per incoming call.
      *
-     *  <p>Last-writer-wins: the native side holds a single global
-     *  reference. In a dual-slot process the {@code HamelinPortsMmTelFeature}
-     *  for the active-SIM slot binds from {@code onRegistered()} so
-     *  MT routes to the correct slot's ImsPhoneCallTracker.</p> */
-    public static void setIncomingCallListener(IncomingCallListener listener) {
+     *  <p>Last-writer-wins on the native side: the singleton holds a
+     *  single global reference. In a dual-slot process the
+     *  {@code HamelinPortsMmTelFeature} for the active-SIM slot binds
+     *  from {@code onRegistered()} so MT routes to the correct slot's
+     *  ImsPhoneCallTracker. Phase 4B will fan this out to a per-slot
+     *  listener slot.</p> */
+    public void setIncomingCallListener(IncomingCallListener listener) {
         if (!sNativeAvailable) return;
         sIncomingCallListener = listener;
         try { nativeSetIncomingCallListener(listener); }
@@ -269,7 +285,8 @@ public final class HamelinPortsSipStack {
 
     /** Drop the MT listener only if {@code self} is currently bound.
      *  Called from {@code onDeregistered()} to avoid clobbering a
-     *  listener that another slot may have just bound during handover. */
+     *  listener that another slot may have just bound during handover.
+     *  Static: the gating reference is a process-global. */
     public static void clearIncomingCallListenerIfSelf(IncomingCallListener self) {
         if (!sNativeAvailable) return;
         if (sIncomingCallListener != self) return;
@@ -282,7 +299,7 @@ public final class HamelinPortsSipStack {
      *  {@code callId}. Reliable (100rel + RSeq + PRACK handshake)
      *  when the incoming INVITE required it, which Mavenir on o2-de
      *  does. */
-    public static boolean progressRinging(String callId) {
+    public boolean progressRinging(String callId) {
         if (!sNativeAvailable) return false;
         try { return nativeProgressRinging(callId); }
         catch (UnsatisfiedLinkError e) { return false; }
@@ -292,7 +309,7 @@ public final class HamelinPortsSipStack {
      *  200 OK carrying {@code sdpAnswer}. The SDP answer's m-line
      *  count + order MUST match the offer (RFC 3264 §5.1), with
      *  local RTP/RTCP ports bound to the IMS PDN's IPv6. */
-    public static boolean acceptIncomingCall(String callId, String sdpAnswer) {
+    public boolean acceptIncomingCall(String callId, String sdpAnswer) {
         if (!sNativeAvailable) return false;
         try { return nativeAcceptIncomingCall(callId, sdpAnswer); }
         catch (UnsatisfiedLinkError e) { return false; }
@@ -301,7 +318,7 @@ public final class HamelinPortsSipStack {
     /** Reject the MT INVITE matching {@code callId} with a SIP error
      *  code. Typical values: 486 Busy Here, 480 Temporarily
      *  Unavailable, 603 Decline (3GPP TS 24.229 §5.1.3). */
-    public static boolean rejectIncomingCall(String callId, int sipCode) {
+    public boolean rejectIncomingCall(String callId, int sipCode) {
         if (!sNativeAvailable) return false;
         try { return nativeRejectIncomingCall(callId, sipCode); }
         catch (UnsatisfiedLinkError e) { return false; }
@@ -332,10 +349,10 @@ public final class HamelinPortsSipStack {
      *         the registration handler in native logs (logcat tag
      *         LineageIms-JNI).
      */
-    public static boolean startRegister(String impi, String impu, String domain,
-                                        int expirySec, String instanceId,
-                                        String pcscfHost, int pcscfCleartextPort,
-                                        String securityClient) {
+    public boolean startRegister(String impi, String impu, String domain,
+                                 int expirySec, String instanceId,
+                                 String pcscfHost, int pcscfCleartextPort,
+                                 String securityClient) {
         if (!sNativeAvailable) return false;
         try {
             return nativeStartRegister(impi, impu, domain, expirySec,
@@ -353,7 +370,7 @@ public final class HamelinPortsSipStack {
      *  200 OK on Mavenir, causing MT voice to fall back to CSFB once
      *  the modem's NAS "VoPS" preference decays without a fresh
      *  REGISTER keeping the registration visible to the TAS. */
-    public static boolean refreshRegister() {
+    public boolean refreshRegister() {
         if (!sNativeAvailable) return false;
         try { return nativeRefreshRegister(); }
         catch (UnsatisfiedLinkError e) { return false; }
@@ -361,7 +378,7 @@ public final class HamelinPortsSipStack {
 
     /** Register the listener that native fires for inbound SIP MESSAGE
      *  and for the result of {@link #sendSms}. */
-    public static void setSmsListener(SmsSessionListener listener) {
+    public void setSmsListener(SmsSessionListener listener) {
         if (!sNativeAvailable) return;
         try { nativeSetSmsListener(listener); }
         catch (UnsatisfiedLinkError e) {}
@@ -377,7 +394,7 @@ public final class HamelinPortsSipStack {
      * @param body opaque body bytes (typically RP-DATA wrapping the TPDU)
      * @return true if queued; the outcome arrives via {@link SmsSessionListener}.
      */
-    public static boolean sendSms(String targetUri, String contentType, byte[] body) {
+    public boolean sendSms(String targetUri, String contentType, byte[] body) {
         if (!sNativeAvailable) return false;
         try { return nativeSendSms(targetUri, contentType, body); }
         catch (UnsatisfiedLinkError e) { return false; }
@@ -387,7 +404,7 @@ public final class HamelinPortsSipStack {
      *  Used by the MT handler to route the separate RP-ACK back to
      *  the exact SMSC instance that sent us the MT. Returns "" if
      *  no MT has been received yet or no PAI was present. */
-    public static String getLastMtPai() {
+    public String getLastMtPai() {
         if (!sNativeAvailable) return "";
         try { return nativeGetLastMtPai(); }
         catch (UnsatisfiedLinkError e) { return ""; }

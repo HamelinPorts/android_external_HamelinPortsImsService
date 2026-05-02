@@ -157,7 +157,7 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
          * 100rel which ReSIProcate handles; we wait for PRACK
          * before the framework's accept() call arrives. */
         if (mCallId != null) {
-            boolean ok = HamelinPortsSipStack.progressRinging(mCallId);
+            boolean ok = mRegController.stack().progressRinging(mCallId);
             Log.i(TAG, "MT setListener: progressRinging ok=" + ok
                     + " callId=" + mCallId);
         }
@@ -208,7 +208,7 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
         mState = ImsCallSessionImplBase.State.TERMINATED;
         int sipCode = mapRejectReasonToSip(reason);
         if (mCallId != null) {
-            HamelinPortsSipStack.rejectIncomingCall(mCallId, sipCode);
+            mRegController.stack().rejectIncomingCall(mCallId, sipCode);
         }
         fireGoneOnce();
         if (mListener != null) {
@@ -283,7 +283,7 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
          * eventually times us out on RTCP silence (~8 s). Target this
          * dialog explicitly by Call-ID. */
         try {
-            boolean sent = HamelinPortsSipStack.endCallByCallId(mCallId);
+            boolean sent = mRegController.stack().endCallByCallId(mCallId);
             Log.i(TAG, "MT BYE queued=" + sent + " callId=" + mCallId);
         } catch (Exception e) {
             Log.w(TAG, "endCallByCallId failed", e);
@@ -348,7 +348,7 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
         /* Hook ourselves as the call-session listener for the live
          * dialog. Same global-listener pattern MO uses; safe because
          * only one call is active. */
-        HamelinPortsSipStack.setCallSessionListener(new CallSessionListener() {
+        mRegController.stack().setCallSessionListener(new CallSessionListener() {
             @Override public void onProvisional(int code, String reason) { /* MT doesn't receive these */ }
             @Override public void onAnswer(String remoteIp, int remoteRtpPort,
                                            int remoteRtcpPort, int pt,
@@ -384,7 +384,7 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
 
         String sdp = buildAnswerSdp(localIp, mRtpPort, mRtcpPort, mRemote,
                 mRemoteVideo, mRtpPortVideo, mRtcpPortVideo);
-        boolean ok = HamelinPortsSipStack.acceptIncomingCall(mCallId, sdp);
+        boolean ok = mRegController.stack().acceptIncomingCall(mCallId, sdp);
         Log.i(TAG, "MT accept: acceptIncomingCall ok=" + ok);
         if (!ok) {
             throw new IllegalStateException("native acceptIncomingCall returned false");

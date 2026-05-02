@@ -36,6 +36,13 @@ public class ImsRegistrationController {
     private final Context mContext;
     private final int mSlotId;
     private final ImsRegistrationImplBase mRegImpl = new ImsRegistrationImplBase();
+    /** Per-slot SIP-stack handle. Today the underlying native singleton
+     *  is shared between slots; phase 4B will fan out per slot. Plumbed
+     *  through CallSession / IncomingCallSession / SmsImpl / MmTelFeature
+     *  via {@link #stack()} so they don't statically reach into the
+     *  process-global API. Declared early so the {@code mRefreshRunnable}
+     *  field-initializer below can reference it. */
+    private final HamelinPortsSipStack mStack;
 
     private ConnectivityManager mCm;
     private ConnectivityManager.NetworkCallback mNetCallback;
@@ -50,18 +57,23 @@ public class ImsRegistrationController {
     private volatile int mNegotiatedExpiresSec;
     private final RegistrationDiag mDiag = new RegistrationDiag();
     private final Handler mRefreshHandler = new Handler(Looper.getMainLooper());
-    private final Runnable mRefreshRunnable = () -> {
-        /* Fire the refresh regardless of current mRegistered state —
-         * reSIProcate will bail cleanly if the handle isn't valid any
-         * more. We still rearm below because the service should keep
-         * trying periodically; a failed refresh followed by onFailure
-         * will tear the trial down and start a fresh REGISTER. */
-        boolean ok = HamelinPortsSipStack.refreshRegister();
+    private final Runnable mRefreshRunnable = this::fireRefreshTick;
+
+    /* Fire the refresh regardless of current mRegistered state —
+     * reSIProcate will bail cleanly if the handle isn't valid any
+     * more. We still rearm below because the service should keep
+     * trying periodically; a failed refresh followed by onFailure
+     * will tear the trial down and start a fresh REGISTER. The body
+     * lives in a method (not a lambda field) so javac doesn't flag
+     * the {@code mStack} read as a forward reference — mStack is
+     * blank-final initialized in the ctor, after this field. */
+    private void fireRefreshTick() {
+        boolean ok = mStack.refreshRegister();
         mDiag.onRefreshTick(ok);
         Log.i(TAG, "REGISTER refresh tick ok=" + ok
                 + " negotiatedExpiresSec=" + mNegotiatedExpiresSec);
         scheduleNextRefresh();
-    };
+    }
 
     /** Diagnostic state for {@code dumpsys activity service
      *  org.hamelinports.ims/.HamelinPortsImsService}. Persists across log-buffer
@@ -270,7 +282,11 @@ public class ImsRegistrationController {
         mSlotId = slotId;
         mCm = context.getSystemService(ConnectivityManager.class);
         mModemBridge = ImsModemBridgeFactory.create(context, slotId);
+        mStack = new HamelinPortsSipStack(slotId);
     }
+
+    /** Per-slot SIP stack accessor for downstream call/SMS/MmTel code. */
+    public HamelinPortsSipStack stack() { return mStack; }
 
     ImsRegistrationImplBase getRegistrationImpl() {
         return mRegImpl;
@@ -418,7 +434,7 @@ public class ImsRegistrationController {
                     mLastBoundIface = iface;
                     if (callActive) {
                         /* Mid-call WWAN↔WLAN handover. tearDown() would
-                         * call HamelinPortsSipStack.stop() which kills
+                         * call mStack.stop() which kills
                          * every reSIProcate Dialog, including the
                          * active call's. Without those handles, a
                          * follow-up re-INVITE has nothing to drive,
@@ -586,7 +602,7 @@ public class ImsRegistrationController {
                     ImsReasonInfo.CODE_LOCAL_SERVICE_UNAVAILABLE, 0));
         }
         if (ownedStack) {
-            try { HamelinPortsSipStack.stop(); } catch (Exception e) {}
+            try { mStack.stop(); } catch (Exception e) {}
         }
         if (mAkaProvider != null) {
             try { mAkaProvider.close(); } catch (Exception e) {}
@@ -660,7 +676,7 @@ public class ImsRegistrationController {
             try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
             Log.i(TAG, "one-shot trial tear-down: " + why);
             if (ownedStack) {
-                try { HamelinPortsSipStack.stop(); } catch (Exception e) {}
+                try { mStack.stop(); } catch (Exception e) {}
             }
             if (mAkaProvider != null) {
                 try { mAkaProvider.close(); } catch (Exception e) {}
@@ -751,19 +767,19 @@ public class ImsRegistrationController {
         // bind transports → register the AKA provider (so the auth
         // round can fire) and the registration listener (so we hear
         // back about success).
-        if (!HamelinPortsSipStack.start()) {
+        if (!mStack.start()) {
             Log.e(TAG, "HamelinPortsSipStack.start failed");
             return;
         }
-        if (!HamelinPortsSipStack.addSipTransports(localIp, ueSec.portC, ueSec.portS)) {
+        if (!mStack.addSipTransports(localIp, ueSec.portC, ueSec.portS)) {
             Log.e(TAG, "addSipTransports failed");
             tearDown();
             return;
         }
         mAkaProvider = new HamelinPortsAkaProviderImpl(
                 mContext, mSlotId, ueSec, pcscf, localAddr, localIp);
-        HamelinPortsSipStack.setAkaProvider(mAkaProvider);
-        HamelinPortsSipStack.setRegistrationListener(new RegistrationListener() {
+        mStack.setAkaProvider(mAkaProvider);
+        mStack.setRegistrationListener(new RegistrationListener() {
             @Override public void onExpiresReported(int expires) {
                 mNegotiatedExpiresSec = expires;
                 Log.i(TAG, "REGISTER Expires negotiated: " + expires + " s");
@@ -888,7 +904,7 @@ public class ImsRegistrationController {
                             if (!mRunning) return;
                             Log.i(TAG, "5xx retry firing — fresh REGISTER cycle");
                             mRetryInFlight = true;
-                            try { HamelinPortsSipStack.stop(); } catch (Exception e) {}
+                            try { mStack.stop(); } catch (Exception e) {}
                             if (mAkaProvider != null) {
                                 try { mAkaProvider.close(); } catch (Exception e) {}
                                 mAkaProvider = null;
@@ -940,7 +956,7 @@ public class ImsRegistrationController {
                     Log.i(TAG, "flow terminated — rearming REGISTER");
                     new Thread(() -> {
                         try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
-                        try { HamelinPortsSipStack.stop(); } catch (Exception e) {}
+                        try { mStack.stop(); } catch (Exception e) {}
                         if (mAkaProvider != null) {
                             try { mAkaProvider.close(); } catch (Exception e) {}
                             mAkaProvider = null;
@@ -975,7 +991,7 @@ public class ImsRegistrationController {
                      * existing SIP transactions drain. */
                     new Thread(() -> {
                         try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
-                        try { HamelinPortsSipStack.stop(); } catch (Exception e) {}
+                        try { mStack.stop(); } catch (Exception e) {}
                         if (mAkaProvider != null) {
                             try { mAkaProvider.close(); } catch (Exception e) {}
                             mAkaProvider = null;
@@ -1003,7 +1019,7 @@ public class ImsRegistrationController {
                 "persist.lineage.ims.register.expires.sec", 3600);
         if (expiresSec < 60) expiresSec = 60;        /* sanity floor */
         Log.i(TAG, "REGISTER request Expires=" + expiresSec + " s");
-        boolean queued = HamelinPortsSipStack.startRegister(
+        boolean queued = mStack.startRegister(
                 impi, impu, creds.domain,
                 expiresSec, creds.imeiUrn,
                 pcscfHost, 5060, securityClient);

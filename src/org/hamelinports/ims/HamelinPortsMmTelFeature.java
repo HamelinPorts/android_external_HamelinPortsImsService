@@ -129,7 +129,7 @@ public class HamelinPortsMmTelFeature extends MmTelFeature implements IncomingCa
          * a second caller during active call; reject 486. */
         if (mActiveCall != null || mActiveIncoming != null) {
             Log.w(TAG, "MT reject: another session active — 486 Busy Here");
-            HamelinPortsSipStack.rejectIncomingCall(callId, 486);
+            mRegController.stack().rejectIncomingCall(callId, 486);
             return;
         }
         HamelinPortsIncomingCallSession.RemoteAudio remote =
@@ -179,7 +179,7 @@ public class HamelinPortsMmTelFeature extends MmTelFeature implements IncomingCa
         } catch (Throwable t) {
             Log.e(TAG, "notifyIncomingCall failed", t);
             mActiveIncoming = null;
-            HamelinPortsSipStack.rejectIncomingCall(callId, 500);
+            mRegController.stack().rejectIncomingCall(callId, 500);
         }
     }
 
@@ -332,7 +332,7 @@ public class HamelinPortsMmTelFeature extends MmTelFeature implements IncomingCa
          * last-writer-wins; whichever slot registers last owns MT
          * routing — which is correct because the active-SIM slot is
          * the only one that will ever register. */
-        HamelinPortsSipStack.setIncomingCallListener(this);
+        mRegController.stack().setIncomingCallListener(this);
         Log.i(TAG, "notified capabilities: VOICE + SMS; MT listener bound slot=" + mSlotId);
     }
 
