@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <ctype.h>
+#include <arpa/inet.h>
 #include <sys/system_properties.h>
 
 static int run_ip(char *const argv[]) {
@@ -19,10 +20,8 @@ static int run_ip(char *const argv[]) {
 
 static int valid_ipv6(const char *s) {
     if (!s || !*s) return 0;
-    for (; *s; s++) {
-        if (!isxdigit(*s) && *s != ':' && *s != '.') return 0;
-    }
-    return 1;
+    struct in6_addr addr;
+    return inet_pton(AF_INET6, s, &addr) == 1;
 }
 
 static int valid_spi(const char *s) {
