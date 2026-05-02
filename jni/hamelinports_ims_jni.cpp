@@ -29,6 +29,7 @@
 #include <jni.h>
 #include <android/log.h>
 
+#include <array>
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -82,23 +83,41 @@
 
 namespace {
 
+class Bridge;  /* forward decl — handlers/auth manager hold a Bridge* */
+
+/* Bridge accessor helpers. Handlers + auth manager + decorator are
+ * declared before Bridge is fully defined (Bridge owns them as
+ * member fields), but their upcall code needs to read per-slot
+ * jobjects + last-MT state that live on Bridge. These free functions
+ * are forward-declared here and inline-defined after Bridge below,
+ * so the handler classes can use them without requiring a complete
+ * Bridge type at the point of declaration. */
+jobject       bridgeAkaProvider(Bridge*);
+jobject       bridgeRegListener(Bridge*);
+jobject       bridgeCallListener(Bridge*);
+jobject       bridgeIncomingCallListener(Bridge*);
+jobject       bridgeSmsListener(Bridge*);
+std::mutex&   bridgeLastMtPaiMu(Bridge*);
+std::string&  bridgeLastMtPai(Bridge*);
+std::string&  bridgeLastMtCallId(Bridge*);
+
 /* --------------------------------------------------------------------- *
- * JNI globals (set in JNI_OnLoad / nativeSetAkaProvider)
+ * JNI globals (cached at JNI_OnLoad — immutable for the process life)
+ *
+ * Per-slot mutable state — Java listener jobjects, last-MT PAI/Call-Id
+ * — lives on the per-slot Bridge instance (see class Bridge below).
  * --------------------------------------------------------------------- */
 
 JavaVM*   gJvm                  = nullptr;
-jobject   gAkaProvider          = nullptr;   /* global ref */
 jmethodID gOnAuthChallengeMethod = nullptr;
 jclass    gAkaResultClass       = nullptr;   /* global ref */
 jfieldID  gFieldRes             = nullptr;
 jfieldID  gFieldCk              = nullptr;
 jfieldID  gFieldIk              = nullptr;
 jfieldID  gFieldAuts            = nullptr;
-jobject   gRegListener              = nullptr;   /* global ref */
 jmethodID gOnRegisteredMethod       = nullptr;
 jmethodID gOnDeregisteredMethod     = nullptr;
 jmethodID gOnRegisterExpiresReported = nullptr;
-jobject   gCallListener         = nullptr;   /* global ref */
 jmethodID gOnCallProvisional    = nullptr;
 jmethodID gOnCallConnected      = nullptr;
 jmethodID gOnCallTerminated     = nullptr;
@@ -106,34 +125,12 @@ jmethodID gOnCallFailure        = nullptr;
 jmethodID gOnCallAnswer         = nullptr;
 jmethodID gOnCallAnswerVideo    = nullptr;
 jmethodID gOnRemoteReinvite     = nullptr;
-/* MT (server-side) INVITE listener — separate from gCallListener
- * (which is set by whichever CallSession is currently active) so that
- * the MmTelFeature can stay subscribed to incoming-call events even
- * between sessions. Set by nativeSetIncomingCallListener. */
-jobject   gIncomingCallListener = nullptr;
 jmethodID gOnIncomingInvite      = nullptr;
 jmethodID gOnIncomingInviteVideo = nullptr;
 jmethodID gOnIncomingCancelled   = nullptr;
-jobject   gSmsListener          = nullptr;   /* global ref */
 jmethodID gOnSmsSendSuccess     = nullptr;
 jmethodID gOnSmsSendFailure     = nullptr;
 jmethodID gOnSmsIncoming        = nullptr;
-
-/* P-Asserted-Identity of the most recently received MT MESSAGE.
- * Written by ServerPagerMessageHandler::onMessageArrived, read by
- * Java (via nativeGetLastMtPai) when it wants to send a separate
- * RP-ACK MESSAGE back to that specific SMSC instance per
- * TS 24.229 §5.3.1.3.4. Guarded by gLastMtPaiMu. */
-std::mutex  gLastMtPaiMu;
-std::string gLastMtPai;
-
-/* Call-ID of the most recently received MT MESSAGE. Stamped on the
- * outbound RP-ACK as `In-Reply-To: <call-id>` so Mavenir's IP-SM-GW
- * can correlate the RP-ACK to the original MT RP-DATA transaction.
- * Without this correlator the IP-SM-GW returns 481 Call/Transaction
- * Does Not Exist on the second and subsequent UE-originated RP-ACK
- * MESSAGEs in the same registration. Guarded by gLastMtPaiMu. */
-std::string gLastMtCallId;
 
 /* Cached state from the most recent successful AKA round, used by
  * later requests (Security-Verify on INVITE/MESSAGE etc.). */
@@ -213,9 +210,11 @@ JNIEnv* attachJni(bool* outAttached) {
 
 class ImsDecorator : public resip::MessageDecorator {
 public:
-    ImsDecorator(resip::Data securityClient, AkaCache& akaCache, PaniCache& paniCache,
+    ImsDecorator(Bridge* bridge,
+                 resip::Data securityClient, AkaCache& akaCache, PaniCache& paniCache,
                  unsigned int portCTransportKey, int portS)
-        : mSecurityClient(std::move(securityClient)),
+        : mBridge(bridge),
+          mSecurityClient(std::move(securityClient)),
           mAkaCache(akaCache), mPaniCache(paniCache),
           mPortCTransportKey(portCTransportKey), mPortS(portS) {}
 
@@ -409,9 +408,9 @@ public:
             std::string ruri;
             std::string mtCallId, mtPai;
             {
-                std::lock_guard<std::mutex> g(gLastMtPaiMu);
-                mtPai   = gLastMtPai;
-                mtCallId = gLastMtCallId;
+                std::lock_guard<std::mutex> g(bridgeLastMtPaiMu(mBridge));
+                mtPai   = bridgeLastMtPai(mBridge);
+                mtCallId = bridgeLastMtCallId(mBridge);
             }
             if (!mtPai.empty() && !mtCallId.empty()) {
                 std::ostringstream oss;
@@ -438,6 +437,7 @@ public:
     }
 
 private:
+    Bridge*      mBridge = nullptr;
     resip::Data  mSecurityClient;
     AkaCache&    mAkaCache;
     PaniCache&   mPaniCache;
@@ -451,10 +451,11 @@ private:
 
 class HamelinPortsImsAuthManager : public resip::ClientAuthManager {
 public:
-    HamelinPortsImsAuthManager(AkaCache& cache,
+    HamelinPortsImsAuthManager(Bridge* bridge,
+                          AkaCache& cache,
                           const std::string& pcscfHost,
                           unsigned int portCTransportKey)
-        : mCache(cache), mPcscfHost(pcscfHost),
+        : mBridge(bridge), mCache(cache), mPcscfHost(pcscfHost),
           mPortCTransportKey(portCTransportKey) {}
 
     bool handle(resip::UserProfile& userProfile,
@@ -544,7 +545,7 @@ private:
 
         /* JNI upcall: Java runs USIM AKA AND installs the kernel xfrm
          * policies for the four SAs (TS 33.203 §7.4) before returning. */
-        if (!gAkaProvider || !gOnAuthChallengeMethod) {
+        if (!bridgeAkaProvider(mBridge) || !gOnAuthChallengeMethod) {
             LOGE("AKA: no provider registered");
             return false;
         }
@@ -562,7 +563,7 @@ private:
         jstring jAlg = env->NewStringUTF(alg.c_str());
 
         jobject jResult = env->CallObjectMethod(
-                gAkaProvider, gOnAuthChallengeMethod,
+                bridgeAkaProvider(mBridge), gOnAuthChallengeMethod,
                 jRand, jAutn,
                 (jlong)serverSpiC, (jlong)serverSpiS,
                 (jint)serverPortC, (jint)serverPortS,
@@ -688,6 +689,7 @@ private:
         return true;
     }
 
+    Bridge*          mBridge = nullptr;
     AkaCache&        mCache;
     std::string      mPcscfHost;
     unsigned int     mPortCTransportKey = 0;
@@ -701,6 +703,9 @@ private:
 
 class HamelinPortsRegHandler : public resip::ClientRegistrationHandler {
 public:
+    /** Bridge owning this handler. Set during Bridge construction so
+     *  upcalls can find the slot-specific listener jobjects. */
+    Bridge* mBridge = nullptr;
     /** Bridge sets this to receive the public identity on each 200 OK. */
     std::function<void(const std::string&)> onPublicIdentity;
     /** Bridge sets this so {@code nativeRefreshRegister} has a handle to
@@ -803,24 +808,24 @@ public:
 
 private:
     void upcallRegistered(const std::string& associatedUri) {
-        if (!gRegListener || !gOnRegisteredMethod) return;
+        if (!bridgeRegListener(mBridge) || !gOnRegisteredMethod) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
         if (!env) return;
         jstring jAu = env->NewStringUTF(associatedUri.c_str());
-        env->CallVoidMethod(gRegListener, gOnRegisteredMethod, jAu);
+        env->CallVoidMethod(bridgeRegListener(mBridge), gOnRegisteredMethod, jAu);
         env->DeleteLocalRef(jAu);
         if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
         if (attached) gJvm->DetachCurrentThread();
     }
     void upcallDeregistered(int code, const std::string& reason,
                             int retryAfterSec) {
-        if (!gRegListener || !gOnDeregisteredMethod) return;
+        if (!bridgeRegListener(mBridge) || !gOnDeregisteredMethod) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
         if (!env) return;
         jstring jr = env->NewStringUTF(reason.c_str());
-        env->CallVoidMethod(gRegListener, gOnDeregisteredMethod,
+        env->CallVoidMethod(bridgeRegListener(mBridge), gOnDeregisteredMethod,
                             (jint)code, jr, (jint)retryAfterSec);
         env->DeleteLocalRef(jr);
         if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
@@ -838,6 +843,10 @@ private:
 class HamelinPortsInviteHandler : public resip::InviteSessionHandler {
 public:
     HamelinPortsInviteHandler() = default;
+
+    /** Bridge owning this handler. Set during Bridge construction so
+     *  upcalls reach the right slot's call/incoming-call listeners. */
+    Bridge* mBridge = nullptr;
 
     resip::ClientInviteSessionHandle takeActive() {
         std::lock_guard<std::mutex> g(mMu);
@@ -873,12 +882,12 @@ public:
 
 private:
     void upcall(jmethodID m, int code, const std::string& reason) {
-        if (!gCallListener || !m) return;
+        if (!bridgeCallListener(mBridge) || !m) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
         if (!env) return;
         jstring jr = env->NewStringUTF(reason.c_str());
-        env->CallVoidMethod(gCallListener, m, (jint)code, jr);
+        env->CallVoidMethod(bridgeCallListener(mBridge), m, (jint)code, jr);
         env->DeleteLocalRef(jr);
         if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
         if (attached) gJvm->DetachCurrentThread();
@@ -1058,12 +1067,12 @@ public:
          * Telecom state. Attaching to the MO listener upcall
          * (gOnCallTerminated) would not route because MT doesn't
          * install a CallSessionListener until accept(). */
-        if (wasMt && gIncomingCallListener && gOnIncomingCancelled) {
+        if (wasMt && bridgeIncomingCallListener(mBridge) && gOnIncomingCancelled) {
             bool attached = false;
             JNIEnv* env = attachJni(&attached);
             if (env) {
                 jstring jCid = env->NewStringUTF(cancelledCallId.c_str());
-                env->CallVoidMethod(gIncomingCallListener,
+                env->CallVoidMethod(bridgeIncomingCallListener(mBridge),
                         gOnIncomingCancelled, jCid, (jint)reason);
                 env->DeleteLocalRef(jCid);
                 if (env->ExceptionCheck()) {
@@ -1142,7 +1151,7 @@ public:
             return;
         }
 
-        if (!gCallListener || !gOnCallAnswer) return;
+        if (!bridgeCallListener(mBridge) || !gOnCallAnswer) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
         if (!env) return;
@@ -1152,7 +1161,7 @@ public:
             jstring jIp    = env->NewStringUTF(audioIp.c_str());
             jstring jName  = env->NewStringUTF(audioCodec.c_str());
             jstring jFmtp  = env->NewStringUTF(audioFmtp.c_str());
-            env->CallVoidMethod(gCallListener, gOnCallAnswer,
+            env->CallVoidMethod(bridgeCallListener(mBridge), gOnCallAnswer,
                                 jIp, (jint)audioPort, (jint)audioRtcpPort,
                                 (jint)audioPt, (jint)audioRate, jName, jFmtp);
             env->DeleteLocalRef(jIp);
@@ -1169,7 +1178,7 @@ public:
             jstring jIp    = env->NewStringUTF(vip.c_str());
             jstring jName  = env->NewStringUTF(videoCodec.c_str());
             jstring jFmtp  = env->NewStringUTF(videoFmtp.c_str());
-            env->CallVoidMethod(gCallListener, gOnCallAnswerVideo,
+            env->CallVoidMethod(bridgeCallListener(mBridge), gOnCallAnswerVideo,
                                 jIp, (jint)videoPort, (jint)videoRtcpPort,
                                 (jint)videoPt, (jint)videoRate, jName, jFmtp);
             env->DeleteLocalRef(jIp);
@@ -1293,7 +1302,7 @@ public:
          * video params in one call so Java has the complete new
          * offer shape in one hop. */
         if (isReinvite) {
-            if (!gCallListener || !gOnRemoteReinvite) {
+            if (!bridgeCallListener(mBridge) || !gOnRemoteReinvite) {
                 LOGW("re-INVITE: no listener wired — rejecting implicitly (ignored)");
                 return;
             }
@@ -1307,7 +1316,7 @@ public:
             jstring jVIp     = re->NewStringUTF(vip.c_str());
             jstring jVCodec  = re->NewStringUTF(videoCodec.c_str());
             jstring jVFmtp   = re->NewStringUTF(videoFmtp.c_str());
-            re->CallVoidMethod(gCallListener, gOnRemoteReinvite,
+            re->CallVoidMethod(bridgeCallListener(mBridge), gOnRemoteReinvite,
                                jAIp, (jint)audioPort, (jint)audioRtcpPort,
                                (jint)audioPt, (jint)audioRate, jACodec, jAFmtp,
                                jVIp, (jint)videoPort, (jint)videoRtcpPort,
@@ -1323,7 +1332,7 @@ public:
             return;
         }
 
-        if (!gIncomingCallListener || !gOnIncomingInvite) return;
+        if (!bridgeIncomingCallListener(mBridge) || !gOnIncomingInvite) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
         if (!env) return;
@@ -1335,7 +1344,7 @@ public:
             jstring jIp     = env->NewStringUTF(audioIp.c_str());
             jstring jCodec  = env->NewStringUTF(audioCodec.c_str());
             jstring jFmtp   = env->NewStringUTF(audioFmtp.c_str());
-            env->CallVoidMethod(gIncomingCallListener, gOnIncomingInvite,
+            env->CallVoidMethod(bridgeIncomingCallListener(mBridge), gOnIncomingInvite,
                                 jCallId, jFrom, jIp,
                                 (jint)audioPort, (jint)audioRtcpPort,
                                 (jint)audioPt, (jint)audioRate,
@@ -1358,7 +1367,7 @@ public:
             jstring jIp     = env->NewStringUTF(vip.c_str());
             jstring jCodec  = env->NewStringUTF(videoCodec.c_str());
             jstring jFmtp   = env->NewStringUTF(videoFmtp.c_str());
-            env->CallVoidMethod(gIncomingCallListener, gOnIncomingInviteVideo,
+            env->CallVoidMethod(bridgeIncomingCallListener(mBridge), gOnIncomingInviteVideo,
                                 jCallId, jIp,
                                 (jint)videoPort, (jint)videoRtcpPort,
                                 (jint)videoPt, (jint)videoRate,
@@ -1465,6 +1474,11 @@ public:
 class HamelinPortsSmsHandler : public resip::ClientPagerMessageHandler,
                           public resip::ServerPagerMessageHandler {
 public:
+    /** Bridge owning this handler. Set during Bridge construction so
+     *  upcalls reach the right slot's SMS listener and write the
+     *  per-Bridge lastMtPai/lastMtCallId fields. */
+    Bridge* mBridge = nullptr;
+
     void onSuccess(resip::ClientPagerMessageHandle, const resip::SipMessage& msg) override {
         const int code = msg.header(resip::h_StatusLine).statusCode();
         LOGI("SMS onSuccess: %d", code);
@@ -1492,20 +1506,20 @@ public:
          * cache). With the correlator stamped, every RP-ACK is
          * unambiguous and the SMSC drains the queue cleanly. */
         {
-            std::lock_guard<std::mutex> g(gLastMtPaiMu);
-            gLastMtPai.clear();
-            gLastMtCallId.clear();
+            std::lock_guard<std::mutex> g(bridgeLastMtPaiMu(mBridge));
+            bridgeLastMtPai(mBridge).clear();
+            bridgeLastMtCallId(mBridge).clear();
             if (msg.exists(resip::h_PAssertedIdentities) &&
                 !msg.header(resip::h_PAssertedIdentities).empty()) {
                 std::ostringstream oss;
                 oss << msg.header(resip::h_PAssertedIdentities).front().uri();
-                gLastMtPai = oss.str();
+                bridgeLastMtPai(mBridge) = oss.str();
             }
             if (msg.exists(resip::h_CallId)) {
-                gLastMtCallId = msg.header(resip::h_CallId).value().c_str();
+                bridgeLastMtCallId(mBridge) = msg.header(resip::h_CallId).value().c_str();
             }
             LOGI("MT PAI=%s Call-ID=%s",
-                 gLastMtPai.c_str(), gLastMtCallId.c_str());
+                 bridgeLastMtPai(mBridge).c_str(), bridgeLastMtCallId(mBridge).c_str());
         }
 
         const resip::Contents* body = msg.getContents();
@@ -1517,14 +1531,14 @@ public:
         const auto* oc = dynamic_cast<const resip::OctetContents*>(body);
         const resip::Data& bytes = oc ? oc->octets() : body->getBodyData();
 
-        if (gSmsListener && gOnSmsIncoming) {
+        if (bridgeSmsListener(mBridge) && gOnSmsIncoming) {
             bool attached = false;
             JNIEnv* env = attachJni(&attached);
             if (env) {
                 jbyteArray jArr = env->NewByteArray((jsize)bytes.size());
                 env->SetByteArrayRegion(jArr, 0, (jsize)bytes.size(),
                                         (const jbyte*)bytes.data());
-                env->CallVoidMethod(gSmsListener, gOnSmsIncoming, jArr);
+                env->CallVoidMethod(bridgeSmsListener(mBridge), gOnSmsIncoming, jArr);
                 env->DeleteLocalRef(jArr);
                 if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
                 if (attached) gJvm->DetachCurrentThread();
@@ -1540,12 +1554,12 @@ public:
 
 private:
     void upcall(jmethodID m, int code, const std::string& reason) {
-        if (!gSmsListener || !m) return;
+        if (!bridgeSmsListener(mBridge) || !m) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
         if (!env) return;
         jstring jr = env->NewStringUTF(reason.c_str());
-        env->CallVoidMethod(gSmsListener, m, (jint)code, jr);
+        env->CallVoidMethod(bridgeSmsListener(mBridge), m, (jint)code, jr);
         env->DeleteLocalRef(jr);
         if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
         if (attached) gJvm->DetachCurrentThread();
@@ -1558,9 +1572,24 @@ private:
 
 class Bridge {
 public:
-    static Bridge& instance() {
-        static Bridge inst;
-        return inst;
+    /** Maximum number of physical slots a single device exposes. Bumping
+     *  this is fine — the array is just nullptr-initialised pointers. */
+    static constexpr int kMaxSlots = 2;
+
+    /** Lookup-or-create the Bridge for {@code slot}. Returns nullptr on
+     *  out-of-range. Lazily allocated on first use; never freed
+     *  (process-lifetime), since the Java {@code HamelinPortsSipStack}
+     *  instance holds a reference for as long as the IMS service runs. */
+    static Bridge* instance(int slot) {
+        if (slot < 0 || slot >= kMaxSlots) return nullptr;
+        Bridge* b = sBridges[slot].load(std::memory_order_acquire);
+        if (b) return b;
+        std::lock_guard<std::mutex> g(sCtorMu);
+        b = sBridges[slot].load(std::memory_order_relaxed);
+        if (b) return b;
+        b = new Bridge(slot);
+        sBridges[slot].store(b, std::memory_order_release);
+        return b;
     }
 
     bool start() {
@@ -1568,10 +1597,17 @@ public:
         if (mStarted) return true;
 
         try {
-            resip::Log::initialize(resip::Log::Cout,
-                                   resip::Log::Info,
-                                   "HamelinPortsIms:resip",
-                                   *mAndroidLogger);
+            /* resip::Log::initialize is process-global; calling it twice
+             * (once per slot) reconfigures the logger, last-writer-wins.
+             * Once-guard so the first slot up wins and the second is a
+             * no-op. */
+            static std::once_flag sLogInitOnce;
+            std::call_once(sLogInitOnce, [this]() {
+                resip::Log::initialize(resip::Log::Cout,
+                                       resip::Log::Info,
+                                       "HamelinPortsIms:resip",
+                                       *mAndroidLogger);
+            });
 
             mStack = std::make_unique<resip::SipStack>();
             mDum   = std::make_unique<resip::DialogUsageManager>(*mStack);
@@ -1899,13 +1935,14 @@ public:
              * the auth manager's stored Security-Verify is visible to the
              * decorator on later non-REGISTER requests. */
             mImsDecorator = std::make_shared<ImsDecorator>(
+                    this,
                     resip::Data(securityClient), mAkaCache, mPaniCache,
                     mPortCTransportKey, mUePortS);
             mProf->setOutboundDecorator(mImsDecorator);
 
             mDum->setClientAuthManager(
                     std::make_unique<HamelinPortsImsAuthManager>(
-                            mAkaCache, pcscfHost, mPortCTransportKey));
+                            this, mAkaCache, pcscfHost, mPortCTransportKey));
             mDum->setClientRegistrationHandler(&mRegHandler);
 
             /* The AOR drives From and To in the REGISTER. Per 3GPP
@@ -2320,10 +2357,25 @@ public:
     }
 
 private:
-    Bridge() = default;
+    explicit Bridge(int slotId) {
+        mSlotId = slotId;
+        /* Wire back-pointers so the handlers and the auth manager we
+         * own can hit our per-slot listener jobjects on upcalls. The
+         * decorator gets its Bridge* via the make_shared below at
+         * startRegister time. */
+        mRegHandler.mBridge = this;
+        mInviteHandler.mBridge = this;
+        mSmsHandler.mBridge = this;
+    }
     ~Bridge() = default;
     Bridge(const Bridge&) = delete;
     Bridge& operator=(const Bridge&) = delete;
+
+    /* Per-slot Bridge instances. Allocated lazily by instance(slot),
+     * never freed for the process life — the Java HamelinPortsSipStack
+     * holds onto the slot for as long as the IMS service runs. */
+    static std::array<std::atomic<Bridge*>, kMaxSlots> sBridges;
+    static std::mutex sCtorMu;
 
     void tearDown() {
         /* Invalidate any stored handles before the DialogUsageManager
@@ -2381,6 +2433,26 @@ private:
     bool                                       mRegHandleValid = false;
 
 public:
+    /* Slot identity. Process-wide there are one Bridge per slot, looked
+     * up via instance(slot). The handlers/auth manager hold a Bridge*
+     * back-pointer so their upcalls reach this slot's listener jobjects. */
+    int                mSlotId = -1;
+
+    /* Per-slot Java listener jobjects (NewGlobalRef'd from the
+     * corresponding nativeSetXxxListener). Released in tearDown(). */
+    jobject            mAkaProvider = nullptr;
+    jobject            mRegListener = nullptr;
+    jobject            mCallListener = nullptr;
+    jobject            mIncomingCallListener = nullptr;
+    jobject            mSmsListener = nullptr;
+
+    /* Last received MT MESSAGE PAI and Call-ID. Java reads PAI via
+     * getLastMtPai() to address the SMS-layer RP-ACK, and the decorator
+     * reads both to stamp In-Reply-To on the outbound RP-ACK. */
+    std::mutex         mLastMtPaiMu;
+    std::string        mLastMtPai;
+    std::string        mLastMtCallId;
+
     bool refreshRegister() {
         std::lock_guard<std::mutex> g(mMu);
         if (!mStarted || !mDum) return false;
@@ -2402,11 +2474,11 @@ public:
     }
 
     void upcallExpiresReported(int expires) {
-        if (!gRegListener || !gOnRegisterExpiresReported) return;
+        if (!mRegListener || !gOnRegisterExpiresReported) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
         if (!env) return;
-        env->CallVoidMethod(gRegListener, gOnRegisterExpiresReported,
+        env->CallVoidMethod(mRegListener, gOnRegisterExpiresReported,
                             (jint)expires);
         if (env->ExceptionCheck()) {
             env->ExceptionDescribe();
@@ -2415,6 +2487,19 @@ public:
         if (attached) gJvm->DetachCurrentThread();
     }
 };
+
+/* Inline definitions for the Bridge accessor helpers forward-declared
+ * at the top of this namespace. Defined after Bridge's full class
+ * body so the handler/decorator/auth-manager bodies above (which only
+ * see the forward decl of Bridge) can resolve these calls. */
+inline jobject       bridgeAkaProvider(Bridge* b)         { return b->mAkaProvider; }
+inline jobject       bridgeRegListener(Bridge* b)         { return b->mRegListener; }
+inline jobject       bridgeCallListener(Bridge* b)        { return b->mCallListener; }
+inline jobject       bridgeIncomingCallListener(Bridge* b){ return b->mIncomingCallListener; }
+inline jobject       bridgeSmsListener(Bridge* b)         { return b->mSmsListener; }
+inline std::mutex&   bridgeLastMtPaiMu(Bridge* b)         { return b->mLastMtPaiMu; }
+inline std::string&  bridgeLastMtPai(Bridge* b)           { return b->mLastMtPai; }
+inline std::string&  bridgeLastMtCallId(Bridge* b)        { return b->mLastMtCallId; }
 
 }  // namespace
 
@@ -2429,30 +2514,50 @@ JNI_OnLoad(JavaVM* vm, void* /*reserved*/)
     return JNI_VERSION_1_6;
 }
 
+namespace {
+std::string jstrUtf(JNIEnv* env, jstring j) {
+    if (!j) return {};
+    const char* p = env->GetStringUTFChars(j, nullptr);
+    if (!p) return {};
+    std::string s(p);
+    env->ReleaseStringUTFChars(j, p);
+    return s;
+}
+}
+
+#define BRIDGE_OR(rv) \
+    Bridge* b = Bridge::instance((int)slotId); \
+    if (!b) return rv;
+#define BRIDGE_OR_VOID() \
+    Bridge* b = Bridge::instance((int)slotId); \
+    if (!b) return;
+
 extern "C" JNIEXPORT void JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetAkaProvider(
-        JNIEnv* env, jclass /*clazz*/, jobject provider)
+        JNIEnv* env, jclass /*clazz*/, jint slotId, jobject provider)
 {
-    if (gAkaProvider) {
-        env->DeleteGlobalRef(gAkaProvider);
-        gAkaProvider = nullptr;
-        gOnAuthChallengeMethod = nullptr;
+    BRIDGE_OR_VOID();
+    if (b->mAkaProvider) {
+        env->DeleteGlobalRef(b->mAkaProvider);
+        b->mAkaProvider = nullptr;
     }
     if (provider == nullptr) {
-        LOGI("AKA provider cleared");
+        LOGI("AKA provider cleared slot=%d", (int)slotId);
         return;
     }
 
-    gAkaProvider = env->NewGlobalRef(provider);
+    b->mAkaProvider = env->NewGlobalRef(provider);
 
-    jclass providerCls = env->GetObjectClass(provider);
-    gOnAuthChallengeMethod = env->GetMethodID(
-            providerCls, "onAuthChallenge",
-            "([B[BJJIILjava/lang/String;)Lorg/hamelinports/ims/sip/AkaResult;");
-    env->DeleteLocalRef(providerCls);
     if (!gOnAuthChallengeMethod) {
-        LOGE("AKA provider missing onAuthChallenge method");
-        return;
+        jclass providerCls = env->GetObjectClass(provider);
+        gOnAuthChallengeMethod = env->GetMethodID(
+                providerCls, "onAuthChallenge",
+                "([B[BJJIILjava/lang/String;)Lorg/hamelinports/ims/sip/AkaResult;");
+        env->DeleteLocalRef(providerCls);
+        if (!gOnAuthChallengeMethod) {
+            LOGE("AKA provider missing onAuthChallenge method");
+            return;
+        }
     }
 
     if (!gAkaResultClass) {
@@ -2468,83 +2573,76 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetAkaProvider(
         gFieldAuts = env->GetFieldID(cls, "auts", "[B");
         env->DeleteLocalRef(cls);
     }
-    LOGI("AKA provider registered");
+    LOGI("AKA provider registered slot=%d", (int)slotId);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeGetStackVersion(
         JNIEnv* env, jclass /*clazz*/)
 {
-    try { return env->NewStringUTF(Bridge::instance().banner().c_str()); }
+    /* Process-global banner — no slot, just instantiate a temporary
+     * bridge view that exposes the resiprocate library version. */
+    Bridge* b = Bridge::instance(0);
+    if (!b) return env->NewStringUTF("unavailable");
+    try { return env->NewStringUTF(b->banner().c_str()); }
     catch (...) { return env->NewStringUTF("exception"); }
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeStart(
-        JNIEnv* /*env*/, jclass /*clazz*/)
+        JNIEnv* /*env*/, jclass /*clazz*/, jint slotId)
 {
-    return Bridge::instance().start() ? JNI_TRUE : JNI_FALSE;
+    BRIDGE_OR(JNI_FALSE);
+    return b->start() ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeStop(
-        JNIEnv* /*env*/, jclass /*clazz*/)
+        JNIEnv* /*env*/, jclass /*clazz*/, jint slotId)
 {
-    Bridge::instance().stop();
+    BRIDGE_OR_VOID();
+    b->stop();
 }
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeGetStatus(
-        JNIEnv* env, jclass /*clazz*/)
+        JNIEnv* env, jclass /*clazz*/, jint slotId)
 {
-    try { return env->NewStringUTF(Bridge::instance().status().c_str()); }
+    Bridge* b = Bridge::instance((int)slotId);
+    if (!b) return env->NewStringUTF("unavailable");
+    try { return env->NewStringUTF(b->status().c_str()); }
     catch (...) { return env->NewStringUTF("exception"); }
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeAddSipTransports(
-        JNIEnv* env, jclass /*clazz*/,
+        JNIEnv* env, jclass /*clazz*/, jint slotId,
         jstring jLocalIp, jint portC, jint portS)
 {
+    BRIDGE_OR(JNI_FALSE);
     if (jLocalIp == nullptr) return JNI_FALSE;
     const char* utf = env->GetStringUTFChars(jLocalIp, nullptr);
     if (!utf) return JNI_FALSE;
     std::string localIp(utf);
     env->ReleaseStringUTFChars(jLocalIp, utf);
     try {
-        return Bridge::instance().addSipTransports(localIp, portC, portS)
+        return b->addSipTransports(localIp, portC, portS)
                 ? JNI_TRUE : JNI_FALSE;
     } catch (...) { return JNI_FALSE; }
 }
 
-namespace {
-std::string jstrUtf(JNIEnv* env, jstring j) {
-    if (!j) return {};
-    const char* p = env->GetStringUTFChars(j, nullptr);
-    if (!p) return {};
-    std::string s(p);
-    env->ReleaseStringUTFChars(j, p);
-    return s;
-}
-}
-
 extern "C" JNIEXPORT void JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetCallSessionListener(
-        JNIEnv* env, jclass /*clazz*/, jobject listener)
+        JNIEnv* env, jclass /*clazz*/, jint slotId, jobject listener)
 {
-    if (gCallListener) {
-        env->DeleteGlobalRef(gCallListener);
-        gCallListener = nullptr;
-        gOnCallProvisional = nullptr;
-        gOnCallConnected = nullptr;
-        gOnCallTerminated = nullptr;
-        gOnCallFailure = nullptr;
-        gOnCallAnswer = nullptr;
-        gOnCallAnswerVideo = nullptr;
-        gOnRemoteReinvite = nullptr;
+    BRIDGE_OR_VOID();
+    if (b->mCallListener) {
+        env->DeleteGlobalRef(b->mCallListener);
+        b->mCallListener = nullptr;
     }
     if (!listener) return;
-    gCallListener = env->NewGlobalRef(listener);
+    b->mCallListener = env->NewGlobalRef(listener);
+    if (gOnCallProvisional) return;  /* method-id cache filled already */
     jclass cls = env->GetObjectClass(listener);
     gOnCallProvisional = env->GetMethodID(cls, "onProvisional", "(ILjava/lang/String;)V");
     gOnCallConnected   = env->GetMethodID(cls, "onConnected",   "(ILjava/lang/String;)V");
@@ -2578,84 +2676,83 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetCallSessionListener(
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetCellIdForPani(
-        JNIEnv* env, jclass /*clazz*/, jstring jVal)
+        JNIEnv* env, jclass /*clazz*/, jint slotId, jstring jVal)
 {
-    try { Bridge::instance().setCellIdForPani(jstrUtf(env, jVal)); }
+    BRIDGE_OR_VOID();
+    try { b->setCellIdForPani(jstrUtf(env, jVal)); }
     catch (...) {}
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetIwlanNodeIdForPani(
-        JNIEnv* env, jclass /*clazz*/, jstring jVal)
+        JNIEnv* env, jclass /*clazz*/, jint slotId, jstring jVal)
 {
-    try { Bridge::instance().setIwlanNodeIdForPani(jstrUtf(env, jVal)); }
+    BRIDGE_OR_VOID();
+    try { b->setIwlanNodeIdForPani(jstrUtf(env, jVal)); }
     catch (...) {}
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeStartCall(
-        JNIEnv* env, jclass /*clazz*/, jstring jTarget, jstring jSdp)
+        JNIEnv* env, jclass /*clazz*/, jint slotId, jstring jTarget, jstring jSdp)
 {
+    BRIDGE_OR(JNI_FALSE);
     try {
-        return Bridge::instance().startCall(
-                jstrUtf(env, jTarget), jstrUtf(env, jSdp))
+        return b->startCall(jstrUtf(env, jTarget), jstrUtf(env, jSdp))
                 ? JNI_TRUE : JNI_FALSE;
     } catch (...) { return JNI_FALSE; }
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeReinvite(
-        JNIEnv* env, jclass /*clazz*/, jstring jSdp)
+        JNIEnv* env, jclass /*clazz*/, jint slotId, jstring jSdp)
 {
+    BRIDGE_OR(JNI_FALSE);
     if (!jSdp) return JNI_FALSE;
-    try {
-        return Bridge::instance().reinvite(
-                jstrUtf(env, jSdp)) ? JNI_TRUE : JNI_FALSE;
-    } catch (...) { return JNI_FALSE; }
+    try { return b->reinvite(jstrUtf(env, jSdp)) ? JNI_TRUE : JNI_FALSE; }
+    catch (...) { return JNI_FALSE; }
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeProvideReinviteAnswer(
-        JNIEnv* env, jclass /*clazz*/, jstring jSdp)
+        JNIEnv* env, jclass /*clazz*/, jint slotId, jstring jSdp)
 {
+    BRIDGE_OR(JNI_FALSE);
     if (!jSdp) return JNI_FALSE;
-    try {
-        return Bridge::instance().provideReinviteAnswer(
-                jstrUtf(env, jSdp)) ? JNI_TRUE : JNI_FALSE;
-    } catch (...) { return JNI_FALSE; }
+    try { return b->provideReinviteAnswer(jstrUtf(env, jSdp)) ? JNI_TRUE : JNI_FALSE; }
+    catch (...) { return JNI_FALSE; }
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeEndCallByCallId(
-        JNIEnv* env, jclass /*clazz*/, jstring jCallId)
+        JNIEnv* env, jclass /*clazz*/, jint slotId, jstring jCallId)
 {
+    BRIDGE_OR(JNI_FALSE);
     if (!jCallId) return JNI_FALSE;
-    try {
-        return Bridge::instance().endCallByCallId(
-                jstrUtf(env, jCallId)) ? JNI_TRUE : JNI_FALSE;
-    } catch (...) { return JNI_FALSE; }
+    try { return b->endCallByCallId(jstrUtf(env, jCallId)) ? JNI_TRUE : JNI_FALSE; }
+    catch (...) { return JNI_FALSE; }
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeEndCall(
-        JNIEnv* /*env*/, jclass /*clazz*/)
+        JNIEnv* /*env*/, jclass /*clazz*/, jint slotId)
 {
-    try { Bridge::instance().endCall(); } catch (...) {}
+    BRIDGE_OR_VOID();
+    try { b->endCall(); } catch (...) {}
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetIncomingCallListener(
-        JNIEnv* env, jclass /*clazz*/, jobject listener)
+        JNIEnv* env, jclass /*clazz*/, jint slotId, jobject listener)
 {
-    if (gIncomingCallListener) {
-        env->DeleteGlobalRef(gIncomingCallListener);
-        gIncomingCallListener = nullptr;
-        gOnIncomingInvite = nullptr;
-        gOnIncomingInviteVideo = nullptr;
-        gOnIncomingCancelled = nullptr;
+    BRIDGE_OR_VOID();
+    if (b->mIncomingCallListener) {
+        env->DeleteGlobalRef(b->mIncomingCallListener);
+        b->mIncomingCallListener = nullptr;
     }
     if (!listener) return;
-    gIncomingCallListener = env->NewGlobalRef(listener);
+    b->mIncomingCallListener = env->NewGlobalRef(listener);
+    if (gOnIncomingInvite) return;  /* method-id cache filled already */
     jclass cls = env->GetObjectClass(listener);
     /* Signature: (callId, fromUri, remoteIp, remotePort, rtcpPort,
      *             pt, clockRate, codecName, fmtp) */
@@ -2677,48 +2774,47 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetIncomingCallListener
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeProgressRinging(
-        JNIEnv* env, jclass /*clazz*/, jstring jCallId)
+        JNIEnv* env, jclass /*clazz*/, jint slotId, jstring jCallId)
 {
-    try {
-        return Bridge::instance().progressRinging(jstrUtf(env, jCallId))
-                ? JNI_TRUE : JNI_FALSE;
-    } catch (...) { return JNI_FALSE; }
+    BRIDGE_OR(JNI_FALSE);
+    try { return b->progressRinging(jstrUtf(env, jCallId)) ? JNI_TRUE : JNI_FALSE; }
+    catch (...) { return JNI_FALSE; }
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeAcceptIncomingCall(
-        JNIEnv* env, jclass /*clazz*/, jstring jCallId, jstring jSdp)
+        JNIEnv* env, jclass /*clazz*/, jint slotId, jstring jCallId, jstring jSdp)
 {
+    BRIDGE_OR(JNI_FALSE);
     try {
-        return Bridge::instance().acceptIncomingCall(
-                jstrUtf(env, jCallId), jstrUtf(env, jSdp))
+        return b->acceptIncomingCall(jstrUtf(env, jCallId), jstrUtf(env, jSdp))
                 ? JNI_TRUE : JNI_FALSE;
     } catch (...) { return JNI_FALSE; }
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeRejectIncomingCall(
-        JNIEnv* env, jclass /*clazz*/, jstring jCallId, jint sipCode)
+        JNIEnv* env, jclass /*clazz*/, jint slotId, jstring jCallId, jint sipCode)
 {
+    BRIDGE_OR(JNI_FALSE);
     try {
-        return Bridge::instance().rejectIncomingCall(
-                jstrUtf(env, jCallId), (int)sipCode) ? JNI_TRUE : JNI_FALSE;
+        return b->rejectIncomingCall(jstrUtf(env, jCallId), (int)sipCode)
+                ? JNI_TRUE : JNI_FALSE;
     } catch (...) { return JNI_FALSE; }
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetSmsListener(
-        JNIEnv* env, jclass /*clazz*/, jobject listener)
+        JNIEnv* env, jclass /*clazz*/, jint slotId, jobject listener)
 {
-    if (gSmsListener) {
-        env->DeleteGlobalRef(gSmsListener);
-        gSmsListener = nullptr;
-        gOnSmsSendSuccess = nullptr;
-        gOnSmsSendFailure = nullptr;
-        gOnSmsIncoming = nullptr;
+    BRIDGE_OR_VOID();
+    if (b->mSmsListener) {
+        env->DeleteGlobalRef(b->mSmsListener);
+        b->mSmsListener = nullptr;
     }
     if (!listener) return;
-    gSmsListener = env->NewGlobalRef(listener);
+    b->mSmsListener = env->NewGlobalRef(listener);
+    if (gOnSmsSendSuccess) return;  /* method-id cache filled already */
     jclass cls = env->GetObjectClass(listener);
     gOnSmsSendSuccess = env->GetMethodID(cls, "onSendSuccess", "(ILjava/lang/String;)V");
     gOnSmsSendFailure = env->GetMethodID(cls, "onSendFailure", "(ILjava/lang/String;)V");
@@ -2728,22 +2824,25 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetSmsListener(
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeGetLastMtPai(
-        JNIEnv* env, jclass /*clazz*/)
+        JNIEnv* env, jclass /*clazz*/, jint slotId)
 {
-    std::lock_guard<std::mutex> g(gLastMtPaiMu);
-    return env->NewStringUTF(gLastMtPai.c_str());
+    Bridge* b = Bridge::instance((int)slotId);
+    if (!b) return env->NewStringUTF("");
+    std::lock_guard<std::mutex> g(b->mLastMtPaiMu);
+    return env->NewStringUTF(b->mLastMtPai.c_str());
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSendSms(
-        JNIEnv* env, jclass /*clazz*/,
+        JNIEnv* env, jclass /*clazz*/, jint slotId,
         jstring jTarget, jstring jContentType, jbyteArray jBody)
 {
+    BRIDGE_OR(JNI_FALSE);
     if (!jBody) return JNI_FALSE;
     try {
         std::vector<uint8_t> body(env->GetArrayLength(jBody));
         env->GetByteArrayRegion(jBody, 0, (jsize)body.size(), (jbyte*)body.data());
-        return Bridge::instance().sendSms(
+        return b->sendSms(
                 jstrUtf(env, jTarget),
                 jstrUtf(env, jContentType),
                 body) ? JNI_TRUE : JNI_FALSE;
@@ -2752,17 +2851,16 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSendSms(
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetRegistrationListener(
-        JNIEnv* env, jclass /*clazz*/, jobject listener)
+        JNIEnv* env, jclass /*clazz*/, jint slotId, jobject listener)
 {
-    if (gRegListener) {
-        env->DeleteGlobalRef(gRegListener);
-        gRegListener = nullptr;
-        gOnRegisteredMethod = nullptr;
-        gOnDeregisteredMethod = nullptr;
-        gOnRegisterExpiresReported = nullptr;
+    BRIDGE_OR_VOID();
+    if (b->mRegListener) {
+        env->DeleteGlobalRef(b->mRegListener);
+        b->mRegListener = nullptr;
     }
     if (!listener) return;
-    gRegListener = env->NewGlobalRef(listener);
+    b->mRegListener = env->NewGlobalRef(listener);
+    if (gOnRegisteredMethod) return;  /* method-id cache filled already */
     jclass cls = env->GetObjectClass(listener);
     gOnRegisteredMethod   = env->GetMethodID(cls, "onRegistered",   "(Ljava/lang/String;)V");
     gOnDeregisteredMethod = env->GetMethodID(cls, "onDeregistered", "(ILjava/lang/String;I)V");
@@ -2772,23 +2870,24 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetRegistrationListener
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeRefreshRegister(
-        JNIEnv* /*env*/, jclass /*clazz*/)
+        JNIEnv* /*env*/, jclass /*clazz*/, jint slotId)
 {
-    try {
-        return Bridge::instance().refreshRegister() ? JNI_TRUE : JNI_FALSE;
-    } catch (...) { return JNI_FALSE; }
+    BRIDGE_OR(JNI_FALSE);
+    try { return b->refreshRegister() ? JNI_TRUE : JNI_FALSE; }
+    catch (...) { return JNI_FALSE; }
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeStartRegister(
-        JNIEnv* env, jclass /*clazz*/,
+        JNIEnv* env, jclass /*clazz*/, jint slotId,
         jstring jImpi, jstring jImpu, jstring jDomain,
         jint expirySec, jstring jInstanceId,
         jstring jPcscfHost, jint pcscfCleartextPort,
         jstring jSecurityClient)
 {
+    BRIDGE_OR(JNI_FALSE);
     try {
-        return Bridge::instance().startRegister(
+        return b->startRegister(
                 jstrUtf(env, jImpi),
                 jstrUtf(env, jImpu),
                 jstrUtf(env, jDomain),
@@ -2800,3 +2899,10 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeStartRegister(
                 ? JNI_TRUE : JNI_FALSE;
     } catch (...) { return JNI_FALSE; }
 }
+
+/* Static member definitions for Bridge. The class lives in an
+ * anonymous namespace, so the definitions must too. */
+namespace {
+std::array<std::atomic<Bridge*>, Bridge::kMaxSlots> Bridge::sBridges = {};
+std::mutex Bridge::sCtorMu;
+}  // namespace

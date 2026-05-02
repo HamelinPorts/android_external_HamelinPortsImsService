@@ -8,10 +8,11 @@ import android.util.Log;
  * One instance per SIM slot; {@code ImsRegistrationController} owns it
  * and threads it through {@code HamelinPortsMmTelFeature},
  * {@code HamelinPortsCallSession}, {@code HamelinPortsIncomingCallSession}
- * and {@code HamelinPortsSmsImpl}. The instance carries a {@code mSlotId}
- * which is currently bookkeeping only — the underlying native methods
- * still operate on a process-wide singleton; phase 4B will fan that out
- * to a per-slot Bridge map keyed on this id.
+ * and {@code HamelinPortsSmsImpl}. Every native method takes a slot id
+ * and the JNI side keeps a per-slot Bridge (SipStack + DUM + handlers +
+ * Java listener jobjects) so two slots can register, place calls and
+ * exchange SMS independently without sharing state at the C++ singleton
+ * level.
  *
  * <p>Drives the full IMS REGISTER cycle through reSIProcate's DUM:
  *   1. {@link #start()} — native SipStack + DialogUsageManager up
@@ -49,33 +50,33 @@ public final class HamelinPortsSipStack {
     }
 
     private static native String  nativeGetStackVersion();
-    private static native boolean nativeStart();
-    private static native void    nativeStop();
-    private static native String  nativeGetStatus();
-    private static native boolean nativeAddSipTransports(String localIp, int portC, int portS);
-    private static native void    nativeSetAkaProvider(AkaProvider provider);
-    private static native void    nativeSetRegistrationListener(RegistrationListener listener);
-    private static native void    nativeSetCallSessionListener(CallSessionListener listener);
-    private static native void    nativeSetSmsListener(SmsSessionListener listener);
-    private static native boolean nativeSendSms(String targetUri, String contentType, byte[] body);
-    private static native String  nativeGetLastMtPai();
-    private static native boolean nativeStartRegister(
+    private static native boolean nativeStart(int slotId);
+    private static native void    nativeStop(int slotId);
+    private static native String  nativeGetStatus(int slotId);
+    private static native boolean nativeAddSipTransports(int slotId, String localIp, int portC, int portS);
+    private static native void    nativeSetAkaProvider(int slotId, AkaProvider provider);
+    private static native void    nativeSetRegistrationListener(int slotId, RegistrationListener listener);
+    private static native void    nativeSetCallSessionListener(int slotId, CallSessionListener listener);
+    private static native void    nativeSetSmsListener(int slotId, SmsSessionListener listener);
+    private static native boolean nativeSendSms(int slotId, String targetUri, String contentType, byte[] body);
+    private static native String  nativeGetLastMtPai(int slotId);
+    private static native boolean nativeStartRegister(int slotId,
             String impi, String impu, String domain,
             int expirySec, String instanceId,
             String pcscfHost, int pcscfCleartextPort,
             String securityClient);
-    private static native boolean nativeRefreshRegister();
-    private static native void    nativeSetCellIdForPani(String value);
-    private static native void    nativeSetIwlanNodeIdForPani(String value);
-    private static native boolean nativeStartCall(String targetUri, String sdpOffer);
-    private static native void    nativeEndCall();
-    private static native boolean nativeEndCallByCallId(String callId);
-    private static native boolean nativeReinvite(String sdpOffer);
-    private static native boolean nativeProvideReinviteAnswer(String sdpAnswer);
-    private static native void    nativeSetIncomingCallListener(IncomingCallListener listener);
-    private static native boolean nativeProgressRinging(String callId);
-    private static native boolean nativeAcceptIncomingCall(String callId, String sdpAnswer);
-    private static native boolean nativeRejectIncomingCall(String callId, int sipCode);
+    private static native boolean nativeRefreshRegister(int slotId);
+    private static native void    nativeSetCellIdForPani(int slotId, String value);
+    private static native void    nativeSetIwlanNodeIdForPani(int slotId, String value);
+    private static native boolean nativeStartCall(int slotId, String targetUri, String sdpOffer);
+    private static native void    nativeEndCall(int slotId);
+    private static native boolean nativeEndCallByCallId(int slotId, String callId);
+    private static native boolean nativeReinvite(int slotId, String sdpOffer);
+    private static native boolean nativeProvideReinviteAnswer(int slotId, String sdpAnswer);
+    private static native void    nativeSetIncomingCallListener(int slotId, IncomingCallListener listener);
+    private static native boolean nativeProgressRinging(int slotId, String callId);
+    private static native boolean nativeAcceptIncomingCall(int slotId, String callId, String sdpAnswer);
+    private static native boolean nativeRejectIncomingCall(int slotId, String callId, int sipCode);
 
     /** True if libnative_ims_jni.so loaded successfully. Process-global. */
     public static boolean isAvailable() {
@@ -97,7 +98,7 @@ public final class HamelinPortsSipStack {
     public boolean start() {
         if (!sNativeAvailable) return false;
         try {
-            return nativeStart();
+            return nativeStart(mSlotId);
         } catch (UnsatisfiedLinkError e) {
             return false;
         }
@@ -107,7 +108,7 @@ public final class HamelinPortsSipStack {
     public void stop() {
         if (!sNativeAvailable) return;
         try {
-            nativeStop();
+            nativeStop(mSlotId);
         } catch (UnsatisfiedLinkError e) {
             // ignore
         }
@@ -117,7 +118,7 @@ public final class HamelinPortsSipStack {
     public String getStatus() {
         if (!sNativeAvailable) return "unavailable";
         try {
-            return nativeGetStatus();
+            return nativeGetStatus(mSlotId);
         } catch (UnsatisfiedLinkError e) {
             return "unavailable";
         }
@@ -140,7 +141,7 @@ public final class HamelinPortsSipStack {
     public boolean addSipTransports(String localIp, int portC, int portS) {
         if (!sNativeAvailable) return false;
         try {
-            return nativeAddSipTransports(localIp, portC, portS);
+            return nativeAddSipTransports(mSlotId, localIp, portC, portS);
         } catch (UnsatisfiedLinkError e) {
             return false;
         }
@@ -157,7 +158,7 @@ public final class HamelinPortsSipStack {
     public void setAkaProvider(AkaProvider provider) {
         if (!sNativeAvailable) return;
         try {
-            nativeSetAkaProvider(provider);
+            nativeSetAkaProvider(mSlotId, provider);
         } catch (UnsatisfiedLinkError e) {
             // ignore
         }
@@ -167,7 +168,7 @@ public final class HamelinPortsSipStack {
     public void setRegistrationListener(RegistrationListener listener) {
         if (!sNativeAvailable) return;
         try {
-            nativeSetRegistrationListener(listener);
+            nativeSetRegistrationListener(mSlotId, listener);
         } catch (UnsatisfiedLinkError e) {
             // ignore
         }
@@ -177,7 +178,7 @@ public final class HamelinPortsSipStack {
      *  Only one active outbound call is supported at a time. */
     public void setCallSessionListener(CallSessionListener listener) {
         if (!sNativeAvailable) return;
-        try { nativeSetCallSessionListener(listener); }
+        try { nativeSetCallSessionListener(mSlotId, listener); }
         catch (UnsatisfiedLinkError e) {}
     }
 
@@ -189,7 +190,7 @@ public final class HamelinPortsSipStack {
      *  TAS as UNALLOCATED_NUMBER. Format: MCC+MNC+TAC(4 hex)+CI(7 hex). */
     public void setCellIdForPani(String value) {
         if (!sNativeAvailable) return;
-        try { nativeSetCellIdForPani(value); }
+        try { nativeSetCellIdForPani(mSlotId, value); }
         catch (UnsatisfiedLinkError e) {}
     }
 
@@ -204,7 +205,7 @@ public final class HamelinPortsSipStack {
      *  not try to keep both warm. */
     public void setIwlanNodeIdForPani(String value) {
         if (!sNativeAvailable) return;
-        try { nativeSetIwlanNodeIdForPani(value); }
+        try { nativeSetIwlanNodeIdForPani(mSlotId, value); }
         catch (UnsatisfiedLinkError e) {}
     }
 
@@ -220,14 +221,14 @@ public final class HamelinPortsSipStack {
      */
     public boolean startCall(String targetUri, String sdpOffer) {
         if (!sNativeAvailable) return false;
-        try { return nativeStartCall(targetUri, sdpOffer); }
+        try { return nativeStartCall(mSlotId, targetUri, sdpOffer); }
         catch (UnsatisfiedLinkError e) { return false; }
     }
 
     /** End the active outbound call (BYE if connected, CANCEL if early). */
     public void endCall() {
         if (!sNativeAvailable) return;
-        try { nativeEndCall(); }
+        try { nativeEndCall(mSlotId); }
         catch (UnsatisfiedLinkError e) {}
     }
 
@@ -236,7 +237,7 @@ public final class HamelinPortsSipStack {
      *  only acts on the MO {@code ClientInviteSessionHandle}. */
     public boolean endCallByCallId(String callId) {
         if (!sNativeAvailable) return false;
-        try { return nativeEndCallByCallId(callId); }
+        try { return nativeEndCallByCallId(mSlotId, callId); }
         catch (UnsatisfiedLinkError e) { return false; }
     }
 
@@ -249,7 +250,7 @@ public final class HamelinPortsSipStack {
      *  {@link CallSessionListener#onAnswerVideo}. */
     public boolean reinvite(String sdpOffer) {
         if (!sNativeAvailable) return false;
-        try { return nativeReinvite(sdpOffer); }
+        try { return nativeReinvite(mSlotId, sdpOffer); }
         catch (UnsatisfiedLinkError e) { return false; }
     }
 
@@ -258,41 +259,28 @@ public final class HamelinPortsSipStack {
      *  {@link CallSessionListener#onRemoteReinvite}. */
     public boolean provideReinviteAnswer(String sdpAnswer) {
         if (!sNativeAvailable) return false;
-        try { return nativeProvideReinviteAnswer(sdpAnswer); }
+        try { return nativeProvideReinviteAnswer(mSlotId, sdpAnswer); }
         catch (UnsatisfiedLinkError e) { return false; }
     }
 
     /** Register the listener the native stack fires when an MT INVITE
-     *  arrives. Separate from {@link #setCallSessionListener} because
-     *  the MT path needs a service-lifetime subscriber (set by
-     *  {@code HamelinPortsMmTelFeature}) that can create a fresh
-     *  {@code HamelinPortsIncomingCallSession} per incoming call.
-     *
-     *  <p>Last-writer-wins on the native side: the singleton holds a
-     *  single global reference. In a dual-slot process the
-     *  {@code HamelinPortsMmTelFeature} for the active-SIM slot binds
-     *  from {@code onRegistered()} so MT routes to the correct slot's
-     *  ImsPhoneCallTracker. Phase 4B will fan this out to a per-slot
-     *  listener slot.</p> */
+     *  arrives. Per-slot — phase 4B fanned this out so each slot's
+     *  MmTelFeature can stay subscribed to its own slot's MT events
+     *  without colliding with the other slot's listener. */
     public void setIncomingCallListener(IncomingCallListener listener) {
         if (!sNativeAvailable) return;
-        sIncomingCallListener = listener;
-        try { nativeSetIncomingCallListener(listener); }
+        try { nativeSetIncomingCallListener(mSlotId, listener); }
         catch (UnsatisfiedLinkError e) {}
     }
 
-    private static volatile IncomingCallListener sIncomingCallListener;
-
-    /** Drop the MT listener only if {@code self} is currently bound.
-     *  Called from {@code onDeregistered()} to avoid clobbering a
-     *  listener that another slot may have just bound during handover.
-     *  Static: the gating reference is a process-global. */
-    public static void clearIncomingCallListenerIfSelf(IncomingCallListener self) {
-        if (!sNativeAvailable) return;
-        if (sIncomingCallListener != self) return;
-        sIncomingCallListener = null;
-        try { nativeSetIncomingCallListener(null); }
-        catch (UnsatisfiedLinkError e) {}
+    /** Drop the MT listener regardless of who set it. The native side
+     *  is per-slot, so this only affects the calling slot's listener
+     *  and never disturbs the other slot's registration. The {@code self}
+     *  parameter is retained for source compatibility with pre-4B
+     *  callers who used it as a "don't clobber another slot's listener"
+     *  guard; it's now redundant. */
+    public void clearIncomingCallListenerIfSelf(IncomingCallListener self) {
+        setIncomingCallListener(null);
     }
 
     /** Send {@code 180 Ringing} on the MT dialog matching
@@ -301,7 +289,7 @@ public final class HamelinPortsSipStack {
      *  does. */
     public boolean progressRinging(String callId) {
         if (!sNativeAvailable) return false;
-        try { return nativeProgressRinging(callId); }
+        try { return nativeProgressRinging(mSlotId, callId); }
         catch (UnsatisfiedLinkError e) { return false; }
     }
 
@@ -311,7 +299,7 @@ public final class HamelinPortsSipStack {
      *  local RTP/RTCP ports bound to the IMS PDN's IPv6. */
     public boolean acceptIncomingCall(String callId, String sdpAnswer) {
         if (!sNativeAvailable) return false;
-        try { return nativeAcceptIncomingCall(callId, sdpAnswer); }
+        try { return nativeAcceptIncomingCall(mSlotId, callId, sdpAnswer); }
         catch (UnsatisfiedLinkError e) { return false; }
     }
 
@@ -320,7 +308,7 @@ public final class HamelinPortsSipStack {
      *  Unavailable, 603 Decline (3GPP TS 24.229 §5.1.3). */
     public boolean rejectIncomingCall(String callId, int sipCode) {
         if (!sNativeAvailable) return false;
-        try { return nativeRejectIncomingCall(callId, sipCode); }
+        try { return nativeRejectIncomingCall(mSlotId, callId, sipCode); }
         catch (UnsatisfiedLinkError e) { return false; }
     }
 
@@ -355,7 +343,7 @@ public final class HamelinPortsSipStack {
                                  String securityClient) {
         if (!sNativeAvailable) return false;
         try {
-            return nativeStartRegister(impi, impu, domain, expirySec,
+            return nativeStartRegister(mSlotId, impi, impu, domain, expirySec,
                                        instanceId, pcscfHost, pcscfCleartextPort,
                                        securityClient);
         } catch (UnsatisfiedLinkError e) {
@@ -372,7 +360,7 @@ public final class HamelinPortsSipStack {
      *  REGISTER keeping the registration visible to the TAS. */
     public boolean refreshRegister() {
         if (!sNativeAvailable) return false;
-        try { return nativeRefreshRegister(); }
+        try { return nativeRefreshRegister(mSlotId); }
         catch (UnsatisfiedLinkError e) { return false; }
     }
 
@@ -380,7 +368,7 @@ public final class HamelinPortsSipStack {
      *  and for the result of {@link #sendSms}. */
     public void setSmsListener(SmsSessionListener listener) {
         if (!sNativeAvailable) return;
-        try { nativeSetSmsListener(listener); }
+        try { nativeSetSmsListener(mSlotId, listener); }
         catch (UnsatisfiedLinkError e) {}
     }
 
@@ -396,7 +384,7 @@ public final class HamelinPortsSipStack {
      */
     public boolean sendSms(String targetUri, String contentType, byte[] body) {
         if (!sNativeAvailable) return false;
-        try { return nativeSendSms(targetUri, contentType, body); }
+        try { return nativeSendSms(mSlotId, targetUri, contentType, body); }
         catch (UnsatisfiedLinkError e) { return false; }
     }
 
@@ -406,7 +394,7 @@ public final class HamelinPortsSipStack {
      *  no MT has been received yet or no PAI was present. */
     public String getLastMtPai() {
         if (!sNativeAvailable) return "";
-        try { return nativeGetLastMtPai(); }
+        try { return nativeGetLastMtPai(mSlotId); }
         catch (UnsatisfiedLinkError e) { return ""; }
     }
 }
