@@ -64,12 +64,6 @@ cc_library_shared {
 }
 
 cc_binary {
-    name: "ims_ipsec_setup",
-    srcs: ["ims_oemipc/ims_ipsec_setup.c"],
-    cflags: ["-Wall"],
-}
-
-cc_binary {
     name: "ims_xfrm",
     srcs: ["ims_xfrm/ims_xfrm.c"],
     cflags: ["-Wall", "-Werror"],

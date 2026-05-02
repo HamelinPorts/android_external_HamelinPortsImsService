@@ -22,8 +22,7 @@ $(call inherit-product, packages/modules/ImsMedia/imsmedia.mk)
 PRODUCT_PACKAGES += \
     HamelinPortsImsService \
     privapp-permissions-org.hamelinports.ims \
-    ims_xfrm \
-    ims_ipsec_setup
+    ims_xfrm
 
 # Framework-resource overlay carrying config_use_voip_mode_for_ims=true.
 # Without this, Telecom drives MODE_IN_CALL on IMS calls and audio routes
