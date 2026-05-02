@@ -77,7 +77,7 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
 
     HamelinPortsSmsImpl(ImsRegistrationController regController) {
         mRegController = regController;
-        HamelinPortsSipStack.setSmsListener(this);
+        mRegController.stack().setSmsListener(this);
         /* One-shot probe so an empty EF_SMSP shows up in the boot
          * logcat before the user tries to send. Cheap (single binder
          * roundtrip) and only runs once per HamelinPortsSmsImpl instance. */
@@ -182,7 +182,8 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
          * send. The dispatcher picks 3GPP-E-UTRAN-FDD on cellular IMS
          * and IEEE-802.11 (with the AP BSSID) on Wi-Fi Calling. */
         SipClient.refreshPaniForOutbound(
-                mRegController.getContext(), mRegController.getLastBoundIface());
+                mRegController.getContext(), mRegController.getLastBoundIface(),
+                mRegController.stack());
 
         String smscNumber = resolveSmscNumber();
 
@@ -198,7 +199,7 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
          * one HamelinPortsSmsImpl per active slot; the static listener is
          * last-writer-wins. Without this re-claim the SMSC RP-ACK
          * MESSAGE gets routed to the wrong instance. */
-        HamelinPortsSipStack.setSmsListener(this);
+        mRegController.stack().setSmsListener(this);
 
         /* Cancel any previous pending timer so two rapid sends don't
          * double-fire. */
@@ -207,7 +208,7 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
         mPendingMessageRef = messageRef;
         mPendingRpMr = rpMr;
 
-        boolean queued = HamelinPortsSipStack.sendSms(resolveSmscUri(smscNumber), CONTENT_TYPE, rpData);
+        boolean queued = mRegController.stack().sendSms(resolveSmscUri(smscNumber), CONTENT_TYPE, rpData);
         if (!queued) {
             clearPendingLocked();
             onSendSmsResultError(token, messageRef, SEND_STATUS_ERROR,
@@ -249,14 +250,14 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
      *  transaction state — routing the RP-ACK through the generic
      *  SMSC E.164 URI elicits 481 Call/Transaction Does Not Exist. */
     private void sendRpAckToSmsc(int rpMr) {
-        String pai = HamelinPortsSipStack.getLastMtPai();
+        String pai = mRegController.stack().getLastMtPai();
         if (pai == null || pai.isEmpty()) {
             Log.w(TAG, "sendRpAckToSmsc: no PAI captured; skipping RP-ACK");
             return;
         }
         byte[] rpAck = buildRpAckMsToN(rpMr);
         Log.i(TAG, "RP-ACK → " + pai + " RP-MR=" + rpMr);
-        boolean queued = HamelinPortsSipStack.sendSms(pai, CONTENT_TYPE, rpAck);
+        boolean queued = mRegController.stack().sendSms(pai, CONTENT_TYPE, rpAck);
         if (!queued) Log.w(TAG, "RP-ACK send failed to queue");
     }
 
@@ -338,7 +339,7 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
          * decorator chain on the outgoing 200 OK. */
         String cellIdPani = SipClient.getCellIdForPani(mRegController.getContext());
         if (cellIdPani != null) {
-            HamelinPortsSipStack.setCellIdForPani(cellIdPani);
+            mRegController.stack().setCellIdForPani(cellIdPani);
         }
         RpData.Parsed parsed = RpData.parseMt(body);
         if (parsed == null) {

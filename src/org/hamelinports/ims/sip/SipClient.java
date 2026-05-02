@@ -142,23 +142,27 @@ public final class SipClient {
      * Returns null if we can't resolve a registered LTE cell (no ServiceState,
      * wrong RAT, missing TAC/CI). Caller omits the PANI header in that case.
      */
-    /** Refresh the P-Access-Network-Info cache on {@link HamelinPortsSipStack}
-     *  with the right flavour for the current IMS PDN underlying access.
-     *  Wi-Fi Calling carries IEEE-802.11 with the AP BSSID; cellular IMS
-     *  carries 3GPP-E-UTRAN-FDD with the LTE cell-id-3gpp. The decorator
-     *  on the native side picks whichever cache field is non-empty.
+    /** Refresh the P-Access-Network-Info cache on the supplied
+     *  {@link HamelinPortsSipStack} with the right flavour for the
+     *  current IMS PDN underlying access. Wi-Fi Calling carries
+     *  IEEE-802.11 with the AP BSSID; cellular IMS carries
+     *  3GPP-E-UTRAN-FDD with the LTE cell-id-3gpp. The decorator on
+     *  the native side picks whichever cache field is non-empty.
      *
      *  The {@code iface} comes from
      *  {@link ImsRegistrationController#getLastBoundIface()}; AOSP names
      *  IpSec tunnel interfaces {@code ipsecN} and cellular IMS PDNs
      *  {@code rmnetN}. Callers (HamelinPortsCallSession, HamelinPortsSmsImpl)
-     *  call this immediately before each MO INVITE / MO MESSAGE / RP-ACK.
+     *  call this immediately before each MO INVITE / MO MESSAGE / RP-ACK,
+     *  passing their slot's stack instance.
      */
-    public static void refreshPaniForOutbound(Context ctx, String iface) {
+    public static void refreshPaniForOutbound(Context ctx, String iface,
+                                              HamelinPortsSipStack stack) {
+        if (stack == null) return;
         if (iface != null && iface.startsWith("ipsec")) {
             String node = getWifiBssidForPani(ctx);
             if (node != null) {
-                HamelinPortsSipStack.setIwlanNodeIdForPani(node);
+                stack.setIwlanNodeIdForPani(node);
             } else {
                 /* No BSSID — still emit the IEEE-802.11 token (with an
                  * empty i-wlan-node-id parameter) rather than fall back
@@ -166,12 +170,12 @@ public final class SipClient {
                  * accept it; if it doesn't, we'll see the rejection and
                  * iterate. The wrong access token is worse than a
                  * missing parameter. */
-                HamelinPortsSipStack.setIwlanNodeIdForPani("");
+                stack.setIwlanNodeIdForPani("");
             }
         } else {
             String cellId = getCellIdForPani(ctx);
             if (cellId != null) {
-                HamelinPortsSipStack.setCellIdForPani(cellId);
+                stack.setCellIdForPani(cellId);
             }
         }
     }

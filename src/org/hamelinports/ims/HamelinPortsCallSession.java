@@ -295,7 +295,7 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
         }
         Log.i(TAG, "CallSession.terminate reason=" + reason);
         try {
-            HamelinPortsSipStack.endCall();
+            mRegController.stack().endCall();
         } catch (Exception e) {
             Log.e(TAG, "endCall failed", e);
         }
@@ -435,10 +435,11 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
         // Cellular: 3GPP-E-UTRAN-FDD + utran-cell-id-3gpp from the LTE cell.
         // Wi-Fi Calling: IEEE-802.11 + i-wlan-node-id from the AP BSSID.
         SipClient.refreshPaniForOutbound(
-                mRegController.getContext(), mRegController.getLastBoundIface());
+                mRegController.getContext(), mRegController.getLastBoundIface(),
+                mRegController.stack());
 
         // Wire ourselves as the call-session listener.
-        HamelinPortsSipStack.setCallSessionListener(new CallSessionListener() {
+        mRegController.stack().setCallSessionListener(new CallSessionListener() {
             @Override public void onProvisional(int code, String reason) {
                 Log.i(TAG, "call onProvisional: " + code + " " + reason);
                 if (code == 180 || code == 183) {
@@ -537,7 +538,7 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
                 videoDirectionAttr(mProfile));
         Log.i(TAG, "---> INVITE " + calleeUri
                 + (isVideoCall(mProfile) ? " [+video]" : ""));
-        boolean queued = HamelinPortsSipStack.startCall(calleeUri, sdp);
+        boolean queued = mRegController.stack().startCall(calleeUri, sdp);
         if (!queued && mListener != null) {
             mListener.callSessionInitiatedFailed(new ImsReasonInfo(
                     ImsReasonInfo.CODE_LOCAL_INTERNAL_ERROR, 0, "queue failed"));
@@ -809,7 +810,7 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
                 wantVideo ? mRtpPortVideo  : 0,
                 wantVideo ? mRtcpPortVideo : 0,
                 "sendrecv");
-        boolean queued = HamelinPortsSipStack.provideReinviteAnswer(sdpAnswer);
+        boolean queued = mRegController.stack().provideReinviteAnswer(sdpAnswer);
         Log.i(TAG, "remote re-INVITE answer queued=" + queued);
         if (!queued) return;
 
@@ -877,7 +878,7 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
         Log.i(TAG, "MO reinvite SDP built, wantVideo=" + wantVideo
                 + ", dir=" + dir);
         mPendingReinviteWantVideo = wantVideo;
-        boolean queued = HamelinPortsSipStack.reinvite(sdp);
+        boolean queued = mRegController.stack().reinvite(sdp);
         Log.i(TAG, "MO reinvite queued=" + queued);
         if (!queued && mVideoProvider != null) {
             /* Tell Telecom the change failed — keep user in current state. */
