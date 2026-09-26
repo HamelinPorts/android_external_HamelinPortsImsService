@@ -44,15 +44,13 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
 
     private static final String CONTENT_TYPE = "application/vnd.3gpp.sms";
 
-    /** Hard-coded fallback for o2 Germany. Used only when both
-     *  {@link android.telephony.SmsManager#getSmscAddress()} (which
-     *  reads EF_SMSP from the SIM) AND any carrier-config override
-     *  return null/empty. Documented per-MCC/MNC fallback table is
-     *  better than a global "everything is Telefonica" assumption,
-     *  but for the current daily-driver this is the only carrier we
-     *  exercise. Remove once confidence in the dynamic lookup is
-     *  high enough to surface MO failures rather than mask them. */
-    private static final String FALLBACK_SMSC_NUMBER = "+491770610000";
+    /** SMSC for MO SMS over IMS (o2 Germany, the only carrier this
+     *  device is used on). Not queried through
+     *  {@link SmsManager#getSmscAddress()}: the RIL deliberately answers
+     *  it empty (CS sends then use the modem's default SMSC), so it
+     *  never yields a usable number. A per-MCC/MNC table is the
+     *  long-term replacement. */
+    private static final String SMSC_NUMBER = "+491770610000";
     private static final String FALLBACK_SMSC_DOMAIN = "telefonica.de";
 
     /** Optimistic success timeout when no RP-ACK / RP-ERROR arrives
@@ -78,60 +76,6 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
     HamelinPortsSmsImpl(ImsRegistrationController regController) {
         mRegController = regController;
         mRegController.stack().setSmsListener(this);
-        /* One-shot probe so an empty EF_SMSP shows up in the boot
-         * logcat before the user tries to send. Cheap (single binder
-         * roundtrip) and only runs once per HamelinPortsSmsImpl instance. */
-        Log.i(TAG, "SMSC probe at init: " + resolveSmscNumber());
-    }
-
-    /** Resolve the SMSC E.164 number at runtime. Order:
-     *   1. {@code SmsManager.getSmscAddress()} — EF_SMSP from the SIM.
-     *      The MNO provisions this; on Telefonica DE it returns
-     *      {@code "+491770610000"} (sometimes wrapped as {@code 91...F0}
-     *      TON/NPI bytes — Android decodes that for us).
-     *   2. Hard-coded fallback so a freshly-flashed device with an
-     *      empty EF_SMSP still completes MO SMS.
-     *
-     * The result is a plain "+E164" string suitable for both the
-     * RP-DATA SC-Address field and the SIP Request-URI userpart. */
-    private String resolveSmscNumber() {
-        try {
-            android.telephony.SmsManager sm =
-                    mRegController.getContext().getSystemService(android.telephony.SmsManager.class);
-            if (sm != null) {
-                String s = sm.getSmscAddress();
-                if (s != null && !s.isEmpty()) {
-                    s = s.replace("\"", "").trim();
-                    if (looksLikeE164(s)) {
-                        Log.i(TAG, "SMSC from EF_SMSP: " + s);
-                        return s;
-                    }
-                    /* Telefonica DE leaves EF_SMSP filled with a non-
-                     * standard record that decodes to junk like ",0" or
-                     * "s)x,0" via SmsManager.getSmscAddress(). Treat
-                     * that as "no SMSC on SIM" and fall through to the
-                     * fallback table. */
-                    Log.w(TAG, "SMSC EF_SMSP returned non-E164: '" + s + "'");
-                }
-            }
-        } catch (Throwable t) {
-            Log.w(TAG, "getSmscAddress failed: " + t);
-        }
-        Log.w(TAG, "SMSC lookup empty/invalid — using fallback "
-                + FALLBACK_SMSC_NUMBER);
-        return FALLBACK_SMSC_NUMBER;
-    }
-
-    /** {@code +} followed by at least 5 digits — a sloppy but
-     *  sufficient sanity check that the platform handed us an
-     *  E.164-formatted MSISDN rather than the raw EF_SMSP TON byte
-     *  garbage. SMSCs are 7-15 digits in practice. */
-    private static boolean looksLikeE164(String s) {
-        if (s == null || s.length() < 6 || s.charAt(0) != '+') return false;
-        for (int i = 1; i < s.length(); i++) {
-            if (s.charAt(i) < '0' || s.charAt(i) > '9') return false;
-        }
-        return true;
     }
 
     /** Build the SMSC SIP URI ({@code sip:<E164>@<carrier-domain>}).
@@ -185,10 +129,8 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
                 mRegController.getContext(), mRegController.getLastBoundIface(),
                 mRegController.stack());
 
-        String smscNumber = resolveSmscNumber();
-
         // Wrap TPDU in RP-DATA per 3GPP TS 24.011
-        byte[] rpData = RpData.wrapMo(messageRef, smscNumber, pdu);
+        byte[] rpData = RpData.wrapMo(messageRef, SMSC_NUMBER, pdu);
         // RP-MR is byte 1 of the wrapped RP-DATA (wrapMo writes
         // messageRef==0 ? 1 : messageRef).
         int rpMr = rpData.length > 1 ? (rpData[1] & 0xFF) : -1;
@@ -208,7 +150,7 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
         mPendingMessageRef = messageRef;
         mPendingRpMr = rpMr;
 
-        boolean queued = mRegController.stack().sendSms(resolveSmscUri(smscNumber), CONTENT_TYPE, rpData);
+        boolean queued = mRegController.stack().sendSms(resolveSmscUri(SMSC_NUMBER), CONTENT_TYPE, rpData);
         if (!queued) {
             clearPendingLocked();
             onSendSmsResultError(token, messageRef, SEND_STATUS_ERROR,
