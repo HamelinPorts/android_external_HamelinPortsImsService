@@ -212,6 +212,13 @@ final class CarrierConfigInjector {
         b.putInt(CarrierConfigManager.KEY_WFC_DATA_SPN_FORMAT_IDX_INT, 1);
         b.putInt(CarrierConfigManager.KEY_WFC_FLIGHT_MODE_SPN_FORMAT_IDX_INT, 1);
 
+        /* IKE dead peer detection every 300 s instead of AOSP's 120 s.
+         * Each DPD exchange wakes the phone from suspend; a dead ePDG
+         * is then noticed after up to 5 min instead of 2. The NAT-T
+         * keepalive interval is left at its default, which keeps home
+         * router NAT mappings alive for incoming Wi-Fi calls. */
+        b.putInt(CarrierConfigManager.Iwlan.KEY_DPD_TIMER_SEC_INT, 300);
+
         mKernelDefaults = b;
         return b;
     }
