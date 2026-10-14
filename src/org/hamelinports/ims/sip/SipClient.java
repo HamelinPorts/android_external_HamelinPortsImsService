@@ -105,7 +105,7 @@ public final class SipClient {
                 // the brackets here.
                 c.imeiUrn = "<urn:gsma:imei:" + imei.substring(0, 8) + "-"
                         + imei.substring(8, 14) + "-" + imei.charAt(14) + ">";
-                Log.i(TAG, "IMEI: " + redact(imei) + " URN: " + c.imeiUrn);
+                Log.i(TAG, "instance id from IMEI " + redact(imei));
             }
         } catch (Exception e) {
             Log.w(TAG, "couldn't get IMEI", e);
