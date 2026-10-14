@@ -133,6 +133,66 @@ public class OutgoingGateTest {
         assertEquals(List.of("ready"), call.events);
     }
 
+    // R3-1: a retry held back by a call is not due before the hold ends.
+    @Test
+    public void dueTimeFollowsTheHold() {
+        RegistrationState s = registeredWithRetryDue();
+        long retryAt = s.freshDueAtMs();
+        long holdUntil = retryAt + RefreshPolicy.ACTIVE_CALL_RECHECK_MS;
+        s.deferFresh(holdUntil);
+        assertEquals(holdUntil, s.freshDueAtMs());
+        long during = retryAt + 30 * S;
+        RegistrationSnapshot snap = s.snapshot(during);
+        assertTrue("an SMS during the call still goes out", snap.isUsable(during));
+        assertFalse(snap.isRenewalPending(during));
+        assertFalse(snap.isUsable(holdUntil));
+        assertTrue(snap.isRenewalPending(holdUntil));
+    }
+
+    // R3-1: the snapshot published right after beginFresh/invalidate blocks every MO request.
+    @Test
+    public void snapshotAfterBeginFreshBlocksEveryCall() {
+        RegistrationState s = registeredWithRetryDue();
+        long now = s.freshDueAtMs() + S;
+        assertTrue("before: the binding is valid", s.snapshot(now).isBindingValid(now));
+        s.beginFresh(now);
+        RegistrationSnapshot snap = s.snapshot(now);
+        assertFalse(snap.isBindingValid(now));
+        assertFalse(snap.isUsable(now));
+        assertTrue(snap.isRenewalPending(now));
+        assertEquals(Decision.FAIL, OutgoingGate.decideCall(true, snap.isBindingValid(now),
+                snap.isRenewalPending(now)));
+        assertEquals(Decision.DEFER, OutgoingGate.decideCall(false, snap.isUsable(now),
+                snap.isRenewalPending(now)));
+    }
+
+    @Test
+    public void snapshotAfterInvalidateBlocksEveryCall() {
+        RegistrationState s = registeredWithRetryDue();
+        long now = T0 + 100 * S;
+        s.invalidate();
+        RegistrationSnapshot snap = s.snapshot(now);
+        assertFalse(snap.isBindingValid(now));
+        assertFalse(snap.isUsable(now));
+        assertFalse("nothing pending: the PDN is gone", snap.isRenewalPending(now));
+        assertEquals(Decision.FAIL, OutgoingGate.decideCall(true, snap.isBindingValid(now),
+                snap.isRenewalPending(now)));
+    }
+
+    @Test
+    public void snapshotSeesADueRetryWithoutRepublish() {
+        RegistrationState s = registeredWithRetryDue();
+        long due = s.freshDueAtMs();
+        RegistrationSnapshot snap = s.snapshot(due - 5 * S);
+        assertTrue(snap.isUsable(due - S));
+        assertFalse(snap.isRenewalPending(due - S));
+        assertFalse(snap.isUsable(due));
+        assertTrue(snap.isRenewalPending(due));
+        assertTrue("the binding itself is still valid", snap.isBindingValid(due));
+        assertFalse(RegistrationSnapshot.NONE.isBindingValid(T0));
+        assertFalse(RegistrationSnapshot.NONE.isRenewalPending(T0));
+    }
+
     /** Registered at T0, refresh got a 503 with Retry-After 10 s at T0 + 2700 s. */
     private static RegistrationState registeredWithRetryDue() {
         RegistrationState s = new RegistrationState();

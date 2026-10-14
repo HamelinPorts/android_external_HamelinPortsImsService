@@ -23,6 +23,7 @@ import org.hamelinports.ims.modem.ImsModemBridgeFactory;
 import org.hamelinports.ims.reg.DeferredRequests;
 import org.hamelinports.ims.reg.OutgoingGate;
 import org.hamelinports.ims.reg.RefreshPolicy;
+import org.hamelinports.ims.reg.RegistrationSnapshot;
 import org.hamelinports.ims.reg.RegistrationState;
 import org.hamelinports.ims.sip.HamelinPortsAkaProviderImpl;
 import org.hamelinports.ims.sip.HamelinPortsSipStack;
@@ -101,9 +102,8 @@ public class ImsRegistrationController {
     /** First P-Associated-URI from the last 200 OK; its host is the carrier's public domain. */
     private volatile String mAssociatedUri;
     private volatile HamelinPortsMmTelFeature mMmTelFeature;
-    private volatile long mUsableUntilMs;
-    private volatile long mFreshDueAtMs = Long.MAX_VALUE;
-    private volatile boolean mRenewalPending;
+    /** Published as one object: readers never pair values of two states. */
+    private volatile RegistrationSnapshot mSnapshot = RegistrationSnapshot.NONE;
     private volatile String mStateSummary = "";
     /** MO lapse checks posted but not yet run; MO requests wait for them. */
     private final AtomicInteger mPendingOutgoingChecks = new AtomicInteger();
@@ -201,7 +201,7 @@ public class ImsRegistrationController {
      * stack under the request).
      */
     public boolean isRegistered() {
-        return OutgoingGate.isUsable(SystemClock.elapsedRealtime(), mUsableUntilMs, mFreshDueAtMs);
+        return mSnapshot.isUsable(SystemClock.elapsedRealtime());
     }
 
     /**
@@ -209,13 +209,13 @@ public class ImsRegistrationController {
      * holds the stack from its creation, so a due fresh registration waits.
      */
     public boolean isBindingValid() {
-        return SystemClock.elapsedRealtime() < mUsableUntilMs;
+        return mSnapshot.isBindingValid(SystemClock.elapsedRealtime());
     }
 
     /** True while a fresh registration runs or is due, so MO requests should wait for it. */
     public boolean isRetryInFlight() {
-        return mRenewalPending || mPendingOutgoingChecks.get() > 0
-                || SystemClock.elapsedRealtime() >= mFreshDueAtMs;
+        return mSnapshot.isRenewalPending(SystemClock.elapsedRealtime())
+                || mPendingOutgoingChecks.get() > 0;
     }
 
     /**
@@ -239,7 +239,7 @@ public class ImsRegistrationController {
      * registration thread has started the fresh registration.
      */
     public void checkRegistrationBeforeOutgoing() {
-        long until = mUsableUntilMs;
+        long until = mSnapshot.usableUntilMs();
         boolean lapsed = until > 0 && SystemClock.elapsedRealtime() >= until;
         if (lapsed) mPendingOutgoingChecks.incrementAndGet();
         mHandler.post(() -> {
@@ -627,10 +627,13 @@ public class ImsRegistrationController {
     private void startFreshRegistration(String reason) {
         long now = SystemClock.elapsedRealtime();
         int gen = mState.beginFresh(now);
+        /* Before the stack goes down: no MO request may still see a binding. */
+        RegistrationSnapshot published = publishSnapshot(now);
         mDiag.mFreshAttempts++;
         mHandler.removeCallbacksAndMessages(mDelayedRegWork);
         acquireWakeLock(RefreshPolicy.FRESH_WAKELOCK_MS, "fresh registration");
-        Log.i(TAG, "fresh registration gen=" + gen + " reason=" + reason);
+        Log.i(TAG, "fresh registration gen=" + gen + " reason=" + reason
+                + " published bindingValid=" + published.isBindingValid(now));
         stopStackAndReleaseSa();
         if (!attemptRegistration(gen)) {
             Log.w(TAG, "fresh registration gen=" + gen + " not sent");
@@ -655,6 +658,8 @@ public class ImsRegistrationController {
     /** Drops the registration and everything tied to the current stack. */
     private void tearDown() {
         mState.invalidate();
+        /* Before the stack goes down: no MO request may still see a binding. */
+        publishSnapshot(SystemClock.elapsedRealtime());
         mHandler.removeCallbacksAndMessages(mDelayedRegWork);
         mAssociatedUri = null;
         reportDeregistered(ImsReasonInfo.CODE_LOCAL_SERVICE_UNAVAILABLE, 0, false);
@@ -850,20 +855,29 @@ public class ImsRegistrationController {
     /** Publishes the state for other threads and releases or expires held MO requests. */
     private void publishState() {
         long now = SystemClock.elapsedRealtime();
-        mUsableUntilMs = mState.usableUntilMs();
-        mFreshDueAtMs = mState.freshDueAtMs();
-        mRenewalPending = mState.isRenewalPending(now);
-        mStateSummary = mState.describe(now);
-        List<Runnable> due = mDeferred.takeDue(now,
-                mRenewalPending || mPendingOutgoingChecks.get() > 0);
+        RegistrationSnapshot snapshot = publishSnapshot(now);
+        boolean pending = snapshot.isRenewalPending(now) || mPendingOutgoingChecks.get() > 0;
+        List<Runnable> due = mDeferred.takeDue(now, pending);
         if (!due.isEmpty()) {
             Log.i(TAG, "releasing " + due.size() + " deferred MO requests (renewalPending="
-                    + mRenewalPending + ")");
+                    + pending + ")");
             for (Runnable r : due) {
                 try { r.run(); } catch (Throwable t) { Log.w(TAG, "deferred MO request threw", t); }
             }
         }
         armDeferralDeadline();
+    }
+
+    /**
+     * Publishes the MO view of the state only. Called on its own right after
+     * a state change that is about to stop the stack, so no MO request can
+     * still see a usable binding while the stack goes down.
+     */
+    private RegistrationSnapshot publishSnapshot(long now) {
+        RegistrationSnapshot snapshot = mState.snapshot(now);
+        mSnapshot = snapshot;
+        mStateSummary = mState.describe(now);
+        return snapshot;
     }
 
     /**
@@ -971,7 +985,7 @@ public class ImsRegistrationController {
         long nowWall = System.currentTimeMillis();
         long nowElapsed = SystemClock.elapsedRealtime();
         pw.println("  slot=" + mSlotId + " usable=" + isRegistered()
-                + " renewalPending=" + mRenewalPending);
+                + " renewalPending=" + isRetryInFlight());
         pw.println("  state: " + mStateSummary);
         pw.println("  pcscfs=" + mPcscfs);
         pw.println("  lastRegistered: " + fmtAgo(nowWall, mDiag.mRegisteredAtMs)

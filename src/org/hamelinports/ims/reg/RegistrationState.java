@@ -81,12 +81,19 @@ public final class RegistrationState {
     }
 
     /**
-     * Time from which a scheduled fresh registration is due, or
-     * {@code Long.MAX_VALUE}. Its alarm fires up to a window later; until then
-     * the binding still looks usable, but the stack is about to be stopped.
+     * Time from which a scheduled fresh registration may stop the stack, or
+     * {@code Long.MAX_VALUE}: the retry time, or later if the fresh-attempt
+     * floor or a call hold keeps it back (no fresh registration starts before
+     * then, so the binding stays usable). Its alarm fires up to a window
+     * later; from this time MO requests wait for it.
      */
     public long freshDueAtMs() {
-        return mRetryAtMs >= 0 ? mRetryAtMs : Long.MAX_VALUE;
+        return mRetryAtMs >= 0 ? Math.max(mRetryAtMs, freshNotBeforeMs()) : Long.MAX_VALUE;
+    }
+
+    /** One immutable view for MO callers on other threads. */
+    public RegistrationSnapshot snapshot(long nowMs) {
+        return new RegistrationSnapshot(usableUntilMs(), freshDueAtMs(), isRenewalPending(nowMs));
     }
 
     /** MO requests should wait: a fresh registration runs or is about to. */
