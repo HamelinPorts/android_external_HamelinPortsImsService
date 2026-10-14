@@ -74,20 +74,29 @@ public final class EspRoutingFix {
     }
 
     /**
-     * Tear down the four xfrm policies for {@code slotId}. The helper reads
-     * the same per-slot prop bag the install used, so the selectors match
-     * exactly and the kernel can locate them. Called from
-     * {@code HamelinPortsAkaProviderImpl.close()} to keep the policy table
-     * from accumulating one quartet per REGISTER cycle.
+     * Tear down the four xfrm policies installed with these selectors. They
+     * go into a flush-only prop bag ({@code f_*}): init runs the helper
+     * asynchronously, and a fresh registration may already have rewritten
+     * the install bag by then, which would delete the new policies instead
+     * of the old ones. Called from {@code HamelinPortsAkaProviderImpl.close()}.
      */
-    public static void removeXfrmPolicy(int slotId) {
+    public static void removeXfrmPolicy(int slotId, String localIpv6, String pcscfIpv6,
+                                        int uePortC, int uePortS,
+                                        int pcscfPortC, int pcscfPortS) {
         if (slotId != 0 && slotId != 1) return;
         synchronized (EspRoutingFix.class) {
             try {
                 String p = "lineage.ims.xfrm." + slotId + ".";
+                android.os.SystemProperties.set(p + "f_pcscf",       pcscfIpv6);
+                android.os.SystemProperties.set(p + "f_local",       localIpv6);
+                android.os.SystemProperties.set(p + "f_ue_portc",    Integer.toString(uePortC));
+                android.os.SystemProperties.set(p + "f_ue_ports",    Integer.toString(uePortS));
+                android.os.SystemProperties.set(p + "f_pcscf_portc", Integer.toString(pcscfPortC));
+                android.os.SystemProperties.set(p + "f_pcscf_ports", Integer.toString(pcscfPortS));
                 android.os.SystemProperties.set(p + "flush",
                         String.valueOf(System.currentTimeMillis()));
-                Log.i(TAG, "xfrm flush trigger set: slot=" + slotId);
+                Log.i(TAG, "xfrm flush trigger set: slot=" + slotId + " ports "
+                        + uePortC + "/" + uePortS);
             } catch (Exception e) {
                 Log.w(TAG, "xfrm flush trigger failed", e);
             }

@@ -38,6 +38,9 @@ public final class HamelinPortsAkaProviderImpl
     private final InetAddress mLocalAddr;
     private final String   mLocalIp;
     private IpsecHelper.IpsecResult mIpsec;
+    /** P-CSCF Security-Server ports of the installed xfrm policies; 0 until installed. */
+    private int mPolicyPcscfPortC;
+    private int mPolicyPcscfPortS;
 
     public HamelinPortsAkaProviderImpl(Context ctx,
                                   int slotId,
@@ -91,6 +94,8 @@ public final class HamelinPortsAkaProviderImpl
                     mUeSec.portC, mUeSec.portS,
                     serverPortC, serverPortS,
                     (int) serverSpiC, (int) serverSpiS);
+            mPolicyPcscfPortC = serverPortC;
+            mPolicyPcscfPortS = serverPortS;
 
             return new AkaResult(aka.res, aka.ck, aka.ik);
         } catch (Exception e) {
@@ -112,7 +117,13 @@ public final class HamelinPortsAkaProviderImpl
          * Without this, the per-cycle random (uePortC, uePortS) selectors
          * accumulate one stale quartet per REGISTER cycle (next cycle's
          * del-then-add only matches its own ports). */
-        EspRoutingFix.removeXfrmPolicy(mSlotId);
+        if (mPolicyPcscfPortC != 0) {
+            EspRoutingFix.removeXfrmPolicy(mSlotId, mLocalIp,
+                    stripScope(mPcscf.getHostAddress()),
+                    mUeSec.portC, mUeSec.portS, mPolicyPcscfPortC, mPolicyPcscfPortS);
+            mPolicyPcscfPortC = 0;
+            mPolicyPcscfPortS = 0;
+        }
     }
 
     private static String stripScope(String ip) {

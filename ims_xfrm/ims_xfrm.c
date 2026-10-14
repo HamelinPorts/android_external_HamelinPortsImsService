@@ -172,10 +172,13 @@ static int do_flush(const char *pcscf, const char *local,
 /*
  * Read a per-slot property. Slot is "0" or "1"; the resulting key is
  * "lineage.ims.xfrm.<slot>.<suffix>". Returns 1 on hit, 0 otherwise.
+ * The key buffer is larger than the legacy PROP_NAME_MAX (32): the flush-bag
+ * keys need 33 bytes, and property names are no longer length-limited.
  */
 static int get_slot_prop(const char *slot, const char *suffix, char *out) {
-    char key[PROP_NAME_MAX];
-    snprintf(key, sizeof(key), "lineage.ims.xfrm.%s.%s", slot, suffix);
+    char key[64];
+    int n = snprintf(key, sizeof(key), "lineage.ims.xfrm.%s.%s", slot, suffix);
+    if (n < 0 || (size_t)n >= sizeof(key)) return 0;
     return __system_property_get(key, out) > 0;
 }
 
@@ -235,15 +238,18 @@ int main(int argc, char *argv[]) {
         char ue_ports[PROP_VALUE_MAX] = {0};
         char pc_portc[PROP_VALUE_MAX] = {0};
         char pc_ports[PROP_VALUE_MAX] = {0};
-        get_slot_prop(slot, "pcscf",       pcscf);
-        get_slot_prop(slot, "local",       local);
-        get_slot_prop(slot, "ue_portc",    ue_portc);
-        get_slot_prop(slot, "ue_ports",    ue_ports);
-        get_slot_prop(slot, "pcscf_portc", pc_portc);
-        get_slot_prop(slot, "pcscf_ports", pc_ports);
+        /* The flush bag (f_*) names the policies being removed. The install
+         * bag may already describe the next registration's policies by the
+         * time init runs this. */
+        get_slot_prop(slot, "f_pcscf",       pcscf);
+        get_slot_prop(slot, "f_local",       local);
+        get_slot_prop(slot, "f_ue_portc",    ue_portc);
+        get_slot_prop(slot, "f_ue_ports",    ue_ports);
+        get_slot_prop(slot, "f_pcscf_portc", pc_portc);
+        get_slot_prop(slot, "f_pcscf_ports", pc_ports);
 
-        /* If the bag is empty (no install ever ran for this slot), nothing
-         * to flush — bail cleanly so init's exec doesn't log a failure. */
+        /* Empty bag: nothing to flush — bail cleanly so init's exec
+         * doesn't log a failure. */
         if (!valid_ipv6(pcscf) || !valid_ipv6(local)) return 0;
         if (!valid_port(ue_portc) || !valid_port(ue_ports)
          || !valid_port(pc_portc) || !valid_port(pc_ports)) return 0;
