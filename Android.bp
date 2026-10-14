@@ -25,6 +25,20 @@ android_app {
     },
 }
 
+// Host unit tests of the registration renewal policy (pure Java, no device):
+//   atest --host HamelinPortsImsPolicyTests
+java_test_host {
+    name: "HamelinPortsImsPolicyTests",
+    srcs: [
+        "src/org/hamelinports/ims/reg/*.java",
+        "tests/host/src/**/*.java",
+    ],
+    static_libs: ["junit"],
+    test_options: {
+        unit_test: true,
+    },
+}
+
 // Native bridge into reSIProcate. Scaffolding — the Java SipClient
 // still handles all real traffic. See jni/hamelinports_ims_jni.cpp.
 cc_library_shared {

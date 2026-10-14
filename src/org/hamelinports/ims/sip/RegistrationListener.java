@@ -21,9 +21,8 @@ public interface RegistrationListener {
      */
     void onRegistered(String associatedUri);
     /**
-     * @param statusCode    SIP status from the failed response (or 0 if
-     *                      the stack synthesised the failure, e.g.
-     *                      flow-terminated / transport death).
+     * @param statusCode    SIP status from the failed response, or 0 when
+     *                      the registration was removed.
      * @param reason        SIP reason phrase.
      * @param retryAfterSec The {@code Retry-After} header value (RFC
      *                      3261 §20.33, seconds), or 0 if not present.
@@ -38,11 +37,8 @@ public interface RegistrationListener {
     void onDeregistered(int statusCode, String reason, int retryAfterSec);
 
     /** Negotiated {@code Expires} (seconds) from the REGISTER 200 OK.
-     *  Fired right before {@link #onRegistered}. Lets the Java side
-     *  schedule an explicit refresh timer at {@code expires − 60 s}
-     *  instead of relying solely on DUM's internal auto-refresh. A
-     *  value of 0 means the response didn't carry an expires
-     *  indication; the caller should fall back to its requested
-     *  default (typically 3600 s). */
+     *  Fired right before {@link #onRegistered}; the Java side schedules
+     *  the renewal from it. A value of 0 means the response carried no
+     *  expires indication; the caller falls back to its requested value. */
     default void onExpiresReported(int expires) {}
 }

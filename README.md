@@ -22,7 +22,9 @@ Telefónica DE:
 - MMTel video (H.264 Constrained Baseline)
 - VoWiFi (ePDG) — MO + MT calls and mid-call cellular ↔ Wi-Fi
   handover (audio preserved by carrier IP continuity)
-- 5xx REGISTER refresh handling per RFC 3261 §21.5.4 / §20.33
+- Registration renewal across deep sleep: wakeup-alarm refresh window,
+  5xx Retry-After handling per RFC 3261 §21.5.4 / §20.33, lapse check on
+  wake with a fresh registration
 - IMS PDN onLost recovery (re-REGISTER on LTE return)
 
 Not yet:
@@ -70,7 +72,7 @@ A handful of system properties tune behaviour:
 | Property | Default | Use |
 |---|---|---|
 | `persist.lineage.ims.register.expires.sec` | 3600 | Requested REGISTER Expires (the carrier may force a higher minimum via 423 + Min-Expires) |
-| `persist.lineage.ims.refresh.sec` | (Expires − 60) | Override the refresh tick interval (clamped ≥ 30s; only useful for testing the watchdog) |
+| `persist.lineage.ims.refresh.sec` | unset (window ends at max(E − 900 s, E / 2)) | Move the refresh point earlier (≥ 30 s; tests only) |
 | `persist.dbg.volte_avail_ovr` | unset | Set to `1` on `device.mk` to advertise VoLTE-by-platform when the vendor RIL doesn't |
 
 ## Diagnostics
@@ -79,8 +81,12 @@ A handful of system properties tune behaviour:
 dumpsys activity service org.hamelinports.ims/.HamelinPortsImsService
 ```
 
-Per-slot snapshot: registration state, negotiated Expires, P-CSCF list,
-refresh-tick counters, 5xx retry counter.
+Per-slot snapshot: registration state (age, remaining, in-flight
+transaction, pending retry), P-CSCF list, refresh and fresh-attempt
+counters, next check alarm.
+
+Host unit tests of the renewal policy: `atest --host HamelinPortsImsPolicyTests`.
+Key-logging gate: `tests/check-no-key-logging.sh`.
 
 ## Architecture & porting
 

@@ -266,6 +266,18 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
     @Override
     public void start(String callee, ImsCallProfile profile) {
         Log.i(TAG, "CallSession.start callee=" + callee);
+        mRegController.checkRegistrationBeforeOutgoing();
+        if (!mRegController.isRegistered() && mRegController.isRetryInFlight()) {
+            /* A lapsed binding is being replaced; an INVITE now would go out
+             * on a dead stack. The outcome drains us. */
+            Log.i(TAG, "CallSession.start: registration renewal pending, deferring INVITE");
+            mRegController.runOnNextRegister(() -> startOutgoingCallThread(callee));
+            return;
+        }
+        startOutgoingCallThread(callee);
+    }
+
+    private void startOutgoingCallThread(String callee) {
         new Thread(() -> {
             try {
                 doOutgoingCall(callee);

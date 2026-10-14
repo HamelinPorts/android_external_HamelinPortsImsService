@@ -99,11 +99,11 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
         Log.i(TAG, "sendSms token=" + token + " messageRef=" + messageRef
                 + " format=" + format + " pduLen=" + pdu.length);
 
+        mRegController.checkRegistrationBeforeOutgoing();
         if (!mRegController.isRegistered()) {
             if (mRegController.isRetryInFlight()) {
-                /* Stack is being rebuilt mid-5xx-retry (~1-2 s window
-                 * per refresh cycle). Defer rather than fail — the
-                 * rebuild's onRegistered drains us and we re-call. */
+                /* A fresh registration runs or is due. Defer rather than
+                 * fail; its outcome drains us and we re-call. */
                 Log.i(TAG, "sendSms token=" + token
                         + ": retry in flight, deferring until REGISTER completes");
                 final int fToken = token, fMessageRef = messageRef;

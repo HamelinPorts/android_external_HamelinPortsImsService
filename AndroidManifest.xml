@@ -16,6 +16,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"/>
     <uses-permission android:name="android.permission.BIND_IMS_SERVICE"/>
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+    <!-- Registration renewal holds a timed partial wakelock per REGISTER
+         transaction. UID 1000 is granted it anyway; declared for clarity. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
     <!-- Media engine: mic capture for the MMTel audio TX leg and
          audio-routing tweaks (speaker/in-call stream) for RX. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>

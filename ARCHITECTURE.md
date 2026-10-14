@@ -80,9 +80,13 @@ bridge implementation.
   the framework's `ImsResolver` binds.
 - `HamelinPortsMmTelFeature.java` — capability advertisement, MO/MT call
   routing, SRVCC notification handlers.
-- `ImsRegistrationController.java` — REGISTER lifecycle, AKA
-  handshake, IPsec SA setup, refresh watchdog with RFC-compliant
-  retry-after handling, IMS-PDN re-bind on LTE return.
+- `ImsRegistrationController.java` — REGISTER lifecycle per slot on one
+  HandlerThread: AKA handshake, IPsec SA setup, IMS-PDN re-bind on LTE
+  return, and renewal across deep sleep (one `ELAPSED_REALTIME_WAKEUP`
+  check alarm, a timed partial wakelock per transaction, lapse checks on
+  screen on / Doze exit / PDN change / MO request).
+- `reg/` — `RefreshPolicy` (renewal window, lapse rule, retry floor and
+  budget) and `RegistrationState`; pure Java, host-tested.
 - `HamelinPortsCallSession.java` / `HamelinPortsIncomingCallSession.java` —
   MO and MT IMS call profiles + SDP negotiation.
 - `HamelinPortsSmsImpl.java` — SIP MESSAGE-based MO and MT SMS.
@@ -309,12 +313,12 @@ system_app.te`.
 `dumpsys activity service org.hamelinports.ims/.HamelinPortsImsService` is the
 authoritative source for current state. Per-slot it prints:
 
-- `running` + `registered`
-- negotiated Expires, P-CSCF list
+- usable + renewal-pending, and the state line (generation, age,
+  remaining, in-flight transaction, pending retry, retry budget)
+- P-CSCF list
 - last-registered / last-deregistered timestamps + counts
-- refresh-tick counters (fired / ok / failed)
-- 5xx retry counter
-- next refresh due time
+- refresh counters (sent / not sent) and fresh attempts
+- next check alarm
 
 ## Known limitations
 

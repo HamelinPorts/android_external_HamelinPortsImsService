@@ -351,13 +351,14 @@ public final class HamelinPortsSipStack {
         }
     }
 
-    /** Explicit refresh against the already-registered P-CSCF. Calls
-     *  reSIProcate's {@code ClientRegistration::requestRefresh} on the
-     *  stored handle — required because DUM's internal auto-refresh
-     *  has been observed to silently stop firing after the initial
-     *  200 OK on Mavenir, causing MT voice to fall back to CSFB once
-     *  the modem's NAS "VoPS" preference decays without a fresh
-     *  REGISTER keeping the registration visible to the TAS. */
+    /** In-dialog REGISTER refresh against the registered P-CSCF. The native
+     *  side posts {@code ClientRegistration::requestRefresh} to the DUM
+     *  thread; the outcome arrives via the {@link RegistrationListener}.
+     *  DUM's own refresh timer runs on CLOCK_MONOTONIC, which stops in
+     *  suspend, so the Java side drives the refresh from an alarm.
+     *
+     *  @return true if the refresh was queued, false without a live
+     *          registration handle. */
     public boolean refreshRegister() {
         if (!sNativeAvailable) return false;
         try { return nativeRefreshRegister(mSlotId); }
