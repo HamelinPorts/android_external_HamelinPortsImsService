@@ -1,5 +1,7 @@
 package org.hamelinports.ims;
 
+import android.net.ConnectivityManager;
+import android.net.Network;
 import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyManager;
 import android.telephony.ims.ImsMmTelManager;
@@ -11,6 +13,9 @@ import android.telephony.ims.stub.ImsFeatureConfiguration;
 import android.telephony.ims.stub.ImsRegistrationImplBase;
 import android.util.Log;
 import android.util.SparseArray;
+
+import org.hamelinports.ims.net.ConnectivityProcessBinding;
+import org.hamelinports.ims.net.ProcessNetworkOwner;
 
 public class HamelinPortsImsService extends ImsService {
     static final String TAG = "HamelinPortsIms";
@@ -28,10 +33,15 @@ public class HamelinPortsImsService extends ImsService {
     @SuppressWarnings("unused")
     private CarrierConfigInjector mCarrierConfigInjector;
 
+    /** The process network binding is process-wide, so one owner serves all slots. */
+    private ProcessNetworkOwner<Network> mProcessNetwork;
+
     @Override
     public void onCreate() {
         super.onCreate();
         Log.i(TAG, "HamelinPortsImsService created");
+        mProcessNetwork = new ProcessNetworkOwner<>(
+                new ConnectivityProcessBinding(getSystemService(ConnectivityManager.class)));
         mCarrierConfigInjector = CarrierConfigInjector.start(this);
     }
 
@@ -51,19 +61,21 @@ public class HamelinPortsImsService extends ImsService {
     private ImsRegistrationController getOrCreateController(int slotId) {
         ImsRegistrationController c = mRegControllers.get(slotId);
         if (c == null) {
-            c = new ImsRegistrationController(this, slotId);
+            c = new ImsRegistrationController(this, slotId, mProcessNetwork);
             mRegControllers.put(slotId, c);
         }
         return c;
     }
 
+    /* The registration starts on onFeatureReady or enableImsForSubscription,
+     * and only for a slot with an active subscription: the framework also
+     * creates an emergency-only feature for a slot without a SIM. */
     @Override
     public MmTelFeature createMmTelFeature(int slotId) {
         Log.i(TAG, "createMmTelFeature slotId=" + slotId);
         ImsRegistrationController c = getOrCreateController(slotId);
         HamelinPortsMmTelFeature f = new HamelinPortsMmTelFeature(this, slotId, c);
         c.setMmTelFeature(f);
-        c.start();
         mMmTelFeatures.put(slotId, f);
         return f;
     }
@@ -75,17 +87,17 @@ public class HamelinPortsImsService extends ImsService {
     }
 
     @Override
-    public void enableIms(int slotId) {
-        Log.i(TAG, "enableIms slotId=" + slotId);
+    public void enableImsForSubscription(int slotId, int subscriptionId) {
+        Log.i(TAG, "enableIms slotId=" + slotId + " subId=" + subscriptionId);
         ImsRegistrationController c = mRegControllers.get(slotId);
-        if (c != null) c.start();
+        if (c != null) c.setImsEnabled(true, "ENABLE_IMS");
     }
 
     @Override
-    public void disableIms(int slotId) {
-        Log.i(TAG, "disableIms slotId=" + slotId);
+    public void disableImsForSubscription(int slotId, int subscriptionId) {
+        Log.i(TAG, "disableIms slotId=" + slotId + " subId=" + subscriptionId);
         ImsRegistrationController c = mRegControllers.get(slotId);
-        if (c != null) c.stop();
+        if (c != null) c.setImsEnabled(false, "DISABLE_IMS");
     }
 
     /** Surfaces per-slot registration diag via

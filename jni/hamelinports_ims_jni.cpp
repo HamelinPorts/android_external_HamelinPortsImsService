@@ -28,6 +28,7 @@
 
 #include <jni.h>
 #include <android/log.h>
+#include <android/multinetwork.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -94,15 +95,74 @@ namespace {
  * dropped then dies instead of retransmitting through it on every wake. */
 constexpr unsigned int kSipTcpUserTimeoutMs = 30000;
 
+/* Physical slots one device exposes; one Bridge and one socket hook each. */
+constexpr int kMaxSipSlots = 2;
+
+/* IMS network each slot's SIP sockets are pinned to (NETWORK_UNSPECIFIED =
+ * none). Java sets it before the stack starts and clears it after the stack
+ * stopped; the socket hook reads it on the stack's threads. */
+std::array<std::atomic<net_handle_t>, kMaxSipSlots> gSipNetwork{};
+
+/* Set while addSipTransports creates the listening sockets, which run the
+ * hook synchronously on the caller's thread; only used to label the log. */
+thread_local bool tCreatingSipListeners = false;
+
+struct SipListenerCreation {
+    SipListenerCreation() { tCreatingSipListeners = true; }
+    ~SipListenerCreation() { tCreatingSipListeners = false; }
+    SipListenerCreation(const SipListenerCreation&) = delete;
+    SipListenerCreation& operator=(const SipListenerCreation&) = delete;
+};
+
+const char* sipSocketRole(resip::Socket fd) {
+    if (tCreatingSipListeners) return "listening";
+    sockaddr_storage peer{};
+    socklen_t len = sizeof(peer);
+    /* The hook runs before connect() on an outgoing socket, so only an
+     * accepted socket has a peer. */
+    return ::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &len) == 0
+            ? "accepted" : "outgoing";
+}
+
+/* The process network binding is process-wide and another slot may clear or
+ * move it; a socket pinned here keeps the slot's IMS network regardless. */
+void pinSipSocket(int slot, resip::Socket fd) {
+    const char* role = sipSocketRole(fd);
+    const net_handle_t net = gSipNetwork[slot].load(std::memory_order_acquire);
+    if (net == NETWORK_UNSPECIFIED) {
+        LOGW("SIP socket fd=%d (%s) slot=%d not pinned: no IMS network set",
+             (int)fd, role, slot);
+        return;
+    }
+    if (android_setsocknetwork(net, fd) != 0) {
+        LOGW("SIP socket fd=%d (%s) slot=%d pin failed: %s",
+             (int)fd, role, slot, strerror(errno));
+        return;
+    }
+    LOGI("SIP socket fd=%d (%s) pinned slot=%d netHandle=%llu",
+         (int)fd, role, slot, (unsigned long long)net);
+}
+
 /* SipStack socket-creation hook: runs for listening, accepted and outgoing
- * TCP sockets, so it covers connections reSIProcate opens on its own. */
+ * TCP sockets (before connect() on outgoing ones), so it covers connections
+ * reSIProcate opens on its own. The hook carries no user pointer, hence one
+ * instantiation per slot. */
+template <int Slot>
 void applySipSocketOptions(resip::Socket fd, int transportType, const char*, int) {
+    static_assert(Slot >= 0 && Slot < kMaxSipSlots, "slot out of range");
     if (transportType != resip::TCP) return;
     unsigned int timeoutMs = kSipTcpUserTimeoutMs;
     if (::setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &timeoutMs, sizeof(timeoutMs)) != 0) {
         LOGW("TCP_USER_TIMEOUT on fd %d failed: %s", (int)fd, strerror(errno));
     }
+    pinSipSocket(Slot, fd);
 }
+
+static_assert(kMaxSipSlots == 2, "one socket hook per slot");
+constexpr std::array<resip::AfterSocketCreationFuncPtr, kMaxSipSlots> kSipSocketHooks = {
+        &applySipSocketOptions<0>,
+        &applySipSocketOptions<1>,
+};
 
 /* "sip:user@domain" -> "sip:***@domain": the user part of the IMPU is the IMSI. */
 std::string maskUserPart(const std::string& uri) {
@@ -1644,9 +1704,8 @@ private:
 
 class Bridge {
 public:
-    /** Maximum number of physical slots a single device exposes. Bumping
-     *  this is fine — the array is just nullptr-initialised pointers. */
-    static constexpr int kMaxSlots = 2;
+    /** Maximum number of physical slots a single device exposes. */
+    static constexpr int kMaxSlots = kMaxSipSlots;
 
     /** Lookup-or-create the Bridge for {@code slot}. Returns nullptr on
      *  out-of-range. Lazily allocated on first use; never freed
@@ -1683,7 +1742,7 @@ public:
 
             mStack = std::make_unique<resip::SipStack>(
                     nullptr, resip::DnsStub::EmptyNameserverList, nullptr,
-                    /*stateless=*/false, &applySipSocketOptions);
+                    /*stateless=*/false, kSipSocketHooks[mSlotId]);
             mDum   = std::make_unique<resip::DialogUsageManager>(*mStack);
             mProf  = std::make_shared<resip::MasterProfile>();
             mDum->setMasterProfile(mProf);
@@ -1838,6 +1897,7 @@ public:
             LOGE("addSipTransports: bridge not started");
             return false;
         }
+        SipListenerCreation listeners;
         try {
             const resip::Data ipIface(localIp);
             const resip::IpVersion ipv =
@@ -2760,6 +2820,17 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeStop(
 {
     BRIDGE_OR_VOID();
     b->stop();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetNetworkHandle(
+        JNIEnv* /*env*/, jclass /*clazz*/, jint slotId, jlong networkHandle)
+{
+    if (slotId < 0 || slotId >= kMaxSipSlots) return;
+    const net_handle_t net = static_cast<net_handle_t>(networkHandle);
+    gSipNetwork[slotId].store(net, std::memory_order_release);
+    LOGI("SIP sockets of slot=%d pin to netHandle=%llu", (int)slotId,
+         (unsigned long long)net);
 }
 
 extern "C" JNIEXPORT jstring JNICALL

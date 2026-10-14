@@ -62,7 +62,8 @@ public class HamelinPortsMmTelFeature extends MmTelFeature implements IncomingCa
     @Override
     public void onFeatureReady() {
         Log.i(TAG, "onFeatureReady slotId=" + mSlotId);
-        mRegController.start();
+        /* Registers only if the slot has an active subscription. */
+        mRegController.setImsEnabled(true, "FEATURE_READY");
         /* Delay SRVCC subscription: the SubscriptionManager slot→sub
          * mapping isn't guaranteed until after SIM provisioning, which
          * may land slightly after onFeatureReady. If the subscription
@@ -76,7 +77,7 @@ public class HamelinPortsMmTelFeature extends MmTelFeature implements IncomingCa
     public void onFeatureRemoved() {
         Log.i(TAG, "onFeatureRemoved slotId=" + mSlotId);
         mSrvcc.stop();
-        mRegController.stop();
+        mRegController.setImsEnabled(false, "FEATURE_REMOVED");
     }
 
     @Override

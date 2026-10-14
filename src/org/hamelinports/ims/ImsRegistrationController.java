@@ -14,17 +14,21 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.PowerManager;
 import android.os.SystemClock;
+import android.telephony.SubscriptionManager;
+import android.telephony.TelephonyManager;
 import android.telephony.ims.ImsReasonInfo;
 import android.telephony.ims.stub.ImsRegistrationImplBase;
 import android.util.Log;
 
 import org.hamelinports.ims.modem.IImsModemBridge;
 import org.hamelinports.ims.modem.ImsModemBridgeFactory;
+import org.hamelinports.ims.net.ProcessNetworkOwner;
 import org.hamelinports.ims.reg.DeferredRequests;
 import org.hamelinports.ims.reg.OutgoingGate;
 import org.hamelinports.ims.reg.RefreshPolicy;
 import org.hamelinports.ims.reg.RegistrationSnapshot;
 import org.hamelinports.ims.reg.RegistrationState;
+import org.hamelinports.ims.reg.SlotActivation;
 import org.hamelinports.ims.sip.HamelinPortsAkaProviderImpl;
 import org.hamelinports.ims.sip.HamelinPortsSipStack;
 import org.hamelinports.ims.sip.RegistrationListener;
@@ -68,6 +72,8 @@ public class ImsRegistrationController {
     private final ImsRegistrationImplBase mRegImpl = new ImsRegistrationImplBase();
     private final HamelinPortsSipStack mStack;
     private final ConnectivityManager mCm;
+    /** Shared by all slots: only the slot that bound the process may clear the binding. */
+    private final ProcessNetworkOwner<Network> mProcessNetwork;
     private final AlarmManager mAlarmManager;
     private final PowerManager mPowerManager;
     private final PowerManager.WakeLock mWakeLock;
@@ -93,6 +99,13 @@ public class ImsRegistrationController {
     private int mLastWwanImsState = android.telephony.TelephonyManager.DATA_DISCONNECTED;
     private int mLastWlanImsState = android.telephony.TelephonyManager.DATA_DISCONNECTED;
     private boolean mImsPdnWatchdogArmed;
+    /** The framework wants IMS on this slot (feature ready / enableImsForSubscription). */
+    private boolean mImsEnabled;
+    /** Subscription the machine runs for, or NO_SUBSCRIPTION while stopped. */
+    private int mRunningSubId = SlotActivation.NO_SUBSCRIPTION;
+    private boolean mIdleLogged;
+    /** The last attempt found the SIM not ready; SIM_STATE_LOADED registers at once. */
+    private boolean mWaitingForSim;
 
     /* Published by the registration thread for callers on other threads. */
     private volatile Network mImsNetwork;
@@ -133,6 +146,29 @@ public class ImsRegistrationController {
         }
     };
 
+    /** SIM records loaded on this slot, e.g. after the PIN was entered. */
+    private final BroadcastReceiver mSimStateReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            int slot = intent.getIntExtra(SubscriptionManager.EXTRA_SLOT_INDEX,
+                    SubscriptionManager.INVALID_SIM_SLOT_INDEX);
+            int state = intent.getIntExtra(TelephonyManager.EXTRA_SIM_STATE,
+                    TelephonyManager.SIM_STATE_UNKNOWN);
+            if (slot == mSlotId && state == TelephonyManager.SIM_STATE_LOADED) {
+                onSimLoaded();
+            }
+        }
+    };
+
+    /** SIM inserted, removed or swapped; the framework does not re-create the feature for it. */
+    private final SubscriptionManager.OnSubscriptionsChangedListener mSubscriptionsListener =
+            new SubscriptionManager.OnSubscriptionsChangedListener() {
+                @Override
+                public void onSubscriptionsChanged() {
+                    evaluateActivation("SUBSCRIPTIONS_CHANGED");
+                }
+            };
+
     /** Wall-clock history for dumpsys; it survives logcat rollover on overnight runs. */
     private static final class RegistrationDiag {
         volatile long mRegisteredAtMs;
@@ -168,9 +204,11 @@ public class ImsRegistrationController {
         }
     }
 
-    ImsRegistrationController(Context context, int slotId) {
+    ImsRegistrationController(Context context, int slotId,
+                              ProcessNetworkOwner<Network> processNetwork) {
         mContext = context;
         mSlotId = slotId;
+        mProcessNetwork = processNetwork;
         mCm = context.getSystemService(ConnectivityManager.class);
         mAlarmManager = context.getSystemService(AlarmManager.class);
         mPowerManager = context.getSystemService(PowerManager.class);
@@ -182,6 +220,10 @@ public class ImsRegistrationController {
         HandlerThread thread = new HandlerThread("ims-reg-" + slotId);
         thread.start();
         mHandler = new Handler(thread.getLooper());
+        SubscriptionManager sm = context.getSystemService(SubscriptionManager.class);
+        if (sm != null) {
+            sm.addOnSubscriptionsChangedListener(mHandler::post, mSubscriptionsListener);
+        }
     }
 
     /** Per-slot SIP stack accessor for downstream call/SMS/MmTel code. */
@@ -289,29 +331,79 @@ public class ImsRegistrationController {
         return (iso == null || iso.isEmpty()) ? null : iso.toUpperCase();
     }
 
-    void start() {
-        mHandler.post(this::startOnRegThread);
+    /**
+     * The framework enabled or disabled IMS on this slot. The machine runs
+     * only while enabled and while the slot has an active subscription.
+     */
+    void setImsEnabled(boolean enabled, String reason) {
+        mHandler.post(() -> {
+            mImsEnabled = enabled;
+            evaluateActivation(reason);
+        });
     }
 
-    void stop() {
-        mHandler.post(this::stopOnRegThread);
+    /** Starts, stops or restarts the machine for the slot's current subscription. */
+    private void evaluateActivation(String reason) {
+        int activeSubId = SipClient.activeSubscriptionId(mContext, mSlotId);
+        SlotActivation.Action action =
+                SlotActivation.decide(mImsEnabled, activeSubId, mRunningSubId);
+        switch (action) {
+            case START:
+                startOnRegThread(activeSubId, reason);
+                break;
+            case RESTART:
+                Log.i(TAG, "slot=" + mSlotId + " subscription changed subId=" + mRunningSubId
+                        + " -> " + activeSubId + " — restarting registration");
+                stopOnRegThread();
+                startOnRegThread(activeSubId, reason);
+                break;
+            case STOP:
+                Log.i(TAG, "slot=" + mSlotId + " stop reason=" + reason
+                        + " imsEnabled=" + mImsEnabled);
+                stopOnRegThread();
+                if (mImsEnabled) logIdle();
+                break;
+            case IDLE:
+                logIdle();
+                break;
+            case NONE:
+                break;
+        }
     }
 
-    private void startOnRegThread() {
+    private void logIdle() {
+        if (mIdleLogged) return;
+        mIdleLogged = true;
+        Log.i(TAG, "slot=" + mSlotId + " registration idle: no active subscription");
+    }
+
+    /** The subscription went away under a running attempt: stop without a retry. */
+    private void idleNoSubscription() {
+        stopOnRegThread();
+        logIdle();
+    }
+
+    private void startOnRegThread(int subId, String reason) {
         if (mState.isRunning()) return;
         mState.setRunning(true);
-        Log.i(TAG, "start: requesting IMS PDN");
+        mRunningSubId = subId;
+        mIdleLogged = false;
+        Log.i(TAG, "slot=" + mSlotId + " start subId=" + subId + " reason=" + reason
+                + ": requesting IMS PDN");
         if (!requestImsNetwork()) {
             mState.setRunning(false);
+            mRunningSubId = SlotActivation.NO_SUBSCRIPTION;
             return;
         }
-        registerImsPdnWatchdog();
+        registerImsPdnWatchdog(subId);
         registerWakeSignals();
         publishState();
     }
 
     private void stopOnRegThread() {
         mState.setRunning(false);
+        mRunningSubId = SlotActivation.NO_SUBSCRIPTION;
+        mWaitingForSim = false;
         mHandler.removeCallbacks(mImsPdnWatchdogRunnable);
         mImsPdnWatchdogArmed = false;
         if (mTelCallback != null) {
@@ -330,6 +422,7 @@ public class ImsRegistrationController {
         }
         if (mWakeSignalsRegistered) {
             try { mContext.unregisterReceiver(mWakeSignalReceiver); } catch (Exception e) {}
+            try { mContext.unregisterReceiver(mSimStateReceiver); } catch (Exception e) {}
             mWakeSignalsRegistered = false;
         }
         tearDown();
@@ -337,7 +430,7 @@ public class ImsRegistrationController {
         publishState();
     }
 
-    /** Lapse checks on the moments a sleeping device comes back. */
+    /** Lapse checks on the moments a sleeping device comes back, and the SIM load. */
     private void registerWakeSignals() {
         if (mWakeSignalsRegistered) return;
         IntentFilter filter = new IntentFilter();
@@ -346,7 +439,31 @@ public class ImsRegistrationController {
         filter.addAction(PowerManager.ACTION_DEVICE_LIGHT_IDLE_MODE_CHANGED);
         mContext.registerReceiver(mWakeSignalReceiver, filter, null, mHandler,
                 Context.RECEIVER_NOT_EXPORTED);
+        /* Sent by the phone process, not by this UID, so the receiver must be
+         * exported; the action is a protected broadcast and the sender must
+         * also hold READ_PRIVILEGED_PHONE_STATE. */
+        mContext.registerReceiver(mSimStateReceiver,
+                new IntentFilter(TelephonyManager.ACTION_SIM_APPLICATION_STATE_CHANGED),
+                android.Manifest.permission.READ_PRIVILEGED_PHONE_STATE, mHandler,
+                Context.RECEIVER_EXPORTED);
         mWakeSignalsRegistered = true;
+    }
+
+    /**
+     * The SIM became readable after an attempt found it not ready: register
+     * now instead of after the retry or the long tail.
+     */
+    private void onSimLoaded() {
+        if (!mWaitingForSim || !mState.isRunning()) return;
+        mWaitingForSim = false;
+        Log.i(TAG, "slot=" + mSlotId + " SIM loaded — registering without waiting for the retry");
+        mState.clearRecovery();
+        List<InetAddress> pcscfs = mPcscfs;
+        if (pcscfs != null && !pcscfs.isEmpty() && mState.isIdle()) {
+            startFreshRegistration("SIM_LOADED");
+        }
+        armNextCheck();
+        publishState();
     }
 
     /**
@@ -438,14 +555,10 @@ public class ImsRegistrationController {
         publishState();
     }
 
-    private void registerImsPdnWatchdog() {
+    private void registerImsPdnWatchdog(int subId) {
         android.telephony.TelephonyManager tm =
                 mContext.getSystemService(android.telephony.TelephonyManager.class);
         if (tm == null) return;
-        int subId = android.telephony.SubscriptionManager.getSubscriptionId(mSlotId);
-        if (!android.telephony.SubscriptionManager.isValidSubscriptionId(subId)) {
-            return;
-        }
         mTelCallback = new ImsPdnWatchdogCallback();
         try {
             tm.createForSubscriptionId(subId).registerTelephonyCallback(
@@ -625,6 +738,13 @@ public class ImsRegistrationController {
      * the outcome, so a quick renewal does not flip MT routing to CSFB.
      */
     private void startFreshRegistration(String reason) {
+        SipClient.CredentialResult creds = SipClient.readSimCredentials(mContext, mSlotId);
+        SlotActivation.NextStep next = SlotActivation.afterCredentialRead(creds.status);
+        if (next == SlotActivation.NextStep.IDLE) {
+            idleNoSubscription();
+            return;
+        }
+        mWaitingForSim = next == SlotActivation.NextStep.RETRY;
         long now = SystemClock.elapsedRealtime();
         int gen = mState.beginFresh(now);
         /* Before the stack goes down: no MO request may still see a binding. */
@@ -635,7 +755,7 @@ public class ImsRegistrationController {
         Log.i(TAG, "fresh registration gen=" + gen + " reason=" + reason
                 + " published bindingValid=" + published.isBindingValid(now));
         stopStackAndReleaseSa();
-        if (!attemptRegistration(gen)) {
+        if (!attemptRegistration(gen, creds.credentials)) {
             Log.w(TAG, "fresh registration gen=" + gen + " not sent");
             stopStackAndReleaseSa();
             mState.endAttempt();
@@ -649,6 +769,7 @@ public class ImsRegistrationController {
     /** Stops the native stack, then releases the SAs and xfrm policies of the last AKA. */
     private void stopStackAndReleaseSa() {
         mStack.stop();
+        mStack.setNetworkHandle(HamelinPortsSipStack.NO_NETWORK);
         if (mAkaProvider != null) {
             try { mAkaProvider.close(); } catch (Exception e) {}
             mAkaProvider = null;
@@ -664,8 +785,15 @@ public class ImsRegistrationController {
         mAssociatedUri = null;
         reportDeregistered(ImsReasonInfo.CODE_LOCAL_SERVICE_UNAVAILABLE, 0, false);
         stopStackAndReleaseSa();
-        try { mCm.bindProcessToNetwork(null); } catch (Exception e) {}
+        releaseProcessNetwork();
         releaseWakeLock("teardown");
+    }
+
+    /** Clears the process binding, but only if this slot made it and it still stands. */
+    private void releaseProcessNetwork() {
+        if (mProcessNetwork.release(mSlotId)) {
+            Log.i(TAG, "slot=" + mSlotId + " cleared the process network binding");
+        }
     }
 
     private void reportDeregistered(int reasonCode, int sipCode, boolean notifyModem) {
@@ -695,7 +823,7 @@ public class ImsRegistrationController {
             if (!mState.isCurrent(gen) || isCallActive()) return;
             Log.i(TAG, "trial tear-down: " + why);
             stopStackAndReleaseSa();
-            try { mCm.bindProcessToNetwork(null); } catch (Exception e) {}
+            releaseProcessNetwork();
         }, mDelayedRegWork, STACK_DRAIN_MS);
         Log.i(TAG, "long-tail recovery armed at +"
                 + (RefreshPolicy.LONG_TAIL_RETRY_MS / 1000) + " s");
@@ -897,13 +1025,11 @@ public class ImsRegistrationController {
         }
     }
 
-    private boolean attemptRegistration(int gen) {
+    private boolean attemptRegistration(int gen, SipClient.Credentials creds) {
         Network net = mImsNetwork;
         List<InetAddress> pcscfs = mPcscfs;
         if (net == null || pcscfs == null || pcscfs.isEmpty()) return false;
-
-        SipClient.Credentials creds = SipClient.readSimCredentials(mContext, mSlotId);
-        if (creds == null) { Log.e(TAG, "SIM unavailable"); return false; }
+        if (creds == null) { Log.e(TAG, "SIM not ready"); return false; }
 
         int pcscfIdx = Math.min(mPcscfAttempt, pcscfs.size() - 1);
         InetAddress pcscf = pcscfs.get(pcscfIdx);
@@ -940,14 +1066,13 @@ public class ImsRegistrationController {
         String impi = creds.imsi + "@" + creds.domain;
         String impu = "sip:" + impi;
 
-        /* reSIProcate creates its sockets internally, so Network.bindSocket
-         * cannot reach them; pin the whole process to the IMS PDN instead. */
-        try {
-            mCm.bindProcessToNetwork(net);
-        } catch (Exception e) {
-            Log.e(TAG, "bindProcessToNetwork failed", e);
-            return false;
+        /* reSIProcate creates its sockets internally; its socket hook pins
+         * each one to this network. The process binding stays as a fallback
+         * until the device shows every SIP socket pinned. */
+        if (!mProcessNetwork.bind(mSlotId, net)) {
+            Log.w(TAG, "slot=" + mSlotId + " process network binding refused");
         }
+        mStack.setNetworkHandle(net.getNetworkHandle());
 
         /* Order: stack -> transports -> AKA provider and listener -> REGISTER. */
         if (!mStack.start()) {
@@ -985,7 +1110,8 @@ public class ImsRegistrationController {
         long nowWall = System.currentTimeMillis();
         long nowElapsed = SystemClock.elapsedRealtime();
         pw.println("  slot=" + mSlotId + " usable=" + isRegistered()
-                + " renewalPending=" + isRetryInFlight());
+                + " renewalPending=" + isRetryInFlight()
+                + " processNetworkOwner=" + mProcessNetwork.ownerSlot());
         pw.println("  state: " + mStateSummary);
         pw.println("  pcscfs=" + mPcscfs);
         pw.println("  lastRegistered: " + fmtAgo(nowWall, mDiag.mRegisteredAtMs)

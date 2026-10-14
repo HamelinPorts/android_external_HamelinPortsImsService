@@ -25,12 +25,14 @@ android_app {
     },
 }
 
-// Host unit tests of the registration renewal policy (pure Java, no device):
+// Host unit tests of the registration policy, slot activation and process
+// network ownership (pure Java, no device):
 //   atest --host HamelinPortsImsPolicyTests
 java_test_host {
     name: "HamelinPortsImsPolicyTests",
     srcs: [
         "src/org/hamelinports/ims/reg/*.java",
+        "src/org/hamelinports/ims/net/ProcessNetworkOwner.java",
         "tests/host/src/**/*.java",
     ],
     static_libs: ["junit"],
@@ -69,6 +71,7 @@ cc_library_shared {
         "libcares",
     ],
     shared_libs: [
+        "libandroid", // android_setsocknetwork: pins SIP sockets to the IMS network
         "liblog",
         "libssl",
         "libcrypto",

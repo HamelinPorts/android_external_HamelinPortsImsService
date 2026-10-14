@@ -5,6 +5,8 @@ import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyManager;
 import android.util.Log;
 
+import org.hamelinports.ims.reg.SlotActivation;
+
 import java.util.Random;
 
 /**
@@ -45,29 +47,48 @@ public final class SipClient {
      * + ImsDecorator). MO SMS (buildSipMessage) is the last hand-rolled
      * builder, pending task 9. */
 
-    /** Picks the IMSI + mccMnc from the active subscription on the
-     *  given physical slot. Returns null when no active SIM sits on
-     *  that slot — this is how a dual-SIM-capable device with only
-     *  one SIM present skips REGISTER on the empty slot. */
-    public static Credentials readSimCredentials(Context ctx, int slotId) {
-        TelephonyManager tm = ctx.getSystemService(TelephonyManager.class);
-        SubscriptionManager sm = ctx.getSystemService(SubscriptionManager.class);
-        int subId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
-        if (sm != null) {
-            android.telephony.SubscriptionInfo info =
-                    sm.getActiveSubscriptionInfoForSimSlotIndex(slotId);
-            if (info != null) subId = info.getSubscriptionId();
+    /** SIM credentials of a slot, or why there are none. */
+    public static final class CredentialResult {
+        public final SlotActivation.CredentialStatus status;
+        /** Non-null exactly when {@link #status} is READY. */
+        public final Credentials credentials;
+
+        private CredentialResult(SlotActivation.CredentialStatus status, Credentials credentials) {
+            this.status = status;
+            this.credentials = credentials;
         }
-        if (subId == SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
+    }
+
+    /**
+     * The active subscription on the slot, or {@link SlotActivation#NO_SUBSCRIPTION}.
+     * The one lookup both slot activation and the credential read use, so the
+     * two cannot disagree about whether the slot has a SIM.
+     */
+    public static int activeSubscriptionId(Context ctx, int slotId) {
+        SubscriptionManager sm = ctx.getSystemService(SubscriptionManager.class);
+        if (sm == null) return SlotActivation.NO_SUBSCRIPTION;
+        android.telephony.SubscriptionInfo info =
+                sm.getActiveSubscriptionInfoForSimSlotIndex(slotId);
+        if (info == null || !SubscriptionManager.isUsableSubscriptionId(info.getSubscriptionId())) {
+            return SlotActivation.NO_SUBSCRIPTION;
+        }
+        return info.getSubscriptionId();
+    }
+
+    /** Picks the IMSI + mccMnc from the active subscription on the given slot. */
+    public static CredentialResult readSimCredentials(Context ctx, int slotId) {
+        TelephonyManager tm = ctx.getSystemService(TelephonyManager.class);
+        int subId = activeSubscriptionId(ctx, slotId);
+        if (!SlotActivation.isActive(subId) || tm == null) {
             Log.i(TAG, "no active subscription on slot " + slotId);
-            return null;
+            return new CredentialResult(SlotActivation.CredentialStatus.NO_SUBSCRIPTION, null);
         }
         TelephonyManager stm = tm.createForSubscriptionId(subId);
         String imsi = stm.getSubscriberId();
         String mccMnc = stm.getSimOperator();
         if (imsi == null || mccMnc == null || mccMnc.isEmpty()) {
             Log.e(TAG, "sim not ready: imsi=" + (imsi != null) + " mccMnc=" + mccMnc);
-            return null;
+            return new CredentialResult(SlotActivation.CredentialStatus.SIM_NOT_READY, null);
         }
         Credentials c = new Credentials();
         c.imsi = imsi;
@@ -93,7 +114,7 @@ public final class SipClient {
             c.imeiUrn = "<urn:gsma:imei:90420156-025763-0>"; // fallback
         }
         Log.i(TAG, "creds imsi=" + redact(imsi) + " mccMnc=" + mccMnc + " domain=" + c.domain);
-        return c;
+        return new CredentialResult(SlotActivation.CredentialStatus.READY, c);
     }
 
     private static String redact(String s) {

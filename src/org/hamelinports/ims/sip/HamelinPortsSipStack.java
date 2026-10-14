@@ -66,6 +66,7 @@ public final class HamelinPortsSipStack {
             String pcscfHost, int pcscfCleartextPort,
             String securityClient);
     private static native boolean nativeRefreshRegister(int slotId);
+    private static native void    nativeSetNetworkHandle(int slotId, long networkHandle);
     private static native void    nativeSetCellIdForPani(int slotId, String value);
     private static native void    nativeSetIwlanNodeIdForPani(int slotId, String value);
     private static native boolean nativeStartCall(int slotId, String targetUri, String sdpOffer);
@@ -101,6 +102,24 @@ public final class HamelinPortsSipStack {
             return nativeStart(mSlotId);
         } catch (UnsatisfiedLinkError e) {
             return false;
+        }
+    }
+
+    /** {@link #setNetworkHandle} value for "no network": sockets are not pinned. */
+    public static final long NO_NETWORK = 0L;
+
+    /**
+     * Network every SIP socket of this slot is pinned to when reSIProcate
+     * creates it (listening, accepted and outgoing), from
+     * {@link android.net.Network#getNetworkHandle()}. Set it before
+     * {@link #start()}; clear it with {@link #NO_NETWORK} after {@link #stop()}.
+     */
+    public void setNetworkHandle(long networkHandle) {
+        if (!sNativeAvailable) return;
+        try {
+            nativeSetNetworkHandle(mSlotId, networkHandle);
+        } catch (UnsatisfiedLinkError e) {
+            // ignore
         }
     }
 

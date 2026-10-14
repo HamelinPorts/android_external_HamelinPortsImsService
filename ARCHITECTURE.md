@@ -84,15 +84,21 @@ bridge implementation.
   HandlerThread: AKA handshake, IPsec SA setup, IMS-PDN re-bind on LTE
   return, and renewal across deep sleep (one `ELAPSED_REALTIME_WAKEUP`
   check alarm, a timed partial wakelock per transaction, lapse checks on
-  screen on / Doze exit / PDN change / MO request).
+  screen on / Doze exit / PDN change / MO request). It runs only while the
+  framework enables IMS on the slot and the slot has an active
+  subscription; a slot without a SIM stays idle (no retry, no alarm).
 - `reg/` — `RefreshPolicy` (renewal window, lapse rule, retry floor and
-  budget) and `RegistrationState`; pure Java, host-tested.
+  budget), `RegistrationState` and `SlotActivation` (start/stop/restart per
+  subscription, credential status → retry or idle); pure Java, host-tested.
 - `HamelinPortsCallSession.java` / `HamelinPortsIncomingCallSession.java` —
   MO and MT IMS call profiles + SDP negotiation.
 - `HamelinPortsSmsImpl.java` — SIP MESSAGE-based MO and MT SMS.
 - `sip/` — SIP/SDP helpers, native handle lifetimes,
   `HamelinPortsSipStack` (the JNI front door).
-- `net/` — IPsec SA setup helpers, ESP routing fix.
+- `net/` — IPsec SA setup helpers, ESP routing fix, `ProcessNetworkOwner`
+  (only the slot that bound the process network may clear it; the only
+  `bindProcessToNetwork` caller is `ConnectivityProcessBinding`, gated by
+  `tests/check-process-binding.sh`).
 - `modem/` — bridge factory + AIDL-side proxies (see below).
 
 ### `jni/hamelinports_ims_jni.cpp`
@@ -101,6 +107,13 @@ Native bridge between the Java service and reSIProcate. Hosts the
 `SipStack` and `DialogUsageManager`, wires registration/INVITE/MESSAGE
 handlers, exposes JNI methods for outbound REGISTER, INVITE, ACK, BYE,
 re-INVITE, MESSAGE, refresh.
+
+Every SIP TCP socket reSIProcate creates (listening, accepted, outgoing)
+passes a per-slot socket hook: `TCP_USER_TIMEOUT` plus
+`android_setsocknetwork` to the slot's IMS network, whose handle Java sets
+before the stack starts and clears after it stops. A connection opened
+later (e.g. for a registration refresh) therefore stays on the IMS network
+whatever the process binding is.
 
 Includes carrier-quirk fixes accumulated during bring-up (in-dialog
 TCP routing, SDP offer/answer matching, 5xx Retry-After parsing).
