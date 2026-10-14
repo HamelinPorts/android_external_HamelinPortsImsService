@@ -1731,7 +1731,7 @@ public:
                     if (mProf) {
                         mProf->setDefaultFrom(resip::NameAddr(resip::Data(uri)));
                         LOGI("public identity set for outbound From: %s",
-                             uri.c_str());
+                             maskUserPart(uri).c_str());
                     }
                     if (mDum && !mSubscribeFired) {
                         resip::NameAddr target{resip::Data(uri)};
@@ -1763,7 +1763,7 @@ public:
                             mDum->send(sub);
                             mSubscribeFired = true;
                             LOGI("SUBSCRIBE reg fired for %s (portC-pinned)",
-                                 uri.c_str());
+                                 maskUserPart(uri).c_str());
                         }
                     }
                 } catch (const std::exception& e) {
