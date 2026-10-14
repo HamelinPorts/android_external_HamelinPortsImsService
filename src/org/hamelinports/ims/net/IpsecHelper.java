@@ -6,8 +6,6 @@ import android.net.IpSecManager;
 import android.net.IpSecTransform;
 import android.util.Log;
 
-import org.hamelinports.ims.auth.AkaHelper;
-
 import java.net.InetAddress;
 
 public final class IpsecHelper {
@@ -61,11 +59,9 @@ public final class IpsecHelper {
         IpSecManager ism = ctx.getSystemService(IpSecManager.class);
         IpsecResult result = new IpsecResult();
 
-        Log.i(TAG, "IPsec setup: localAddr=" + localAddr.getHostAddress()
-                + " pcscfAddr=" + pcscfAddr.getHostAddress()
-                + " serverSpiS=" + serverSpiS
-                + " ueSpiC=" + ueSpiC + " ueSpiS=" + ueSpiS
-                + " IK=" + AkaHelper.hex(ik));
+        /* SPIs only: the integrity key must never reach the log. */
+        Log.i(TAG, "IPsec setup: serverSpiS=" + serverSpiS + " serverSpiC=" + serverSpiC
+                + " ueSpiC=" + ueSpiC + " ueSpiS=" + ueSpiS);
 
         IpSecAlgorithm auth = new IpSecAlgorithm(IpSecAlgorithm.AUTH_HMAC_MD5, ik, 96);
 
