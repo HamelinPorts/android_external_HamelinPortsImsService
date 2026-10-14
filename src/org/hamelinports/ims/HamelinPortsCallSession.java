@@ -7,6 +7,8 @@ import android.telephony.ims.ImsStreamMediaProfile;
 import android.telephony.ims.stub.ImsCallSessionImplBase;
 import android.util.Log;
 
+import org.hamelinports.ims.reg.DeferredRequests;
+import org.hamelinports.ims.reg.OutgoingGate;
 import org.hamelinports.ims.sip.CallSessionListener;
 import org.hamelinports.ims.sip.HamelinPortsSipStack;
 import org.hamelinports.ims.sip.SipClient;
@@ -133,6 +135,14 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
      *  §12.2). Set by {@link HamelinPortsMmTelFeature#onSrvccStarted},
      *  cleared on any terminal SRVCC transition. */
     private volatile boolean mSrvccStarted = false;
+
+    /** Set by {@link #terminate} or a CS fallback; a terminated session never sends its INVITE. */
+    private final java.util.concurrent.atomic.AtomicBoolean mTerminated =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    /** Set just before the INVITE goes to the stack. */
+    private volatile boolean mInviteSent;
+    /** Queued start while the registration is renewed; cancelled by {@link #terminate}. */
+    private volatile DeferredRequests.Entry mDeferredStart;
 
     /** Monotonic nanotime of the most recent {@code onConnected}
      *  callback, for annotating SRVCC diagnostic log lines with a
@@ -266,15 +276,58 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
     @Override
     public void start(String callee, ImsCallProfile profile) {
         Log.i(TAG, "CallSession.start callee=" + callee);
-        mRegController.checkRegistrationBeforeOutgoing();
-        if (!mRegController.isRegistered() && mRegController.isRetryInFlight()) {
-            /* A lapsed binding is being replaced; an INVITE now would go out
-             * on a dead stack. The outcome drains us. */
-            Log.i(TAG, "CallSession.start: registration renewal pending, deferring INVITE");
-            mRegController.runOnNextRegister(() -> startOutgoingCallThread(callee));
-            return;
+        ImsCallProfile p = profile != null ? profile : mProfile;
+        boolean emergency = p != null
+                && p.getServiceType() == ImsCallProfile.SERVICE_TYPE_EMERGENCY;
+        /* No lapse check for an emergency call: a fresh registration it
+         * triggered would stop the stack under its INVITE. */
+        if (!emergency) mRegController.checkRegistrationBeforeOutgoing();
+        switch (OutgoingGate.decideCall(emergency, mRegController.isRegistered(),
+                mRegController.isRetryInFlight())) {
+            case SEND:
+                startOutgoingCallThread(callee);
+                break;
+            case FAIL:
+                failToCircuitSwitched(emergency, "no usable IMS registration");
+                break;
+            case DEFER:
+                /* A lapsed binding is being replaced; an INVITE now would go
+                 * out on a dead stack. */
+                Log.i(TAG, "CallSession.start: registration renewal pending, deferring INVITE");
+                mDeferredStart = mRegController.deferUntilRegistered(
+                        () -> startDeferred(callee),
+                        () -> failToCircuitSwitched(false, "registration renewal too slow"));
+                break;
         }
-        startOutgoingCallThread(callee);
+    }
+
+    /** Runs a deferred start once the renewal has an outcome. */
+    private void startDeferred(String callee) {
+        mDeferredStart = null;
+        if (mTerminated.get()) return;
+        if (mRegController.isRegistered()) {
+            startOutgoingCallThread(callee);
+        } else {
+            failToCircuitSwitched(false, "renewal failed");
+        }
+    }
+
+    /** Fails the call before any INVITE so telephony redials it over CS. */
+    private void failToCircuitSwitched(boolean emergency, String why) {
+        mDeferredStart = null;
+        if (!mTerminated.compareAndSet(false, true)) return;
+        Log.w(TAG, "CallSession: " + why + " — CS retry (emergency=" + emergency + ")");
+        if (mListener != null) {
+            mListener.callSessionInitiatedFailed(new ImsReasonInfo(
+                    ImsReasonInfo.CODE_LOCAL_CALL_CS_RETRY_REQUIRED,
+                    emergency ? ImsReasonInfo.EXTRA_CODE_CALL_RETRY_EMERGENCY : 0, why));
+        }
+        fireGoneOnce();
+    }
+
+    /** True once the INVITE was handed to the stack; until then the call needs no stack. */
+    boolean hasSentInvite() {
+        return mInviteSent;
     }
 
     private void startOutgoingCallThread(String callee) {
@@ -306,6 +359,13 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
             return;
         }
         Log.i(TAG, "CallSession.terminate reason=" + reason);
+        /* A deferred start must never send its INVITE after this. */
+        mTerminated.set(true);
+        DeferredRequests.Entry deferred = mDeferredStart;
+        if (deferred != null) {
+            deferred.cancel();
+            mDeferredStart = null;
+        }
         try {
             mRegController.stack().endCall();
         } catch (Exception e) {
@@ -382,6 +442,10 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
     }
 
     private void doOutgoingCall(String callee) throws Exception {
+        if (mTerminated.get()) {
+            Log.i(TAG, "CallSession: terminated before setup — no INVITE");
+            return;
+        }
         mCalleeNumber = callee.replaceAll("[^0-9+]", "");
 
         // Allocate the local RTP port. The socket must be bound to an
@@ -548,9 +612,19 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
                 isVideoCall(mProfile) ? mRtpPortVideo  : 0,
                 isVideoCall(mProfile) ? mRtcpPortVideo : 0,
                 videoDirectionAttr(mProfile));
+        if (mTerminated.get()) {
+            Log.i(TAG, "CallSession: terminated during setup — no INVITE");
+            cleanup();   /* sockets opened after terminate()'s own cleanup */
+            return;
+        }
         Log.i(TAG, "---> INVITE " + calleeUri
                 + (isVideoCall(mProfile) ? " [+video]" : ""));
+        mInviteSent = true;
         boolean queued = mRegController.stack().startCall(calleeUri, sdp);
+        if (queued && mTerminated.get()) {
+            /* terminate() raced the send: end the dialog it just opened. */
+            mRegController.stack().endCall();
+        }
         if (!queued && mListener != null) {
             mListener.callSessionInitiatedFailed(new ImsReasonInfo(
                     ImsReasonInfo.CODE_LOCAL_INTERNAL_ERROR, 0, "queue failed"));

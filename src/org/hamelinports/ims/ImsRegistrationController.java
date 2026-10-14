@@ -20,6 +20,8 @@ import android.util.Log;
 
 import org.hamelinports.ims.modem.IImsModemBridge;
 import org.hamelinports.ims.modem.ImsModemBridgeFactory;
+import org.hamelinports.ims.reg.DeferredRequests;
+import org.hamelinports.ims.reg.OutgoingGate;
 import org.hamelinports.ims.reg.RefreshPolicy;
 import org.hamelinports.ims.reg.RegistrationState;
 import org.hamelinports.ims.sip.HamelinPortsAkaProviderImpl;
@@ -30,9 +32,7 @@ import org.hamelinports.ims.sip.SipClient;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -104,7 +104,7 @@ public class ImsRegistrationController {
     private volatile String mStateSummary = "";
     /** MO lapse checks posted but not yet run; MO requests wait for them. */
     private final AtomicInteger mPendingOutgoingChecks = new AtomicInteger();
-    private final List<Runnable> mDeferredOnRegister = new CopyOnWriteArrayList<>();
+    private final DeferredRequests mDeferred = new DeferredRequests();
     private final RegistrationDiag mDiag = new RegistrationDiag();
 
     private final AlarmManager.OnAlarmListener mCheckAlarm =
@@ -198,15 +198,21 @@ public class ImsRegistrationController {
     }
 
     /**
-     * Queues a one-shot Runnable for the next registration outcome (success
-     * or terminal failure). It runs on the registration thread and should
-     * re-check {@link #isRegistered()} itself.
+     * Holds an MO request until no renewal is pending ({@code onReady}) or
+     * for at most {@link OutgoingGate#MAX_DEFERRAL_MS} ({@code onExpired}).
+     * Both run on the registration thread; {@code onReady} should re-check
+     * {@link #isRegistered()}. Cancel the entry when the request goes away.
      */
-    public void runOnNextRegister(Runnable r) {
-        mDeferredOnRegister.add(r);
+    public DeferredRequests.Entry deferUntilRegistered(Runnable onReady, Runnable onExpired) {
+        DeferredRequests.Entry entry =
+                mDeferred.add(onReady, onExpired, SystemClock.elapsedRealtime());
         /* Re-evaluate on the owning thread so an outcome that landed just
-         * before the add still releases this Runnable. */
+         * before the add still releases this request. */
         mHandler.post(this::publishState);
+        /* Uptime advances no faster than elapsed time, so the deadline has
+         * passed when this runs. */
+        mHandler.postDelayed(this::publishState, OutgoingGate.MAX_DEFERRAL_MS);
+        return entry;
     }
 
     /**
@@ -533,9 +539,10 @@ public class ImsRegistrationController {
         publishState();
     }
 
+    /** A call that needs the current stack (an MO call waiting for registration does not). */
     private boolean isCallActive() {
         HamelinPortsMmTelFeature feature = mMmTelFeature;
-        return feature != null && feature.hasActiveCall();
+        return feature != null && feature.hasCallOnStack();
     }
 
     /**
@@ -698,6 +705,16 @@ public class ImsRegistrationController {
         long now = SystemClock.elapsedRealtime();
         int expires = mReportedExpiresSec > 0 ? mReportedExpiresSec : mRequestedExpiresSec;
         Log.i(TAG, "*** IMS REGISTERED (native) *** gen=" + gen + " expiresS=" + expires);
+        if (!OutgoingGate.isGrantedExpiresAcceptable(expires, mRequestedExpiresSec)) {
+            Log.w(TAG, "granted Expires " + expires + " s is below "
+                    + Math.min(OutgoingGate.MIN_GRANTED_EXPIRES_SEC, mRequestedExpiresSec)
+                    + " s — treating the registration as failed");
+            releaseWakeLock("Expires too short");
+            failTerminally(0, "Expires too short");
+            armNextCheck();
+            publishState();
+            return;
+        }
         mAssociatedUri = (associatedUri != null && !associatedUri.isEmpty())
                 ? associatedUri : null;
         mState.onRegistered(now, expires, refreshOverrideSec());
@@ -812,24 +829,19 @@ public class ImsRegistrationController {
                 + (SystemClock.elapsedRealtime() - mWakeLockSinceMs) + " after " + why);
     }
 
-    /** Publishes the state for other threads and releases MO requests once nothing is pending. */
+    /** Publishes the state for other threads and releases or expires held MO requests. */
     private void publishState() {
         long now = SystemClock.elapsedRealtime();
         mUsableUntilMs = mState.usableUntilMs();
         mRenewalPending = mState.isRenewalPending(now);
         mStateSummary = mState.describe(now);
-        if (!mRenewalPending && mPendingOutgoingChecks.get() == 0) {
-            drainDeferredRegisterOps();
-        }
-    }
-
-    private void drainDeferredRegisterOps() {
-        if (mDeferredOnRegister.isEmpty()) return;
-        List<Runnable> drain = new ArrayList<>(mDeferredOnRegister);
-        mDeferredOnRegister.removeAll(drain);
-        Log.i(TAG, "draining " + drain.size() + " deferred MO ops");
-        for (Runnable r : drain) {
-            try { r.run(); } catch (Throwable t) { Log.w(TAG, "deferred op threw", t); }
+        List<Runnable> due = mDeferred.takeDue(now,
+                mRenewalPending || mPendingOutgoingChecks.get() > 0);
+        if (due.isEmpty()) return;
+        Log.i(TAG, "releasing " + due.size() + " deferred MO requests (renewalPending="
+                + mRenewalPending + ")");
+        for (Runnable r : due) {
+            try { r.run(); } catch (Throwable t) { Log.w(TAG, "deferred MO request threw", t); }
         }
     }
 

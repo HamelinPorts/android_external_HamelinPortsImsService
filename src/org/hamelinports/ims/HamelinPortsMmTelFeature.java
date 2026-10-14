@@ -15,6 +15,7 @@ import android.telephony.ims.stub.ImsCallSessionImplBase;
 import android.telephony.ims.stub.ImsSmsImplBase;
 import android.util.Log;
 
+import org.hamelinports.ims.reg.OutgoingGate;
 import org.hamelinports.ims.sip.IncomingCallListener;
 
 import java.util.ArrayList;
@@ -306,14 +307,15 @@ public class HamelinPortsMmTelFeature extends MmTelFeature implements IncomingCa
         if (mt != null) mt.handleImsPdnLost();
     }
 
-    /** True iff there is an active MO or MT call session attached
-     *  to this feature. Used by ImsRegistrationController on iface-swap
-     *  detection: a mid-call WWAN↔WLAN handover takes a different code
-     *  path (preserve dialog handles, drive a re-INVITE on the new
-     *  transport) than an idle one (full SIP-stack tearDown + fresh
-     *  trial). */
-    boolean hasActiveCall() {
-        return mActiveCall != null || mActiveIncoming != null;
+    /** True iff a call needs the current SIP stack: an MT session, or an MO
+     *  session that has sent its INVITE. ImsRegistrationController keeps the
+     *  stack for such a call (iface swap, policy-driven fresh registration).
+     *  An MO session still waiting to send is excluded: it waits for that
+     *  very registration. */
+    boolean hasCallOnStack() {
+        HamelinPortsCallSession mo = mActiveCall;
+        return OutgoingGate.callHoldsStack(mo != null, mo != null && mo.hasSentInvite(),
+                mActiveIncoming != null);
     }
 
     /** Called by ImsRegistrationController after successful 200 OK. */

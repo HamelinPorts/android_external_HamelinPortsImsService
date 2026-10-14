@@ -7,6 +7,7 @@ import android.telephony.SmsMessage;
 import android.telephony.ims.stub.ImsSmsImplBase;
 import android.util.Log;
 
+import org.hamelinports.ims.reg.OutgoingGate;
 import org.hamelinports.ims.sip.HamelinPortsSipStack;
 import org.hamelinports.ims.sip.RpData;
 import org.hamelinports.ims.sip.SipClient;
@@ -93,31 +94,52 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
     @Override public void onReady() { Log.i(TAG, "SMS onReady"); }
     @Override public String getSmsFormat() { return SmsMessage.FORMAT_3GPP; }
 
+    private void failSmsRetryable(int token, int messageRef, String why) {
+        Log.w(TAG, "sendSms token=" + token + ": " + why + " — retryable failure");
+        onSendSmsResultError(token, messageRef, SEND_STATUS_ERROR_RETRY,
+                SmsManager.RESULT_ERROR_NO_SERVICE, 0);
+    }
+
     @Override
     public void sendSms(int token, int messageRef, String format,
                         String smsc, boolean isRetry, byte[] pdu) {
         Log.i(TAG, "sendSms token=" + token + " messageRef=" + messageRef
                 + " format=" + format + " pduLen=" + pdu.length);
-
         mRegController.checkRegistrationBeforeOutgoing();
-        if (!mRegController.isRegistered()) {
-            if (mRegController.isRetryInFlight()) {
-                /* A fresh registration runs or is due. Defer rather than
-                 * fail; its outcome drains us and we re-call. */
+        sendSmsWhenRegistered(token, messageRef, format, smsc, isRetry, pdu, /*mayDefer=*/ true);
+    }
+
+    /**
+     * Sends now, waits once for a pending renewal (bounded by the deferral
+     * limit), or fails. A wait that ends without a registration fails with
+     * SEND_STATUS_ERROR_RETRY: telephony retries and falls back to CS after
+     * its IMS retry limit.
+     */
+    private void sendSmsWhenRegistered(int token, int messageRef, String format,
+                                       String smsc, boolean isRetry, byte[] pdu,
+                                       boolean mayDefer) {
+        switch (OutgoingGate.decideSms(mRegController.isRegistered(),
+                mRegController.isRetryInFlight(), mayDefer)) {
+            case SEND:
+                break;
+            case DEFER:
                 Log.i(TAG, "sendSms token=" + token
-                        + ": retry in flight, deferring until REGISTER completes");
-                final int fToken = token, fMessageRef = messageRef;
-                final String fFormat = format, fSmsc = smsc;
-                final boolean fIsRetry = isRetry;
-                final byte[] fPdu = pdu;
-                mRegController.runOnNextRegister(() ->
-                        sendSms(fToken, fMessageRef, fFormat, fSmsc, fIsRetry, fPdu));
+                        + ": registration renewal pending, deferring");
+                mRegController.deferUntilRegistered(
+                        () -> sendSmsWhenRegistered(token, messageRef, format, smsc,
+                                isRetry, pdu, /*mayDefer=*/ false),
+                        () -> failSmsRetryable(token, messageRef,
+                                "registration renewal too slow"));
                 return;
-            }
-            Log.e(TAG, "sendSms: not registered");
-            onSendSmsResultError(token, messageRef, SEND_STATUS_ERROR,
-                    SmsManager.RESULT_ERROR_GENERIC_FAILURE, 0);
-            return;
+            case FAIL:
+                if (!mayDefer) {
+                    failSmsRetryable(token, messageRef, "registration renewal failed");
+                    return;
+                }
+                Log.e(TAG, "sendSms: not registered");
+                onSendSmsResultError(token, messageRef, SEND_STATUS_ERROR,
+                        SmsManager.RESULT_ERROR_GENERIC_FAILURE, 0);
+                return;
         }
 
         /* P-Access-Network-Info: the decorator adds it on non-REGISTER

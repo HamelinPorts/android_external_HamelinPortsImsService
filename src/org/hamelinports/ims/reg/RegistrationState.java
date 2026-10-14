@@ -143,8 +143,13 @@ public final class RegistrationState {
         return true;
     }
 
-    /** Terminal failure: the binding is lost; try again after the long-tail wait. */
+    /**
+     * Terminal failure: the binding is lost; try again after the long-tail
+     * wait. Starts a new generation so a late 200 OK of the failed stack,
+     * which is stopped shortly after, cannot mark it registered.
+     */
     public void scheduleLongTail(long nowMs) {
+        mGeneration++;
         mRegistered = false;
         mInFlight = Op.NONE;
         mRetryCount = 0;
