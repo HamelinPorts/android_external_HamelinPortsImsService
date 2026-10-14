@@ -106,6 +106,11 @@ public class ImsRegistrationController {
     private boolean mIdleLogged;
     /** The last attempt found the SIM not ready; SIM_STATE_LOADED registers at once. */
     private boolean mWaitingForSim;
+    /** When a subscription-driven STOP/RESTART was first seen, or -1. */
+    private long mStopPendingSinceMs = -1;
+    private SlotActivation.StopHold mStopHold = SlotActivation.StopHold.NONE;
+    /** Token for the re-evaluation of a held STOP/RESTART. */
+    private final Object mActivationRecheck = new Object();
 
     /* Published by the registration thread for callers on other threads. */
     private volatile Network mImsNetwork;
@@ -342,11 +347,37 @@ public class ImsRegistrationController {
         });
     }
 
-    /** Starts, stops or restarts the machine for the slot's current subscription. */
+    /**
+     * Starts, stops or restarts the machine for the slot's current
+     * subscription. A STOP or RESTART waits out the subscription debounce and
+     * any call that holds the stack, then this runs again.
+     */
     private void evaluateActivation(String reason) {
         int activeSubId = SipClient.activeSubscriptionId(mContext, mSlotId);
         SlotActivation.Action action =
                 SlotActivation.decide(mImsEnabled, activeSubId, mRunningSubId);
+        if (SlotActivation.stopsMachine(action)) {
+            long now = SystemClock.elapsedRealtime();
+            boolean subscriptionDriven = mImsEnabled;
+            if (subscriptionDriven && mStopPendingSinceMs < 0) mStopPendingSinceMs = now;
+            SlotActivation.StopHold hold = SlotActivation.holdStop(subscriptionDriven,
+                    mStopPendingSinceMs, now, isCallActive());
+            if (hold != SlotActivation.StopHold.NONE) {
+                if (hold != mStopHold) {
+                    Log.i(TAG, "slot=" + mSlotId + " " + action + " held: " + hold
+                            + " reason=" + reason + " subId=" + mRunningSubId + " -> " + activeSubId);
+                }
+                mStopHold = hold;
+                mHandler.removeCallbacksAndMessages(mActivationRecheck);
+                mHandler.postAtTime(() -> evaluateActivation("RECHECK"), mActivationRecheck,
+                        SystemClock.uptimeMillis()
+                                + SlotActivation.recheckDelayMs(hold, mStopPendingSinceMs, now));
+                return;
+            }
+        }
+        mStopPendingSinceMs = -1;
+        mStopHold = SlotActivation.StopHold.NONE;
+        mHandler.removeCallbacksAndMessages(mActivationRecheck);
         switch (action) {
             case START:
                 startOnRegThread(activeSubId, reason);

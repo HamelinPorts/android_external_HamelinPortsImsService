@@ -46,7 +46,63 @@ public final class SlotActivation {
         IDLE,
     }
 
+    /** Why a STOP or RESTART waits. */
+    public enum StopHold {
+        /** Act now. */
+        NONE,
+        /** The subscription loss or change may be transient (SIM refresh, modem restart). */
+        DEBOUNCE,
+        /** A call holds the stack; stopping it would drop the call. */
+        CALL,
+    }
+
+    /**
+     * How long a lost or changed subscription must persist before the machine
+     * stops or restarts. A SIM refresh or modem restart drops and restores the
+     * active subscription within a burst of subscription updates lasting a few
+     * seconds; a real removal or swap loses nothing by waiting this long (the
+     * registration of a removed SIM is dead either way, and the framework
+     * also disables IMS for it).
+     */
+    public static final long SUBSCRIPTION_DEBOUNCE_MS = 4_000;
+
     private SlotActivation() {}
+
+    public static boolean stopsMachine(Action action) {
+        return action == Action.STOP || action == Action.RESTART;
+    }
+
+    /**
+     * Whether a STOP or RESTART must wait.
+     *
+     * @param subscriptionDriven the action follows a subscription loss or change
+     *                           (IMS still enabled), not a framework disable
+     * @param pendingSinceMs     when the subscription-driven action was first seen
+     * @param callHoldsStack     a call needs the current stack (an emergency
+     *                           session from its creation)
+     */
+    public static StopHold holdStop(boolean subscriptionDriven, long pendingSinceMs,
+                                    long nowMs, boolean callHoldsStack) {
+        if (callHoldsStack) {
+            return StopHold.CALL;
+        }
+        if (subscriptionDriven && nowMs - pendingSinceMs < SUBSCRIPTION_DEBOUNCE_MS) {
+            return StopHold.DEBOUNCE;
+        }
+        return StopHold.NONE;
+    }
+
+    /** When to evaluate a held STOP or RESTART again. */
+    public static long recheckDelayMs(StopHold hold, long pendingSinceMs, long nowMs) {
+        switch (hold) {
+            case DEBOUNCE:
+                return Math.max(0, pendingSinceMs + SUBSCRIPTION_DEBOUNCE_MS - nowMs);
+            case CALL:
+                return RefreshPolicy.ACTIVE_CALL_RECHECK_MS;
+            default:
+                return 0;
+        }
+    }
 
     public static boolean isActive(int subId) {
         return subId > NO_SUBSCRIPTION;

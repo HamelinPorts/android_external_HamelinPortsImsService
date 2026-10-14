@@ -86,13 +86,34 @@ public class SlotActivationTest {
         int runningSubId = NONE;
         int activeSubId = NONE;
         CredentialStatus credentials = CredentialStatus.READY;
+        boolean callOnStack;
+        long stopPendingSinceMs = -1;
+        long recheckAtMs = -1;
         int starts;
+        int stops;
         int retries;
         int longTails;
         int attempts;
 
         void evaluate() {
-            switch (SlotActivation.decide(enabled, activeSubId, runningSubId)) {
+            evaluate(T0);
+        }
+
+        void evaluate(long now) {
+            Action action = SlotActivation.decide(enabled, activeSubId, runningSubId);
+            if (SlotActivation.stopsMachine(action)) {
+                boolean subscriptionDriven = enabled;
+                if (subscriptionDriven && stopPendingSinceMs < 0) stopPendingSinceMs = now;
+                SlotActivation.StopHold hold = SlotActivation.holdStop(subscriptionDriven,
+                        stopPendingSinceMs, now, callOnStack);
+                if (hold != SlotActivation.StopHold.NONE) {
+                    recheckAtMs = now + SlotActivation.recheckDelayMs(hold, stopPendingSinceMs, now);
+                    return;
+                }
+            }
+            stopPendingSinceMs = -1;
+            recheckAtMs = -1;
+            switch (action) {
                 case START:
                     start();
                     break;
@@ -118,6 +139,16 @@ public class SlotActivationTest {
             state.setRunning(false);
             runningSubId = NONE;
             state.invalidate();
+            stops++;
+        }
+
+        /** Runs the held re-evaluations due up to {@code untilMs}. */
+        void advanceTo(long untilMs) {
+            while (recheckAtMs >= 0 && recheckAtMs <= untilMs) {
+                long at = recheckAtMs;
+                recheckAtMs = -1;
+                evaluate(at);
+            }
         }
 
         /** The PDN came up (a SIM-less slot still receives the other slot's IMS PDN). */
@@ -231,11 +262,123 @@ public class SlotActivationTest {
         slot.pdnAvailable(T0);
         int gen = slot.state.generation();
         slot.activeSubId = SUB_B;
-        slot.evaluate();
+        slot.evaluate(T0);
+        assertEquals(1, slot.starts);           /* debounced */
+        slot.advanceTo(T0 + SlotActivation.SUBSCRIPTION_DEBOUNCE_MS);
         assertEquals(2, slot.starts);
         assertEquals(SUB_B, slot.runningSubId);
         assertFalse(slot.state.isRegistered());
         assertFalse(slot.state.isCurrent(gen));
+    }
+
+    @Test
+    public void holdStopRules() {
+        long d = SlotActivation.SUBSCRIPTION_DEBOUNCE_MS;
+        assertEquals(SlotActivation.StopHold.DEBOUNCE, SlotActivation.holdStop(true, T0, T0, false));
+        assertEquals(SlotActivation.StopHold.DEBOUNCE,
+                SlotActivation.holdStop(true, T0, T0 + d - 1, false));
+        assertEquals(SlotActivation.StopHold.NONE, SlotActivation.holdStop(true, T0, T0 + d, false));
+        assertEquals(SlotActivation.StopHold.NONE, SlotActivation.holdStop(false, T0, T0, false));
+        assertEquals(SlotActivation.StopHold.CALL, SlotActivation.holdStop(false, T0, T0, true));
+        assertEquals(SlotActivation.StopHold.CALL, SlotActivation.holdStop(true, T0, T0 + d, true));
+        assertEquals(d, SlotActivation.recheckDelayMs(SlotActivation.StopHold.DEBOUNCE, T0, T0));
+        assertEquals(1000, SlotActivation.recheckDelayMs(SlotActivation.StopHold.DEBOUNCE,
+                T0, T0 + d - 1000));
+        assertEquals(RefreshPolicy.ACTIVE_CALL_RECHECK_MS,
+                SlotActivation.recheckDelayMs(SlotActivation.StopHold.CALL, T0, T0));
+        assertTrue(d >= 3_000 && d <= 5_000);
+    }
+
+    @Test
+    public void transientLossWithinDebounceDoesNotStop() {
+        Slot slot = new Slot();
+        slot.enabled = true;
+        slot.activeSubId = SUB_A;
+        slot.evaluate(T0);
+        slot.pdnAvailable(T0);
+        int gen = slot.state.generation();
+        slot.activeSubId = NONE;                /* SIM refresh: subscription gone ... */
+        slot.evaluate(T0 + S);
+        slot.advanceTo(T0 + 3 * S);
+        assertTrue(slot.state.isRunning());
+        slot.activeSubId = SUB_A;               /* ... and back within the debounce */
+        slot.evaluate(T0 + 3 * S);
+        slot.advanceTo(T0 + 60 * S);
+        assertTrue(slot.state.isRunning());
+        assertTrue(slot.state.isRegistered());
+        assertTrue(slot.state.isCurrent(gen));
+        assertEquals(0, slot.stops);
+        assertEquals(1, slot.starts);
+        assertEquals(-1, slot.recheckAtMs);
+    }
+
+    @Test
+    public void realLossStopsAfterDebounce() {
+        Slot slot = new Slot();
+        slot.enabled = true;
+        slot.activeSubId = SUB_A;
+        slot.evaluate(T0);
+        slot.activeSubId = NONE;
+        slot.evaluate(T0 + S);
+        slot.advanceTo(T0 + S + SlotActivation.SUBSCRIPTION_DEBOUNCE_MS - 1);
+        assertTrue(slot.state.isRunning());
+        slot.evaluate(T0 + 2 * S);              /* another update does not restart the clock */
+        slot.advanceTo(T0 + S + SlotActivation.SUBSCRIPTION_DEBOUNCE_MS);
+        assertFalse(slot.state.isRunning());
+        assertEquals(1, slot.stops);
+    }
+
+    @Test
+    public void lossDuringCallIsDeferredUntilTheCallEnds() {
+        Slot slot = new Slot();
+        slot.enabled = true;
+        slot.activeSubId = SUB_A;
+        slot.evaluate(T0);
+        slot.pdnAvailable(T0);
+        slot.callOnStack = true;                /* an emergency session holds it from creation too */
+        slot.activeSubId = NONE;
+        slot.evaluate(T0 + S);
+        slot.advanceTo(T0 + 20 * 60 * S);       /* a 20-minute call */
+        assertTrue(slot.state.isRunning());
+        assertTrue(slot.state.isRegistered());
+        assertEquals(0, slot.stops);
+        slot.callOnStack = false;
+        long end = T0 + 20 * 60 * S;
+        slot.advanceTo(end + RefreshPolicy.ACTIVE_CALL_RECHECK_MS);
+        assertFalse(slot.state.isRunning());
+        assertEquals(1, slot.stops);
+    }
+
+    @Test
+    public void disableDuringCallIsDeferredButNotDebounced() {
+        Slot slot = new Slot();
+        slot.enabled = true;
+        slot.activeSubId = SUB_A;
+        slot.evaluate(T0);
+        slot.callOnStack = true;
+        slot.enabled = false;
+        slot.evaluate(T0);
+        assertTrue(slot.state.isRunning());
+        slot.callOnStack = false;
+        slot.advanceTo(T0 + RefreshPolicy.ACTIVE_CALL_RECHECK_MS);
+        assertFalse(slot.state.isRunning());
+    }
+
+    @Test
+    public void swapDuringCallRestartsAfterTheCall() {
+        Slot slot = new Slot();
+        slot.enabled = true;
+        slot.activeSubId = SUB_A;
+        slot.evaluate(T0);
+        slot.callOnStack = true;
+        slot.activeSubId = SUB_B;
+        slot.evaluate(T0);
+        slot.advanceTo(T0 + 10 * 60 * S);
+        assertEquals(SUB_A, slot.runningSubId);
+        slot.callOnStack = false;
+        slot.advanceTo(T0 + 10 * 60 * S + RefreshPolicy.ACTIVE_CALL_RECHECK_MS);
+        assertEquals(SUB_B, slot.runningSubId);
+        assertEquals(2, slot.starts);
     }
 
     @Test
