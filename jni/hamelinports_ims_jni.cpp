@@ -28,9 +28,14 @@
 
 #include <jni.h>
 #include <android/log.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 
 #include <array>
 #include <atomic>
+#include <cerrno>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -61,6 +66,7 @@
 #include "resip/stack/PlainContents.hxx"
 #include "resip/stack/OctetContents.hxx"
 #include "resip/dum/DialogUsageManager.hxx"
+#include "resip/dum/DumCommand.hxx"
 #include "resip/dum/MasterProfile.hxx"
 #include "resip/dum/UserProfile.hxx"
 #include "resip/dum/ClientAuthManager.hxx"
@@ -82,6 +88,30 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 namespace {
+
+/* Unacknowledged data on a SIP TCP connection fails the connection after
+ * this long, below Timer F (32 s). A flow whose SA the P-CSCF already
+ * dropped then dies instead of retransmitting through it on every wake. */
+constexpr unsigned int kSipTcpUserTimeoutMs = 30000;
+
+/* SipStack socket-creation hook: runs for listening, accepted and outgoing
+ * TCP sockets, so it covers connections reSIProcate opens on its own. */
+void applySipSocketOptions(resip::Socket fd, int transportType, const char*, int) {
+    if (transportType != resip::TCP) return;
+    unsigned int timeoutMs = kSipTcpUserTimeoutMs;
+    if (::setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &timeoutMs, sizeof(timeoutMs)) != 0) {
+        LOGW("TCP_USER_TIMEOUT on fd %d failed: %s", (int)fd, strerror(errno));
+    }
+}
+
+/* "sip:user@domain" -> "sip:***@domain": the user part of the IMPU is the IMSI. */
+std::string maskUserPart(const std::string& uri) {
+    const size_t at = uri.find('@');
+    const size_t colon = uri.find(':');
+    if (at == std::string::npos) return "***";
+    const size_t userStart = (colon != std::string::npos && colon < at) ? colon + 1 : 0;
+    return uri.substr(0, userStart) + "***" + uri.substr(at);
+}
 
 class Bridge;  /* forward decl — handlers/auth manager hold a Bridge* */
 
@@ -713,7 +743,7 @@ public:
      *  onRemoved/onFailure. */
     std::function<void(resip::ClientRegistrationHandle)> onHandle;
     /** Bridge sets this to report the Expires we negotiated with the
-     *  P-CSCF so Java can schedule its own refresh timer at T-60 s. */
+     *  P-CSCF; Java schedules the renewal from it. */
     std::function<void(int)> onExpiresReported;
 
     void onSuccess(resip::ClientRegistrationHandle h,
@@ -722,16 +752,13 @@ public:
         LOGI("REGISTER onSuccess: %d %s", code,
              response.header(resip::h_StatusLine).reason().c_str());
 
-        /* Capture the handle for requestRefresh. reSIProcate's DUM
-         * should auto-refresh internally but has been observed to
-         * silently skip it in the field (5 h without refresh despite
-         * Expires=3600 requested); an explicit Java-driven timer on
-         * top is belt-and-braces. */
+        /* Capture the handle for the Java-driven refresh: DUM's own
+         * refresh timer runs on CLOCK_MONOTONIC and stops in suspend. */
         if (onHandle) onHandle(h);
 
         /* Negotiated Expires — Contact[0].expires param if present,
-         * else the top-level Expires header, else our requested value.
-         * Tell Java so it can schedule a refresh a minute before. */
+         * else the top-level Expires header, else 0 (Java then uses
+         * its requested value). */
         int negotiatedExpires = 0;
         try {
             if (response.exists(resip::h_Contacts)
@@ -782,6 +809,7 @@ public:
         } catch (...) {}
         LOGE("REGISTER onFailure: %d %s retryAfter=%d",
              code, reason.c_str(), retryAfterSec);
+        logFailureCause(response);
         upcallDeregistered(code, reason, retryAfterSec);
     }
     void onRemoved(resip::ClientRegistrationHandle h,
@@ -795,18 +823,38 @@ public:
         LOGI("REGISTER onRequestRetry in %d s", retrySeconds);
         return -1;
     }
-    void onFlowTerminated(resip::ClientRegistrationHandle) override {
-        /* The P-CSCF TCP flow carrying our registration died (NAT idle
-         * GC, P-CSCF reboot, or just a long silence past the carrier's
-         * socket timeout). reSIProcate won't auto-recover — future
-         * INVITE/MESSAGE would try to send on the dead flow, fail, and
-         * stay in limbo. Signal Java with a distinctive reason so the
-         * ImsRegistrationController tears down and re-REGISTERs. */
-        LOGI("REGISTER onFlowTerminated — signalling re-register");
-        upcallDeregistered(0, "flow-terminated", 0);
+    /** A queued refresh found its registration gone: report it as a
+     *  failure so Java registers fresh instead of waiting for an outcome. */
+    void onRefreshNotSent() {
+        LOGW("refreshRegister: registration handle no longer valid");
+        upcallDeregistered(0, "refresh not sent", 0);
     }
 
 private:
+    /** Logs the Warning and Reason headers of a failed REGISTER: the
+     *  network's stated cause of the 503s on refresh. They carry no
+     *  credentials (those travel in WWW-Authenticate/Authorization). */
+    static void logFailureCause(const resip::SipMessage& response) {
+        try {
+            if (response.exists(resip::h_Warnings)) {
+                for (const auto& w : response.header(resip::h_Warnings)) {
+                    std::stringstream ws;
+                    w.encode(ws);
+                    LOGW("REGISTER failure Warning: %s", ws.str().c_str());
+                }
+            }
+            if (response.exists(resip::h_Reasons)) {
+                for (const auto& r : response.header(resip::h_Reasons)) {
+                    std::stringstream rs;
+                    r.encode(rs);
+                    LOGW("REGISTER failure Reason: %s", rs.str().c_str());
+                }
+            }
+        } catch (const std::exception& e) {
+            LOGW("REGISTER failure cause unreadable: %s", e.what());
+        }
+    }
+
     void upcallRegistered(const std::string& associatedUri) {
         if (!bridgeRegListener(mBridge) || !gOnRegisteredMethod) return;
         bool attached = false;
@@ -831,6 +879,31 @@ private:
         if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
         if (attached) gJvm->DetachCurrentThread();
     }
+};
+
+/* Runs ClientRegistration::requestRefresh on the DUM thread. A handle is
+ * only safe to dereference there; DUM is not thread-safe. */
+class RegistrationRefreshCommand : public resip::DumCommandAdapter {
+public:
+    RegistrationRefreshCommand(resip::ClientRegistrationHandle handle,
+                               HamelinPortsRegHandler* regHandler)
+        : mHandle(handle), mRegHandler(regHandler) {}
+
+    void executeCommand() override {
+        if (mHandle.isValid()) {
+            mHandle->requestRefresh();
+        } else {
+            mRegHandler->onRefreshNotSent();
+        }
+    }
+
+    EncodeStream& encodeBrief(EncodeStream& strm) const override {
+        return strm << "RegistrationRefreshCommand";
+    }
+
+private:
+    resip::ClientRegistrationHandle mHandle;
+    HamelinPortsRegHandler* mRegHandler;
 };
 
 /* --------------------------------------------------------------------- *
@@ -1608,7 +1681,9 @@ public:
                                        *mAndroidLogger);
             });
 
-            mStack = std::make_unique<resip::SipStack>();
+            mStack = std::make_unique<resip::SipStack>(
+                    nullptr, resip::DnsStub::EmptyNameserverList, nullptr,
+                    /*stateless=*/false, &applySipSocketOptions);
             mDum   = std::make_unique<resip::DialogUsageManager>(*mStack);
             mProf  = std::make_shared<resip::MasterProfile>();
             mDum->setMasterProfile(mProf);
@@ -1842,14 +1917,9 @@ public:
              * a known-accepted value. */
             mProf->setUserAgent(resip::Data("SM-A515F-WI1 Samsung IMS 6.0"));
 
-            /* TCP CRLF keepalive (TS 24.229 §5.1.1.4 / RFC 6223):
-             * a 2-byte "\r\n\r\n" ping every 30 s to keep the
-             * IPsec-protected P-CSCF TCP flow alive. Without it the
-             * P-CSCF drops the idle connection after ~5 min, we lose
-             * the ability to receive MT traffic or send subsequent
-             * MO requests, and the IMS PDN eventually tears down.
-             * 30 s is the 3GPP-recommended interval. */
-            mProf->setKeepAliveTimeForStream(30);
+            /* No CRLF keepalive: the P-CSCF opens a new connection to
+             * port-s for MT requests, so an idle flow need not be held
+             * open, and every keepalive would wake the device. */
 
             /* Advertise the SIP methods we actually handle. Default is
              * "all methods" which emits an Allow list that omits MESSAGE
@@ -1974,7 +2044,7 @@ public:
             mDum->send(reg);
 
             LOGI("startRegister submitted: impu=%s domain=%s pcscf=%s:%d",
-                 impuUri.c_str(), domain.c_str(),
+                 maskUserPart(impuUri).c_str(), domain.c_str(),
                  pcscfHost.c_str(), pcscfCleartextPort);
             return true;
         } catch (const std::exception& e) {
@@ -2423,11 +2493,9 @@ private:
     AkaCache                                   mAkaCache;
     PaniCache                                  mPaniCache;
 
-    /* Refresh state: reSIProcate owns the ClientRegistration but we
-     * keep a handle so Java can explicitly call requestRefresh on a
-     * timer, working around observed cases where DUM's internal
-     * auto-refresh didn't fire (5 h gap with zero REGo beyond the
-     * initial AKA pair). Access under mMu. */
+    /* Handle of the live ClientRegistration for the Java-driven refresh.
+     * Written on the DUM thread, read by refreshRegister; access under
+     * mMu, dereference only on the DUM thread. */
     resip::ClientRegistrationHandle            mRegHandle;
     bool                                       mRegHandleValid = false;
 
@@ -2452,16 +2520,18 @@ public:
     std::string        mLastMtPai;
     std::string        mLastMtCallId;
 
+    /** Queues an in-dialog refresh. DUM is single-threaded: the handle is
+     *  only dereferenced inside the command, on the DUM thread. */
     bool refreshRegister() {
         std::lock_guard<std::mutex> g(mMu);
         if (!mStarted || !mDum) return false;
-        if (!mRegHandleValid || !mRegHandle.isValid()) {
+        if (!mRegHandleValid) {
             LOGW("refreshRegister: no valid registration handle");
             return false;
         }
         try {
             LOGI("refreshRegister: requesting refresh via ClientRegistration");
-            mRegHandle->requestRefresh();
+            mDum->post(new RegistrationRefreshCommand(mRegHandle, &mRegHandler));
             return true;
         } catch (const std::exception& e) {
             LOGE("refreshRegister threw: %s", e.what());
