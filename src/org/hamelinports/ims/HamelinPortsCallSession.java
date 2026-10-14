@@ -118,6 +118,7 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
         mRegController = regController;
         mProfile = profile;
         mOnGone = onGone;
+        mEmergency = isEmergencyProfile(profile);
     }
 
     /** Optional callback invoked exactly once when the session reaches a
@@ -141,6 +142,8 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
             new java.util.concurrent.atomic.AtomicBoolean();
     /** Set just before the INVITE goes to the stack. */
     private volatile boolean mInviteSent;
+    /** From the creation profile (or the start profile); see {@link #isEmergency()}. */
+    private volatile boolean mEmergency;
     /** Queued start while the registration is renewed; cancelled by {@link #terminate}. */
     private volatile DeferredRequests.Entry mDeferredStart;
 
@@ -276,14 +279,15 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
     @Override
     public void start(String callee, ImsCallProfile profile) {
         Log.i(TAG, "CallSession.start callee=" + callee);
-        ImsCallProfile p = profile != null ? profile : mProfile;
-        boolean emergency = p != null
-                && p.getServiceType() == ImsCallProfile.SERVICE_TYPE_EMERGENCY;
+        if (isEmergencyProfile(profile)) mEmergency = true;
+        boolean emergency = mEmergency;
         /* No lapse check for an emergency call: a fresh registration it
-         * triggered would stop the stack under its INVITE. */
+         * triggered would stop the stack under its INVITE. It holds the stack
+         * from creation, so only the binding itself must be valid. */
         if (!emergency) mRegController.checkRegistrationBeforeOutgoing();
-        switch (OutgoingGate.decideCall(emergency, mRegController.isRegistered(),
-                mRegController.isRetryInFlight())) {
+        boolean usable = emergency ? mRegController.isBindingValid()
+                : mRegController.isRegistered();
+        switch (OutgoingGate.decideCall(emergency, usable, mRegController.isRetryInFlight())) {
             case SEND:
                 startOutgoingCallThread(callee);
                 break;
@@ -325,9 +329,18 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
         fireGoneOnce();
     }
 
-    /** True once the INVITE was handed to the stack; until then the call needs no stack. */
+    /** True once the INVITE was handed to the stack; until then a normal call needs no stack. */
     boolean hasSentInvite() {
         return mInviteSent;
+    }
+
+    /** An emergency session; it holds the stack from its creation. */
+    boolean isEmergency() {
+        return mEmergency;
+    }
+
+    private static boolean isEmergencyProfile(ImsCallProfile profile) {
+        return profile != null && profile.getServiceType() == ImsCallProfile.SERVICE_TYPE_EMERGENCY;
     }
 
     private void startOutgoingCallThread(String callee) {

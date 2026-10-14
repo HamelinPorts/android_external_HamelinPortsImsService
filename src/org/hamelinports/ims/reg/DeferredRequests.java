@@ -65,6 +65,15 @@ public final class DeferredRequests {
         return due;
     }
 
+    /** Earliest deadline of a queued request, or -1 if none is queued. */
+    public synchronized long nextDeadlineMs() {
+        long next = -1;
+        for (Entry e : mEntries) {
+            if (next < 0 || e.mDeadlineMs < next) next = e.mDeadlineMs;
+        }
+        return next;
+    }
+
     public synchronized int size() {
         return mEntries.size();
     }

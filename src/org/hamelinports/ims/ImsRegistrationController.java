@@ -53,6 +53,8 @@ public class ImsRegistrationController {
     private static final int CONNECT_TIMEOUT_MS = 10000;
     private static final String CHECK_ALARM_TAG = "HamelinPortsIms:reg-check";
     private static final String WAKELOCK_TAG = "HamelinPortsIms:reg";
+    private static final String DEFERRAL_ALARM_TAG = "HamelinPortsIms:mo-deferral";
+    private static final long DEFERRAL_ALARM_WINDOW_MS = 1000;
     /** Lets the in-flight SIP transactions drain before the stack is stopped. */
     private static final long STACK_DRAIN_MS = 2000;
     /** Watchdog: IMS APN non-CONNECTED on every transport for this long forces a teardown. */
@@ -100,6 +102,7 @@ public class ImsRegistrationController {
     private volatile String mAssociatedUri;
     private volatile HamelinPortsMmTelFeature mMmTelFeature;
     private volatile long mUsableUntilMs;
+    private volatile long mFreshDueAtMs = Long.MAX_VALUE;
     private volatile boolean mRenewalPending;
     private volatile String mStateSummary = "";
     /** MO lapse checks posted but not yet run; MO requests wait for them. */
@@ -109,6 +112,12 @@ public class ImsRegistrationController {
 
     private final AlarmManager.OnAlarmListener mCheckAlarm =
             () -> checkRegistration("ALARM");
+    /** Deadline the deferral alarm is armed for, or -1; registration thread only. */
+    private long mDeferralAlarmAtMs = -1;
+    private final AlarmManager.OnAlarmListener mDeferralAlarm = () -> {
+        mDeferralAlarmAtMs = -1;   /* fired: re-arm for whatever is still queued */
+        publishState();
+    };
 
     private final BroadcastReceiver mWakeSignalReceiver = new BroadcastReceiver() {
         @Override
@@ -186,15 +195,27 @@ public class ImsRegistrationController {
         mMmTelFeature = feature;
     }
 
-    /** True while the binding can carry an MO request: registered and not about to lapse. */
+    /**
+     * True while the binding can carry a normal MO request: registered, not
+     * about to lapse, and no fresh registration due (that would stop the
+     * stack under the request).
+     */
     public boolean isRegistered() {
-        long until = mUsableUntilMs;
-        return until > 0 && SystemClock.elapsedRealtime() < until;
+        return OutgoingGate.isUsable(SystemClock.elapsedRealtime(), mUsableUntilMs, mFreshDueAtMs);
+    }
+
+    /**
+     * True while the binding itself is valid. For an emergency call, which
+     * holds the stack from its creation, so a due fresh registration waits.
+     */
+    public boolean isBindingValid() {
+        return SystemClock.elapsedRealtime() < mUsableUntilMs;
     }
 
     /** True while a fresh registration runs or is due, so MO requests should wait for it. */
     public boolean isRetryInFlight() {
-        return mRenewalPending || mPendingOutgoingChecks.get() > 0;
+        return mRenewalPending || mPendingOutgoingChecks.get() > 0
+                || SystemClock.elapsedRealtime() >= mFreshDueAtMs;
     }
 
     /**
@@ -206,12 +227,9 @@ public class ImsRegistrationController {
     public DeferredRequests.Entry deferUntilRegistered(Runnable onReady, Runnable onExpired) {
         DeferredRequests.Entry entry =
                 mDeferred.add(onReady, onExpired, SystemClock.elapsedRealtime());
-        /* Re-evaluate on the owning thread so an outcome that landed just
-         * before the add still releases this request. */
+        /* Re-evaluate on the owning thread: an outcome that landed just before
+         * the add releases this request, else the deadline alarm is armed. */
         mHandler.post(this::publishState);
-        /* Uptime advances no faster than elapsed time, so the deadline has
-         * passed when this runs. */
-        mHandler.postDelayed(this::publishState, OutgoingGate.MAX_DEFERRAL_MS);
         return entry;
     }
 
@@ -833,15 +851,35 @@ public class ImsRegistrationController {
     private void publishState() {
         long now = SystemClock.elapsedRealtime();
         mUsableUntilMs = mState.usableUntilMs();
+        mFreshDueAtMs = mState.freshDueAtMs();
         mRenewalPending = mState.isRenewalPending(now);
         mStateSummary = mState.describe(now);
         List<Runnable> due = mDeferred.takeDue(now,
                 mRenewalPending || mPendingOutgoingChecks.get() > 0);
-        if (due.isEmpty()) return;
-        Log.i(TAG, "releasing " + due.size() + " deferred MO requests (renewalPending="
-                + mRenewalPending + ")");
-        for (Runnable r : due) {
-            try { r.run(); } catch (Throwable t) { Log.w(TAG, "deferred MO request threw", t); }
+        if (!due.isEmpty()) {
+            Log.i(TAG, "releasing " + due.size() + " deferred MO requests (renewalPending="
+                    + mRenewalPending + ")");
+            for (Runnable r : due) {
+                try { r.run(); } catch (Throwable t) { Log.w(TAG, "deferred MO request threw", t); }
+            }
+        }
+        armDeferralDeadline();
+    }
+
+    /**
+     * Wakeup alarm at the earliest MO deferral deadline, so an expired request
+     * is failed on time even if the device suspends meanwhile. Only touched
+     * when that deadline changes.
+     */
+    private void armDeferralDeadline() {
+        long next = mDeferred.nextDeadlineMs();
+        if (next == mDeferralAlarmAtMs) return;
+        mDeferralAlarmAtMs = next;
+        if (next < 0) {
+            mAlarmManager.cancel(mDeferralAlarm);
+        } else {
+            mAlarmManager.setWindow(AlarmManager.ELAPSED_REALTIME_WAKEUP, next,
+                    DEFERRAL_ALARM_WINDOW_MS, DEFERRAL_ALARM_TAG, mDeferralAlarm, mHandler);
         }
     }
 

@@ -26,15 +26,17 @@ public final class OutgoingGate {
     public static final long MAX_DEFERRAL_MS = 20_000;
 
     /**
-     * Shortest granted registration the policy accepts: 600 s, or the
-     * requested value if a test asked for less. Lapse detection must use the
-     * real expiry, so a shorter grant cannot be stretched; at 600 s the
-     * half-time rule renews every 300 s at most (12 per hour), while a
-     * shorter grant would mean a fresh AKA registration every minute.
-     * Below it the registration is treated as failed and retried after the
-     * long-tail wait; meanwhile telephony uses the CS domain.
+     * Shortest granted registration the policy can keep alive: 120 s, or the
+     * requested value if a test asked for less. A grant is used as granted
+     * (TS 24.229: half-time renewal at or below 1200 s). Below
+     * 2 * LAPSE_MARGIN + MIN_FRESH_INTERVAL the binding lapses before the
+     * fresh-attempt floor allows the next registration, so every cycle has a
+     * gap and costs a fresh AKA registration; such a grant is treated as a
+     * failed registration (long-tail retry, CS meanwhile). Lapse detection
+     * must use the real expiry, so a short grant is never stretched.
      */
-    public static final int MIN_GRANTED_EXPIRES_SEC = 600;
+    public static final int MIN_GRANTED_EXPIRES_SEC = (int)
+            ((2 * RefreshPolicy.LAPSE_MARGIN_MS + RefreshPolicy.MIN_FRESH_INTERVAL_MS) / 1000);
 
     private OutgoingGate() {}
 
@@ -67,12 +69,24 @@ public final class OutgoingGate {
 
     /**
      * Whether a call needs the current SIP stack, so a policy-driven fresh
-     * registration must wait for it. An MO session that has not sent its
-     * INVITE does not: it is itself waiting for that registration.
+     * registration must wait for it. A normal MO session that has not sent
+     * its INVITE does not: it waits for that registration itself. An
+     * emergency MO session does from its creation: it never waits, so the
+     * stack must not be stopped under its setup.
      */
     public static boolean callHoldsStack(boolean moSession, boolean moInviteSent,
-                                         boolean mtSession) {
-        return (moSession && moInviteSent) || mtSession;
+                                         boolean moEmergency, boolean mtSession) {
+        return (moSession && (moInviteSent || moEmergency)) || mtSession;
+    }
+
+    /**
+     * Whether the binding can carry a normal MO request now: not lapsed and
+     * no fresh registration due. Callers on other threads evaluate it from
+     * published times, so a retry that came due since the last publish counts
+     * at once.
+     */
+    public static boolean isUsable(long nowMs, long usableUntilMs, long freshDueAtMs) {
+        return nowMs < usableUntilMs && nowMs < freshDueAtMs;
     }
 
     /** Whether a granted Expires is long enough to schedule renewals on. */

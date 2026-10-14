@@ -307,14 +307,16 @@ public class HamelinPortsMmTelFeature extends MmTelFeature implements IncomingCa
         if (mt != null) mt.handleImsPdnLost();
     }
 
-    /** True iff a call needs the current SIP stack: an MT session, or an MO
-     *  session that has sent its INVITE. ImsRegistrationController keeps the
-     *  stack for such a call (iface swap, policy-driven fresh registration).
-     *  An MO session still waiting to send is excluded: it waits for that
-     *  very registration. */
+    /** True iff a call needs the current SIP stack: an MT session, an MO
+     *  session that has sent its INVITE, or an emergency MO session from its
+     *  creation. ImsRegistrationController keeps the stack for such a call
+     *  (iface swap, policy-driven fresh registration). A normal MO session
+     *  still waiting to send is excluded: it waits for that registration. */
     boolean hasCallOnStack() {
         HamelinPortsCallSession mo = mActiveCall;
-        return OutgoingGate.callHoldsStack(mo != null, mo != null && mo.hasSentInvite(),
+        return OutgoingGate.callHoldsStack(mo != null,
+                mo != null && mo.hasSentInvite(),
+                mo != null && mo.isEmergency(),
                 mActiveIncoming != null);
     }
 

@@ -80,9 +80,18 @@ public final class RegistrationState {
         return mRegistered ? lapseAtMs() : 0;
     }
 
+    /**
+     * Time from which a scheduled fresh registration is due, or
+     * {@code Long.MAX_VALUE}. Its alarm fires up to a window later; until then
+     * the binding still looks usable, but the stack is about to be stopped.
+     */
+    public long freshDueAtMs() {
+        return mRetryAtMs >= 0 ? mRetryAtMs : Long.MAX_VALUE;
+    }
+
     /** MO requests should wait: a fresh registration runs or is about to. */
     public boolean isRenewalPending(long nowMs) {
-        return mInFlight == Op.FRESH || isLapsed(nowMs);
+        return mInFlight == Op.FRESH || isLapsed(nowMs) || nowMs >= freshDueAtMs();
     }
 
     public void setRunning(boolean running) {
