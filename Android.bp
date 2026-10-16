@@ -25,12 +25,13 @@ android_app {
     },
 }
 
-// Host unit tests of the registration policy, slot activation and process
-// network ownership (pure Java, no device):
+// Host unit tests of the registration policy, slot activation, process
+// network ownership and the IWLAN DPD interval (pure Java, no device):
 //   atest --host HamelinPortsImsPolicyTests
 java_test_host {
     name: "HamelinPortsImsPolicyTests",
     srcs: [
+        "src/org/hamelinports/ims/config/*.java",
         "src/org/hamelinports/ims/reg/*.java",
         "src/org/hamelinports/ims/net/ProcessNetworkOwner.java",
         "tests/host/src/**/*.java",

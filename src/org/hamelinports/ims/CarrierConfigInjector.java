@@ -4,11 +4,13 @@ import android.content.Context;
 import android.net.ipsec.ike.ChildSaProposal;
 import android.net.ipsec.ike.SaProposal;
 import android.os.PersistableBundle;
+import android.os.SystemProperties;
 import android.telephony.CarrierConfigManager;
 import android.telephony.SubscriptionInfo;
 import android.telephony.SubscriptionManager;
 import android.util.Log;
 
+import org.hamelinports.ims.config.IwlanDpdInterval;
 import org.xmlpull.v1.XmlPullParser;
 import org.xmlpull.v1.XmlPullParserException;
 import org.xmlpull.v1.XmlPullParserFactory;
@@ -212,12 +214,22 @@ final class CarrierConfigInjector {
         b.putInt(CarrierConfigManager.KEY_WFC_DATA_SPN_FORMAT_IDX_INT, 1);
         b.putInt(CarrierConfigManager.KEY_WFC_FLIGHT_MODE_SPN_FORMAT_IDX_INT, 1);
 
-        /* IKE dead peer detection every 300 s instead of AOSP's 120 s.
-         * Each DPD exchange wakes the phone from suspend; a dead ePDG
-         * is then noticed after up to 5 min instead of 2. The NAT-T
-         * keepalive interval is left at its default, which keeps home
-         * router NAT mappings alive for incoming Wi-Fi calls. */
-        b.putInt(CarrierConfigManager.Iwlan.KEY_DPD_TIMER_SEC_INT, 300);
+        /* IKE dead peer detection interval (AOSP default 120 s). Each DPD
+         * exchange wakes the phone from suspend and only checks that the
+         * ePDG is alive; the NAT-T keepalive, left at its default, keeps
+         * home router NAT mappings alive for incoming Wi-Fi calls. A
+         * device whose keepalive is offloaded sets a longer interval and
+         * accepts a later detection of a silently lost ePDG. IWLAN reads
+         * the value when it builds the next tunnel. */
+        String dpdProperty = SystemProperties.get(IwlanDpdInterval.PROPERTY);
+        IwlanDpdInterval dpd = IwlanDpdInterval.fromProperty(dpdProperty);
+        if (dpd.rejected()) {
+            Log.w(TAG, IwlanDpdInterval.PROPERTY + "=" + dpdProperty + " is outside "
+                    + IwlanDpdInterval.MIN_SEC + ".." + IwlanDpdInterval.MAX_SEC
+                    + " s — using " + dpd.seconds() + " s");
+        }
+        Log.i(TAG, "IKE DPD interval " + dpd.seconds() + " s");
+        b.putInt(CarrierConfigManager.Iwlan.KEY_DPD_TIMER_SEC_INT, dpd.seconds());
 
         mKernelDefaults = b;
         return b;
