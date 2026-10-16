@@ -45,6 +45,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "sip_socket_discard.h"
+
 #include "rutil/Data.hxx"
 #include "rutil/Log.hxx"
 #include "rutil/AndroidLogger.hxx"
@@ -99,8 +101,9 @@ constexpr unsigned int kSipTcpUserTimeoutMs = 30000;
 constexpr int kMaxSipSlots = 2;
 
 /* IMS network each slot's SIP sockets are pinned to (NETWORK_UNSPECIFIED =
- * none). Java sets it before the stack starts and clears it after the stack
- * stopped; the socket hook reads it on the stack's threads. */
+ * none). Bridge::start sets it before the stack exists and Bridge::stop
+ * clears it after the stack's threads are joined; the socket hook reads it
+ * on the stack's threads. */
 std::array<std::atomic<net_handle_t>, kMaxSipSlots> gSipNetwork{};
 
 /* Set while addSipTransports creates the listening sockets, which run the
@@ -124,19 +127,34 @@ const char* sipSocketRole(resip::Socket fd) {
             ? "accepted" : "outgoing";
 }
 
-/* The process network binding is process-wide and another slot may clear or
- * move it; a socket pinned here keeps the slot's IMS network regardless. */
+/* Nothing else routes SIP traffic to the IMS network, so a socket that
+ * cannot be pinned would leave on the default network: discard it. The
+ * request on it fails and the registration policy retries. */
+void discardUnpinnedSipSocket(int slot, resip::Socket fd, const char* role) {
+    if (hamelinports::discardSocketKeepingDescriptor(fd)) {
+        LOGE("SIP socket fd=%d (%s) slot=%d discarded", (int)fd, role, slot);
+        return;
+    }
+    const int err = errno;
+    /* Best effort: a connected socket stops carrying data. */
+    ::shutdown(fd, SHUT_RDWR);
+    LOGE("SIP socket fd=%d (%s) slot=%d could not be discarded: %s",
+         (int)fd, role, slot, strerror(err));
+}
+
 void pinSipSocket(int slot, resip::Socket fd) {
     const char* role = sipSocketRole(fd);
     const net_handle_t net = gSipNetwork[slot].load(std::memory_order_acquire);
     if (net == NETWORK_UNSPECIFIED) {
-        LOGW("SIP socket fd=%d (%s) slot=%d not pinned: no IMS network set",
+        LOGE("SIP socket fd=%d (%s) slot=%d not pinned: no IMS network set",
              (int)fd, role, slot);
+        discardUnpinnedSipSocket(slot, fd, role);
         return;
     }
     if (android_setsocknetwork(net, fd) != 0) {
-        LOGW("SIP socket fd=%d (%s) slot=%d pin failed: %s",
+        LOGE("SIP socket fd=%d (%s) slot=%d pin failed: %s",
              (int)fd, role, slot, strerror(errno));
+        discardUnpinnedSipSocket(slot, fd, role);
         return;
     }
     LOGI("SIP socket fd=%d (%s) pinned slot=%d netHandle=%llu",
@@ -1723,9 +1741,19 @@ public:
         return b;
     }
 
-    bool start() {
+    /** Starts the stack with every SIP socket pinned to {@code net}. */
+    bool start(net_handle_t net) {
         std::lock_guard<std::mutex> g(mMu);
-        if (mStarted) return true;
+        if (net == NETWORK_UNSPECIFIED) {
+            LOGE("Bridge::start slot=%d refused: no IMS network", mSlotId);
+            return false;
+        }
+        if (mStarted) {
+            return gSipNetwork[mSlotId].load(std::memory_order_acquire) == net;
+        }
+        gSipNetwork[mSlotId].store(net, std::memory_order_release);
+        LOGI("SIP sockets of slot=%d pin to netHandle=%llu", mSlotId,
+             (unsigned long long)net);
 
         try {
             /* resip::Log::initialize is process-global; calling it twice
@@ -2522,6 +2550,8 @@ private:
         mProf.reset();
         mAkaCache = AkaCache{};
         mStarted = false;
+        /* The stack and its threads are gone: no socket can be created now. */
+        gSipNetwork[mSlotId].store(NETWORK_UNSPECIFIED, std::memory_order_release);
     }
 
     mutable std::mutex mMu;
@@ -2808,10 +2838,10 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeGetStackVersion(
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeStart(
-        JNIEnv* /*env*/, jclass /*clazz*/, jint slotId)
+        JNIEnv* /*env*/, jclass /*clazz*/, jint slotId, jlong networkHandle)
 {
     BRIDGE_OR(JNI_FALSE);
-    return b->start() ? JNI_TRUE : JNI_FALSE;
+    return b->start(static_cast<net_handle_t>(networkHandle)) ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -2820,17 +2850,6 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeStop(
 {
     BRIDGE_OR_VOID();
     b->stop();
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetNetworkHandle(
-        JNIEnv* /*env*/, jclass /*clazz*/, jint slotId, jlong networkHandle)
-{
-    if (slotId < 0 || slotId >= kMaxSipSlots) return;
-    const net_handle_t net = static_cast<net_handle_t>(networkHandle);
-    gSipNetwork[slotId].store(net, std::memory_order_release);
-    LOGI("SIP sockets of slot=%d pin to netHandle=%llu", (int)slotId,
-         (unsigned long long)net);
 }
 
 extern "C" JNIEXPORT jstring JNICALL

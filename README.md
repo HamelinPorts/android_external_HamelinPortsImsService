@@ -82,12 +82,15 @@ A handful of system properties tune behaviour:
 dumpsys activity service org.hamelinports.ims/.HamelinPortsImsService
 ```
 
-Per-slot snapshot: registration state (age, remaining, in-flight
-transaction, pending retry), P-CSCF list, refresh and fresh-attempt
-counters, next check alarm.
+The process network binding (`processBoundNetwork=none`: SIP sockets are
+pinned one by one) and a per-slot snapshot: registration state (age,
+remaining, in-flight transaction, pending retry), P-CSCF list, refresh and
+fresh-attempt counters, next check alarm.
 
-Host unit tests of the renewal policy: `atest --host HamelinPortsImsPolicyTests`.
-Key-logging gate: `tests/check-no-key-logging.sh`.
+Host unit tests of the renewal policy: `atest --host HamelinPortsImsPolicyTests`;
+of the unpinned-socket discard: `atest --host HamelinPortsImsSocketDiscardTest`.
+Key-logging gate: `tests/check-no-key-logging.sh`. Process-binding gate:
+`tests/check-process-binding.sh`.
 
 ## Architecture & porting
 

@@ -1,32 +1,27 @@
 #!/bin/bash
-# Fails if code under src/ binds or clears the process network binding outside
-# the owner-aware helper: a slot clearing it would unbind the network another
-# slot bound. Only net/ConnectivityProcessBinding.java may call
-# bindProcessToNetwork (reached through ProcessNetworkOwner).
+# Fails if the app's code (src/ and jni/) can bind the whole process to a
+# network. Every SIP socket is pinned on its own; a process binding would send
+# every other socket of both slots over one slot's network.
+# Any mention of a process-binding API counts: a call with any spacing, a
+# method reference, a string or a comment.
 #   usage: check-process-binding.sh [tree-root]   (default: this repository)
 set -euo pipefail
 
 root="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$root"
 
-helper='src/org/hamelinports/ims/net/ConnectivityProcessBinding.java'
+for dir in src jni; do
+    [ -d "$dir" ] || { echo "FAIL: no $dir/ under $root — gate cannot see the code" >&2; exit 2; }
+done
+n_files="$(find src jni -type f \( -name '*.java' -o -name '*.cpp' -o -name '*.h' \) | wc -l)"
+[ "$n_files" -gt 0 ] || { echo "FAIL: no sources under $root — gate cannot see the code" >&2; exit 2; }
 
-[ -d src ] || { echo "FAIL: no src/ under $root — gate cannot see the code" >&2; exit 2; }
+process_binding_apis='bindProcessToNetwork|setProcessDefaultNetwork|android_setprocnetwork|android_setprocdns|setNetworkForProcess'
+hits="$(/bin/grep -rnwE "$process_binding_apis" src jni || true)"
 
-# Any mention of the name counts (call with any spacing, method reference,
-# string): only the helper may touch the binding.
-call_hits="$(/bin/grep -rnwE 'bindProcessToNetwork|setProcessDefaultNetwork' src \
-    | /bin/grep -v "^$helper:" || true)"
-in_helper="$(/bin/grep -cE '\bbindProcessToNetwork[[:space:]]*[(][[:space:]]*null[[:space:]]*[)]' \
-    "$helper" 2>/dev/null || true)"
-
-if [ -n "$call_hits" ]; then
-    echo "FAIL: process network binding touched outside $helper"
-    [ -z "$call_hits" ] || printf '%s\n' "$call_hits"
+if [ -n "$hits" ]; then
+    echo "FAIL: process network binding in the app"
+    printf '%s\n' "$hits"
     exit 1
 fi
-if [ "${in_helper:-0}" != 1 ]; then
-    echo "FAIL: expected exactly one clear in $helper, found ${in_helper:-0}"
-    exit 1
-fi
-echo "PASS: bindProcessToNetwork only in $helper (one clear there)"
+echo "PASS: no process network binding in $n_files files under src/ and jni/"

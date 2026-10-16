@@ -15,7 +15,7 @@ import android.util.Log;
  * level.
  *
  * <p>Drives the full IMS REGISTER cycle through reSIProcate's DUM:
- *   1. {@link #start()} — native SipStack + DialogUsageManager up
+ *   1. {@link #start(long)} — native SipStack + DialogUsageManager up
  *   2. {@link #addSipTransports} — TCP transports bound to UE port-c
  *      and port-s (kernel xfrm SAs are NOT installed yet — they get
  *      installed by the AkaProvider during step 4)
@@ -50,7 +50,7 @@ public final class HamelinPortsSipStack {
     }
 
     private static native String  nativeGetStackVersion();
-    private static native boolean nativeStart(int slotId);
+    private static native boolean nativeStart(int slotId, long networkHandle);
     private static native void    nativeStop(int slotId);
     private static native String  nativeGetStatus(int slotId);
     private static native boolean nativeAddSipTransports(int slotId, String localIp, int portC, int portS);
@@ -66,7 +66,6 @@ public final class HamelinPortsSipStack {
             String pcscfHost, int pcscfCleartextPort,
             String securityClient);
     private static native boolean nativeRefreshRegister(int slotId);
-    private static native void    nativeSetNetworkHandle(int slotId, long networkHandle);
     private static native void    nativeSetCellIdForPani(int slotId, String value);
     private static native void    nativeSetIwlanNodeIdForPani(int slotId, String value);
     private static native boolean nativeStartCall(int slotId, String targetUri, String sdpOffer);
@@ -95,31 +94,19 @@ public final class HamelinPortsSipStack {
         }
     }
 
-    /** Bring the native stack up (no transport yet). Idempotent. */
-    public boolean start() {
+    /**
+     * Brings the native stack up (no transport yet). Every SIP socket it
+     * creates (listening, accepted and outgoing) is pinned to the network
+     * of {@code networkHandle}, from {@link android.net.Network#getNetworkHandle()};
+     * a socket that cannot be pinned is discarded. Fails without a network.
+     * Idempotent for the same network; {@link #stop()} releases it.
+     */
+    public boolean start(long networkHandle) {
         if (!sNativeAvailable) return false;
         try {
-            return nativeStart(mSlotId);
+            return nativeStart(mSlotId, networkHandle);
         } catch (UnsatisfiedLinkError e) {
             return false;
-        }
-    }
-
-    /** {@link #setNetworkHandle} value for "no network": sockets are not pinned. */
-    public static final long NO_NETWORK = 0L;
-
-    /**
-     * Network every SIP socket of this slot is pinned to when reSIProcate
-     * creates it (listening, accepted and outgoing), from
-     * {@link android.net.Network#getNetworkHandle()}. Set it before
-     * {@link #start()}; clear it with {@link #NO_NETWORK} after {@link #stop()}.
-     */
-    public void setNetworkHandle(long networkHandle) {
-        if (!sNativeAvailable) return;
-        try {
-            nativeSetNetworkHandle(mSlotId, networkHandle);
-        } catch (UnsatisfiedLinkError e) {
-            // ignore
         }
     }
 
@@ -150,7 +137,7 @@ public final class HamelinPortsSipStack {
      * cover both directions for both ports; reSIProcate's TcpTransport
      * speaks plain TCP and the kernel transparently wraps it in ESP.
      *
-     * Caller must have invoked {@link #start()} first. Idempotent
+     * Caller must have invoked {@link #start(long)} first. Idempotent
      * is NOT guaranteed — calling twice will create duplicate
      * transports; tear down with {@link #stop()} between attempts.
      *
@@ -171,7 +158,7 @@ public final class HamelinPortsSipStack {
      * upcalls into when an IMS challenge arrives. Pass {@code null}
      * to clear.
      *
-     * Must be called before {@link #start()} returns 200 OK on a
+     * Must be called before {@link #start(long)} returns 200 OK on a
      * REGISTER, otherwise the first auth challenge will fail.
      */
     public void setAkaProvider(AkaProvider provider) {
@@ -335,7 +322,7 @@ public final class HamelinPortsSipStack {
      * Kick off an IMS REGISTER cycle via reSIProcate's DialogUsageManager.
      *
      * Caller MUST have:
-     *   - invoked {@link #start()}
+     *   - invoked {@link #start(long)}
      *   - invoked {@link #addSipTransports} for both UE port-c and port-s
      *     (kernel xfrm SAs are NOT installed yet — that happens
      *     mid-cycle via the AkaProvider)

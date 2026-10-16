@@ -22,7 +22,7 @@ import android.util.Log;
 
 import org.hamelinports.ims.modem.IImsModemBridge;
 import org.hamelinports.ims.modem.ImsModemBridgeFactory;
-import org.hamelinports.ims.net.ProcessNetworkOwner;
+import org.hamelinports.ims.reg.AttemptReadiness;
 import org.hamelinports.ims.reg.DeferredRequests;
 import org.hamelinports.ims.reg.OutgoingGate;
 import org.hamelinports.ims.reg.RefreshPolicy;
@@ -72,8 +72,6 @@ public class ImsRegistrationController {
     private final ImsRegistrationImplBase mRegImpl = new ImsRegistrationImplBase();
     private final HamelinPortsSipStack mStack;
     private final ConnectivityManager mCm;
-    /** Shared by all slots: only the slot that bound the process may clear the binding. */
-    private final ProcessNetworkOwner<Network> mProcessNetwork;
     private final AlarmManager mAlarmManager;
     private final PowerManager mPowerManager;
     private final PowerManager.WakeLock mWakeLock;
@@ -209,11 +207,9 @@ public class ImsRegistrationController {
         }
     }
 
-    ImsRegistrationController(Context context, int slotId,
-                              ProcessNetworkOwner<Network> processNetwork) {
+    ImsRegistrationController(Context context, int slotId) {
         mContext = context;
         mSlotId = slotId;
-        mProcessNetwork = processNetwork;
         mCm = context.getSystemService(ConnectivityManager.class);
         mAlarmManager = context.getSystemService(AlarmManager.class);
         mPowerManager = context.getSystemService(PowerManager.class);
@@ -800,7 +796,6 @@ public class ImsRegistrationController {
     /** Stops the native stack, then releases the SAs and xfrm policies of the last AKA. */
     private void stopStackAndReleaseSa() {
         mStack.stop();
-        mStack.setNetworkHandle(HamelinPortsSipStack.NO_NETWORK);
         if (mAkaProvider != null) {
             try { mAkaProvider.close(); } catch (Exception e) {}
             mAkaProvider = null;
@@ -816,15 +811,7 @@ public class ImsRegistrationController {
         mAssociatedUri = null;
         reportDeregistered(ImsReasonInfo.CODE_LOCAL_SERVICE_UNAVAILABLE, 0, false);
         stopStackAndReleaseSa();
-        releaseProcessNetwork();
         releaseWakeLock("teardown");
-    }
-
-    /** Clears the process binding, but only if this slot made it and it still stands. */
-    private void releaseProcessNetwork() {
-        if (mProcessNetwork.release(mSlotId)) {
-            Log.i(TAG, "slot=" + mSlotId + " cleared the process network binding");
-        }
     }
 
     private void reportDeregistered(int reasonCode, int sipCode, boolean notifyModem) {
@@ -854,7 +841,6 @@ public class ImsRegistrationController {
             if (!mState.isCurrent(gen) || isCallActive()) return;
             Log.i(TAG, "trial tear-down: " + why);
             stopStackAndReleaseSa();
-            releaseProcessNetwork();
         }, mDelayedRegWork, STACK_DRAIN_MS);
         Log.i(TAG, "long-tail recovery armed at +"
                 + (RefreshPolicy.LONG_TAIL_RETRY_MS / 1000) + " s");
@@ -1059,8 +1045,14 @@ public class ImsRegistrationController {
     private boolean attemptRegistration(int gen, SipClient.Credentials creds) {
         Network net = mImsNetwork;
         List<InetAddress> pcscfs = mPcscfs;
-        if (net == null || pcscfs == null || pcscfs.isEmpty()) return false;
-        if (creds == null) { Log.e(TAG, "SIM not ready"); return false; }
+        long networkHandle = net == null
+                ? AttemptReadiness.NO_NETWORK_HANDLE : net.getNetworkHandle();
+        AttemptReadiness.Blocker blocker = AttemptReadiness.blocker(networkHandle,
+                pcscfs == null ? 0 : pcscfs.size(), creds != null);
+        if (blocker != AttemptReadiness.Blocker.NONE) {
+            Log.w(TAG, "registration attempt gen=" + gen + " not sent: " + blocker);
+            return false;
+        }
 
         int pcscfIdx = Math.min(mPcscfAttempt, pcscfs.size() - 1);
         InetAddress pcscf = pcscfs.get(pcscfIdx);
@@ -1097,16 +1089,10 @@ public class ImsRegistrationController {
         String impi = creds.imsi + "@" + creds.domain;
         String impu = "sip:" + impi;
 
-        /* reSIProcate creates its sockets internally; its socket hook pins
-         * each one to this network. The process binding stays as a fallback
-         * until the device shows every SIP socket pinned. */
-        if (!mProcessNetwork.bind(mSlotId, net)) {
-            Log.w(TAG, "slot=" + mSlotId + " process network binding refused");
-        }
-        mStack.setNetworkHandle(net.getNetworkHandle());
-
-        /* Order: stack -> transports -> AKA provider and listener -> REGISTER. */
-        if (!mStack.start()) {
+        /* Order: stack -> transports -> AKA provider and listener -> REGISTER.
+         * reSIProcate creates its sockets internally; its socket hook pins
+         * each one to this network. */
+        if (!mStack.start(networkHandle)) {
             Log.e(TAG, "HamelinPortsSipStack.start failed");
             return false;
         }
@@ -1141,8 +1127,7 @@ public class ImsRegistrationController {
         long nowWall = System.currentTimeMillis();
         long nowElapsed = SystemClock.elapsedRealtime();
         pw.println("  slot=" + mSlotId + " usable=" + isRegistered()
-                + " renewalPending=" + isRetryInFlight()
-                + " processNetworkOwner=" + mProcessNetwork.ownerSlot());
+                + " renewalPending=" + isRetryInFlight());
         pw.println("  state: " + mStateSummary);
         pw.println("  pcscfs=" + mPcscfs);
         pw.println("  lastRegistered: " + fmtAgo(nowWall, mDiag.mRegisteredAtMs)

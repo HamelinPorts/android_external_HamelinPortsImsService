@@ -88,17 +88,16 @@ bridge implementation.
   framework enables IMS on the slot and the slot has an active
   subscription; a slot without a SIM stays idle (no retry, no alarm).
 - `reg/` — `RefreshPolicy` (renewal window, lapse rule, retry floor and
-  budget), `RegistrationState` and `SlotActivation` (start/stop/restart per
-  subscription, credential status → retry or idle); pure Java, host-tested.
+  budget), `RegistrationState`, `SlotActivation` (start/stop/restart per
+  subscription, credential status → retry or idle) and `AttemptReadiness`
+  (no IMS network handle, P-CSCF or credentials → the attempt is not sent
+  and goes through the retry budget); pure Java, host-tested.
 - `HamelinPortsCallSession.java` / `HamelinPortsIncomingCallSession.java` —
   MO and MT IMS call profiles + SDP negotiation.
 - `HamelinPortsSmsImpl.java` — SIP MESSAGE-based MO and MT SMS.
 - `sip/` — SIP/SDP helpers, native handle lifetimes,
   `HamelinPortsSipStack` (the JNI front door).
-- `net/` — IPsec SA setup helpers, ESP routing fix, `ProcessNetworkOwner`
-  (only the slot that bound the process network may clear it; the only
-  `bindProcessToNetwork` caller is `ConnectivityProcessBinding`, gated by
-  `tests/check-process-binding.sh`).
+- `net/` — IPsec SA setup helpers, ESP routing fix.
 - `modem/` — bridge factory + AIDL-side proxies (see below).
 
 ### `jni/hamelinports_ims_jni.cpp`
@@ -110,10 +109,15 @@ re-INVITE, MESSAGE, refresh.
 
 Every SIP TCP socket reSIProcate creates (listening, accepted, outgoing)
 passes a per-slot socket hook: `TCP_USER_TIMEOUT` plus
-`android_setsocknetwork` to the slot's IMS network, whose handle Java sets
-before the stack starts and clears after it stops. A connection opened
-later (e.g. for a registration refresh) therefore stays on the IMS network
-whatever the process binding is.
+`android_setsocknetwork` to the slot's IMS network. The network handle is a
+parameter of the stack start, which refuses to start without one, and is
+cleared when the stack stops. A connection opened later (e.g. for a
+registration refresh) therefore stays on the IMS network. The process is
+never bound to a network: a socket the hook cannot pin is discarded (its
+descriptor is swapped for a dead socket, `jni/sip_socket_discard.h`), so the
+request on it fails and the registration policy retries.
+`tests/check-process-binding.sh` fails on any process-binding API in `src/`
+or `jni/`.
 
 Includes carrier-quirk fixes accumulated during bring-up (in-dialog
 TCP routing, SDP offer/answer matching, 5xx Retry-After parsing).
@@ -324,7 +328,8 @@ system_app.te`.
 ## Diagnostics
 
 `dumpsys activity service org.hamelinports.ims/.HamelinPortsImsService` is the
-authoritative source for current state. Per-slot it prints:
+authoritative source for current state. It prints the process network
+binding (`processBoundNetwork=none` expected) and, per slot:
 
 - usable + renewal-pending, and the state line (generation, age,
   remaining, in-flight transaction, pending retry, retry budget)

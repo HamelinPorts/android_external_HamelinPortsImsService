@@ -14,9 +14,6 @@ import android.telephony.ims.stub.ImsRegistrationImplBase;
 import android.util.Log;
 import android.util.SparseArray;
 
-import org.hamelinports.ims.net.ConnectivityProcessBinding;
-import org.hamelinports.ims.net.ProcessNetworkOwner;
-
 public class HamelinPortsImsService extends ImsService {
     static final String TAG = "HamelinPortsIms";
 
@@ -33,15 +30,10 @@ public class HamelinPortsImsService extends ImsService {
     @SuppressWarnings("unused")
     private CarrierConfigInjector mCarrierConfigInjector;
 
-    /** The process network binding is process-wide, so one owner serves all slots. */
-    private ProcessNetworkOwner<Network> mProcessNetwork;
-
     @Override
     public void onCreate() {
         super.onCreate();
         Log.i(TAG, "HamelinPortsImsService created");
-        mProcessNetwork = new ProcessNetworkOwner<>(
-                new ConnectivityProcessBinding(getSystemService(ConnectivityManager.class)));
         mCarrierConfigInjector = CarrierConfigInjector.start(this);
     }
 
@@ -61,7 +53,7 @@ public class HamelinPortsImsService extends ImsService {
     private ImsRegistrationController getOrCreateController(int slotId) {
         ImsRegistrationController c = mRegControllers.get(slotId);
         if (c == null) {
-            c = new ImsRegistrationController(this, slotId, mProcessNetwork);
+            c = new ImsRegistrationController(this, slotId);
             mRegControllers.put(slotId, c);
         }
         return c;
@@ -124,6 +116,10 @@ public class HamelinPortsImsService extends ImsService {
         }
         pw.println("HamelinPortsImsService");
         pw.println("  wallclock_ms=" + System.currentTimeMillis());
+        /* SIP sockets are pinned one by one; the process itself stays unbound. */
+        ConnectivityManager cm = getSystemService(ConnectivityManager.class);
+        Network bound = cm == null ? null : cm.getBoundNetworkForProcess();
+        pw.println("  processBoundNetwork=" + (bound == null ? "none" : bound));
         for (int i = 0; i < mRegControllers.size(); i++) {
             int slotId = mRegControllers.keyAt(i);
             ImsRegistrationController c = mRegControllers.valueAt(i);
