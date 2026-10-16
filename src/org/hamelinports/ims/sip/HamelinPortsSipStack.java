@@ -65,7 +65,7 @@ public final class HamelinPortsSipStack {
             int expirySec, String instanceId,
             String pcscfHost, int pcscfCleartextPort,
             String securityClient);
-    private static native boolean nativeRefreshRegister(int slotId);
+    private static native boolean nativeRefreshRegister(int slotId, String securityClient);
     private static native void    nativeSetCellIdForPani(int slotId, String value);
     private static native void    nativeSetIwlanNodeIdForPani(int slotId, String value);
     private static native boolean nativeStartCall(int slotId, String targetUri, String sdpOffer);
@@ -363,11 +363,14 @@ public final class HamelinPortsSipStack {
      *  DUM's own refresh timer runs on CLOCK_MONOTONIC, which stops in
      *  suspend, so the Java side drives the refresh from an alarm.
      *
+     *  @param securityClient the Security-Client the refresh and later
+     *          REGISTERs of this registration offer, or null for the offer
+     *          given to {@link #startRegister}
      *  @return true if the refresh was queued, false without a live
      *          registration handle. */
-    public boolean refreshRegister() {
+    public boolean refreshRegister(String securityClient) {
         if (!sNativeAvailable) return false;
-        try { return nativeRefreshRegister(mSlotId); }
+        try { return nativeRefreshRegister(mSlotId, securityClient); }
         catch (UnsatisfiedLinkError e) { return false; }
     }
 

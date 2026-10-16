@@ -7,8 +7,6 @@ import android.util.Log;
 
 import org.hamelinports.ims.reg.SlotActivation;
 
-import java.util.Random;
-
 /**
  * Minimal SIP REGISTER client. Phase 1: plain TCP to the P-CSCF, single
  * outbound REGISTER with AKAv1-MD5 + sec-agree placeholders (no nonce, no
@@ -20,17 +18,6 @@ import java.util.Random;
  */
 public final class SipClient {
     private static final String TAG = "HamelinPortsIms";
-
-    public static class UeSecurityParams {
-        public int spiC, spiS, portC, portS;
-        public UeSecurityParams() {
-            Random r = new Random();
-            spiC = 10000 + r.nextInt(50000);
-            spiS = spiC + 1;
-            portC = 7100 + r.nextInt(900) * 2 + 1;
-            portS = portC - 1;
-        }
-    }
 
     // Build an o2 DE / Telefonica_DE style REGISTER.
     // Domain is mnc/mcc-derived per 3GPP TS 23.003 §13.

@@ -264,6 +264,32 @@ struct PaniCache {
     resip::Data iWlanNodeId;
 };
 
+/* Security-Client value the decorator stamps on REGISTER. The profile's
+ * decorator and its per-message clones share it, so a refresh can offer new
+ * parameters (TS 33.203 §7.4) without rebuilding the profile; the decorator
+ * reads it on the stack thread, a refresh request sets it on another. */
+class RegisterSecurityClient {
+public:
+    explicit RegisterSecurityClient(const resip::Data& registrationOffer)
+        : mRegistrationOffer(registrationOffer), mCurrent(registrationOffer) {}
+
+    resip::Data current() const {
+        std::lock_guard<std::mutex> g(mMu);
+        return mCurrent;
+    }
+
+    /** The offer of the next REGISTERs; empty restores the registration's offer. */
+    void offer(const resip::Data& value) {
+        std::lock_guard<std::mutex> g(mMu);
+        mCurrent = value.empty() ? mRegistrationOffer : value;
+    }
+
+private:
+    mutable std::mutex mMu;
+    const resip::Data  mRegistrationOffer;
+    resip::Data        mCurrent;
+};
+
 /* Wrap an IPv6 literal in brackets for use inside a SIP URI. reSIProcate's
  * URI parser splits on the first ':' to find the port, so a bare
  * "2a02:3018:0:25fc::3" becomes host="2a02" + garbage. RFC 3986 §3.2.2
@@ -299,9 +325,10 @@ JNIEnv* attachJni(bool* outAttached) {
  *   Supported:     sec-agree, gruu, path
  *   Security-Client: ipsec-3gpp; <UE's SPIs/ports/algorithms>
  *
- * The Security-Client value is configured at startRegister() time;
- * Java owns the SPI/port choices (it allocated them) so the value is
- * pre-formatted on the Java side and we just splat it in.
+ * The Security-Client value is configured at startRegister() time and a
+ * refresh may replace it; Java owns the SPI/port choices (it allocated
+ * them) so the value is pre-formatted on the Java side and we just splat
+ * it in.
  *
  * Security-Verify is added by HamelinPortsImsAuthManager on REGISTER 2 (it
  * mutates origRequest directly); on subsequent IPsec-protected requests
@@ -319,7 +346,8 @@ JNIEnv* attachJni(bool* outAttached) {
 class ImsDecorator : public resip::MessageDecorator {
 public:
     ImsDecorator(Bridge* bridge,
-                 resip::Data securityClient, AkaCache& akaCache, PaniCache& paniCache,
+                 std::shared_ptr<RegisterSecurityClient> securityClient,
+                 AkaCache& akaCache, PaniCache& paniCache,
                  unsigned int portCTransportKey, int portS)
         : mBridge(bridge),
           mSecurityClient(std::move(securityClient)),
@@ -431,13 +459,15 @@ public:
             if (!contact.exists(pSrvccPre))   contact.param(pSrvccPre) = "";
         }
 
-        if (isRequest && msg.method() == resip::REGISTER &&
-            !mSecurityClient.empty()) {
+        const resip::Data securityClient =
+                (isRequest && msg.method() == resip::REGISTER && mSecurityClient)
+                ? mSecurityClient->current() : resip::Data::Empty;
+        if (!securityClient.empty()) {
             /* Security-Client is a comma-separated list of mechanisms.
              * Each mechanism is one Token. Push each separately so the
              * wire format is "mech1, mech2" rather than a single
              * malformed value. */
-            std::string s(mSecurityClient.data(), mSecurityClient.size());
+            std::string s(securityClient.data(), securityClient.size());
             size_t start = 0;
             while (start < s.size()) {
                 size_t comma = s.find(',', start);
@@ -546,7 +576,7 @@ public:
 
 private:
     Bridge*      mBridge = nullptr;
-    resip::Data  mSecurityClient;
+    std::shared_ptr<RegisterSecurityClient> mSecurityClient;
     AkaCache&    mAkaCache;
     PaniCache&   mPaniCache;
     unsigned int mPortCTransportKey = 0;
@@ -2091,9 +2121,11 @@ public:
             /* Decorator + auth manager — both share the same AkaCache so
              * the auth manager's stored Security-Verify is visible to the
              * decorator on later non-REGISTER requests. */
+            mRegisterSecurityClient =
+                    std::make_shared<RegisterSecurityClient>(resip::Data(securityClient));
             mImsDecorator = std::make_shared<ImsDecorator>(
                     this,
-                    resip::Data(securityClient), mAkaCache, mPaniCache,
+                    mRegisterSecurityClient, mAkaCache, mPaniCache,
                     mPortCTransportKey, mUePortS);
             mProf->setOutboundDecorator(mImsDecorator);
 
@@ -2545,6 +2577,7 @@ private:
         mRegHandleValid = false;
         mTransports.clear();
         mImsDecorator.reset();
+        mRegisterSecurityClient.reset();
         mDum.reset();
         mStack.reset();
         mProf.reset();
@@ -2576,6 +2609,7 @@ private:
     std::string                                mPublicIdentity;
     bool                                       mSubscribeFired = false;
     std::shared_ptr<ImsDecorator>              mImsDecorator;
+    std::shared_ptr<RegisterSecurityClient>    mRegisterSecurityClient;
     HamelinPortsRegHandler                          mRegHandler;
     HamelinPortsInviteHandler                       mInviteHandler;
     HamelinPortsSmsHandler                          mSmsHandler;
@@ -2611,8 +2645,10 @@ public:
     std::string        mLastMtCallId;
 
     /** Queues an in-dialog refresh. DUM is single-threaded: the handle is
-     *  only dereferenced inside the command, on the DUM thread. */
-    bool refreshRegister() {
+     *  only dereferenced inside the command, on the DUM thread. A non-empty
+     *  {@code securityClient} is offered by this and later REGISTERs; empty
+     *  restores the registration's offer. */
+    bool refreshRegister(const std::string& securityClient) {
         std::lock_guard<std::mutex> g(mMu);
         if (!mStarted || !mDum) return false;
         if (!mRegHandleValid) {
@@ -2620,7 +2656,11 @@ public:
             return false;
         }
         try {
-            LOGI("refreshRegister: requesting refresh via ClientRegistration");
+            if (mRegisterSecurityClient) {
+                mRegisterSecurityClient->offer(resip::Data(securityClient));
+            }
+            LOGI("refreshRegister: requesting refresh via ClientRegistration (%s Security-Client)",
+                 securityClient.empty() ? "registration's" : "new");
             mDum->post(new RegistrationRefreshCommand(mRegHandle, &mRegHandler));
             return true;
         } catch (const std::exception& e) {
@@ -3058,10 +3098,11 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetRegistrationListener
 
 extern "C" JNIEXPORT jboolean JNICALL
 Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeRefreshRegister(
-        JNIEnv* /*env*/, jclass /*clazz*/, jint slotId)
+        JNIEnv* env, jclass /*clazz*/, jint slotId, jstring jSecurityClient)
 {
     BRIDGE_OR(JNI_FALSE);
-    try { return b->refreshRegister() ? JNI_TRUE : JNI_FALSE; }
+    const std::string securityClient = jstrUtf(env, jSecurityClient);
+    try { return b->refreshRegister(securityClient) ? JNI_TRUE : JNI_FALSE; }
     catch (...) { return JNI_FALSE; }
 }
 

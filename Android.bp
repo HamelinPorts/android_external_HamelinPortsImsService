@@ -25,14 +25,15 @@ android_app {
     },
 }
 
-// Host unit tests of the registration policy, slot activation and the
-// IWLAN DPD interval (pure Java, no device):
+// Host unit tests of the registration policy, slot activation, the IWLAN
+// DPD interval and the Security-Client offer (pure Java, no device):
 //   atest --host HamelinPortsImsPolicyTests
 java_test_host {
     name: "HamelinPortsImsPolicyTests",
     srcs: [
         "src/org/hamelinports/ims/config/*.java",
         "src/org/hamelinports/ims/reg/*.java",
+        "src/org/hamelinports/ims/sip/SecurityClientOffer.java",
         "tests/host/src/**/*.java",
     ],
     static_libs: ["junit"],

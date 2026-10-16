@@ -96,7 +96,8 @@ bridge implementation.
   MO and MT IMS call profiles + SDP negotiation.
 - `HamelinPortsSmsImpl.java` — SIP MESSAGE-based MO and MT SMS.
 - `sip/` — SIP/SDP helpers, native handle lifetimes,
-  `HamelinPortsSipStack` (the JNI front door).
+  `HamelinPortsSipStack` (the JNI front door), `SecurityClientOffer` (the
+  UE's SPIs and ports in Security-Client; pure Java, host-tested).
 - `net/` — IPsec SA setup helpers, ESP routing fix.
 - `modem/` — bridge factory + AIDL-side proxies (see below).
 
@@ -337,6 +338,8 @@ binding (`processBoundNetwork=none` expected) and, per slot:
 - last-registered / last-deregistered timestamps + counts
 - refresh counters (sent / not sent) and fresh attempts
 - next check alarm
+- the `refresh_new_sa` experiment switch and the network's last answer to
+  a refresh that offered a new Security-Client
 
 ## Known limitations
 

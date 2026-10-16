@@ -33,7 +33,7 @@ public final class HamelinPortsAkaProviderImpl
 
     private final Context  mContext;
     private final int      mSlotId;
-    private final SipClient.UeSecurityParams mUeSec;
+    private final SecurityClientOffer mUeSec;
     private final InetAddress mPcscf;
     private final InetAddress mLocalAddr;
     private final String   mLocalIp;
@@ -44,7 +44,7 @@ public final class HamelinPortsAkaProviderImpl
 
     public HamelinPortsAkaProviderImpl(Context ctx,
                                   int slotId,
-                                  SipClient.UeSecurityParams ueSec,
+                                  SecurityClientOffer ueSec,
                                   InetAddress pcscf,
                                   InetAddress localAddr,
                                   String localIp) {

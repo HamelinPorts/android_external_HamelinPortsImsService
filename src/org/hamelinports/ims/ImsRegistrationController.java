@@ -32,12 +32,14 @@ import org.hamelinports.ims.reg.SlotActivation;
 import org.hamelinports.ims.sip.HamelinPortsAkaProviderImpl;
 import org.hamelinports.ims.sip.HamelinPortsSipStack;
 import org.hamelinports.ims.sip.RegistrationListener;
+import org.hamelinports.ims.sip.SecurityClientOffer;
 import org.hamelinports.ims.sip.SipClient;
 
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.List;
+import java.util.Random;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -66,6 +68,9 @@ public class ImsRegistrationController {
     private static final long IMS_PDN_WATCHDOG_MS = 15_000L;
     private static final int DEFAULT_REQUESTED_EXPIRES_SEC = 3600;
     private static final int MIN_REQUESTED_EXPIRES_SEC = 60;
+    /** Experiment switch: a refresh offers a new Security-Client (see refreshSecurityClient). */
+    private static final String REFRESH_NEW_SA_PROPERTY =
+            "persist.lineage.ims.debug.refresh_new_sa";
 
     private final Context mContext;
     private final int mSlotId;
@@ -109,6 +114,10 @@ public class ImsRegistrationController {
     private SlotActivation.StopHold mStopHold = SlotActivation.StopHold.NONE;
     /** Token for the re-evaluation of a held STOP/RESTART. */
     private final Object mActivationRecheck = new Object();
+    /** Security-Client offer of the last attempt, i.e. of the SAs in use once registered. */
+    private SecurityClientOffer mSecurityOffer;
+    /** The outstanding refresh offered a new Security-Client; its answer is logged. */
+    private boolean mRefreshOffersNewSa;
 
     /* Published by the registration thread for callers on other threads. */
     private volatile Network mImsNetwork;
@@ -186,6 +195,7 @@ public class ImsRegistrationController {
         volatile int mRefreshesNotSent;
         volatile int mFreshAttempts;
         volatile long mNextCheckElapsedMs = -1;
+        volatile String mLastNewSaOutcome = "none";
 
         void onRegistered(int expires) {
             mRegisteredAtMs = System.currentTimeMillis();
@@ -714,6 +724,7 @@ public class ImsRegistrationController {
         RegistrationState.Op op = mState.inFlight();
         Log.w(TAG, "REGISTER outcome overdue trigger=" + trigger + " op=" + op
                 + " ageS=" + (now - mState.inFlightSentMs()) / 1000);
+        logNewSaOutcome("no answer");
         releaseWakeLock("outcome overdue");
         if (op == RegistrationState.Op.REFRESH && mState.isRegistered()
                 && mState.scheduleRetry(now, 0, "refresh retry")) {
@@ -747,15 +758,45 @@ public class ImsRegistrationController {
                 + " lateS=" + Math.max(0, lateMs) / 1000);
         mState.beginRefresh(now);
         acquireWakeLock(RefreshPolicy.REFRESH_WAKELOCK_MS, "refresh");
-        boolean sent = mStack.refreshRegister();
+        boolean sent = mStack.refreshRegister(refreshSecurityClient());
         mDiag.onRefresh(sent);
         if (sent) return;
         /* No live registration handle: the binding cannot be renewed in place. */
         Log.w(TAG, "refresh not sent — no live registration handle");
+        logNewSaOutcome("not sent");
         releaseWakeLock("refresh not sent");
         if (!mState.scheduleRetry(now, 0, "refresh retry")) {
             failTerminally(0, "refresh not sent");
         }
+    }
+
+    /**
+     * The Security-Client of a refresh, or null to repeat the registration's
+     * offer. Experiment {@value #REFRESH_NEW_SA_PROPERTY}: offer new SPIs and
+     * a new port-c with the same port-s (TS 33.203 §7.4) to read the
+     * network's answer. No new SA is installed; a 401 is refused by the
+     * one-AKA guard and a fresh registration follows.
+     */
+    private String refreshSecurityClient() {
+        SecurityClientOffer current = mSecurityOffer;
+        if (current == null
+                || !android.os.SystemProperties.getBoolean(REFRESH_NEW_SA_PROPERTY, false)) {
+            return null;
+        }
+        SecurityClientOffer next = current.forReRegistration(new Random());
+        mRefreshOffersNewSa = true;
+        Log.i(TAG, "refresh_new_sa: refresh offers a new Security-Client (new SPIs, port-c "
+                + current.portC + " -> " + next.portC + ", port-s " + next.portS
+                + " kept); no new SA installed");
+        return next.headerValue();
+    }
+
+    /** Records the answer to a refresh that offered a new Security-Client. */
+    private void logNewSaOutcome(String outcome) {
+        if (!mRefreshOffersNewSa) return;
+        mRefreshOffersNewSa = false;
+        Log.i(TAG, "refresh_new_sa outcome: " + outcome);
+        mDiag.mLastNewSaOutcome = outcome + " at " + System.currentTimeMillis() + "ms";
     }
 
     /**
@@ -771,6 +812,7 @@ public class ImsRegistrationController {
             idleNoSubscription();
             return;
         }
+        logNewSaOutcome("no answer before a fresh registration");
         mWaitingForSim = next == SlotActivation.NextStep.RETRY;
         long now = SystemClock.elapsedRealtime();
         int gen = mState.beginFresh(now);
@@ -804,6 +846,7 @@ public class ImsRegistrationController {
 
     /** Drops the registration and everything tied to the current stack. */
     private void tearDown() {
+        logNewSaOutcome("no answer before the tear-down");
         mState.invalidate();
         /* Before the stack goes down: no MO request may still see a binding. */
         publishSnapshot(SystemClock.elapsedRealtime());
@@ -870,6 +913,7 @@ public class ImsRegistrationController {
             Log.i(TAG, "dropping 200 OK of stale gen=" + gen);
             return;
         }
+        logNewSaOutcome("200 OK, no re-authentication");
         long now = SystemClock.elapsedRealtime();
         int expires = mReportedExpiresSec > 0 ? mReportedExpiresSec : mRequestedExpiresSec;
         Log.i(TAG, "*** IMS REGISTERED (native) *** gen=" + gen + " expiresS=" + expires);
@@ -916,6 +960,10 @@ public class ImsRegistrationController {
         Log.w(TAG, "REGISTER failed/removed: " + statusCode + " " + reason
                 + " retryAfter=" + retryAfterSec + " gen=" + gen);
         mDiag.onDeregistered(statusCode, reason);
+        logNewSaOutcome(statusCode == 401
+                ? "401, the network re-authenticates (the one-AKA guard refuses; a fresh"
+                        + " registration follows)"
+                : statusCode + " " + reason);
         boolean wasRefresh = mState.inFlight() == RegistrationState.Op.REFRESH;
         releaseWakeLock("final response " + statusCode);
 
@@ -1058,7 +1106,10 @@ public class ImsRegistrationController {
         InetAddress pcscf = pcscfs.get(pcscfIdx);
         Log.i(TAG, "Attempting registration via reSIProcate to " + pcscf
                 + " (#" + (pcscfIdx + 1) + "/" + pcscfs.size() + ")");
-        SipClient.UeSecurityParams ueSec = new SipClient.UeSecurityParams();
+        /* UE IPsec offer (TS 33.203 §7.2.1); a refresh offers new
+         * parameters relative to it. */
+        SecurityClientOffer ueSec = SecurityClientOffer.initial(new Random());
+        mSecurityOffer = ueSec;
 
         /* The source address the IMS PDN gives a socket to the P-CSCF. */
         String localIp;
@@ -1074,17 +1125,7 @@ public class ImsRegistrationController {
         }
         Log.i(TAG, "local IMS PDN address = " + localIp);
 
-        /* UE IPsec offer (TS 33.203 §7.2.1). Both algorithms are listed: the
-         * P-CSCF rejects an offer without hmac-md5-96 with 403. */
-        String secCommon =
-                "ipsec-3gpp;prot=esp;mod=trans"
-                + ";spi-c=" + ueSec.spiC
-                + ";spi-s=" + ueSec.spiS
-                + ";port-c=" + ueSec.portC
-                + ";port-s=" + ueSec.portS;
-        String securityClient =
-                secCommon + ";alg=hmac-md5-96;ealg=null, "
-                + secCommon + ";alg=hmac-sha-1-96;ealg=null";
+        String securityClient = ueSec.headerValue();
 
         String impi = creds.imsi + "@" + creds.domain;
         String impu = "sip:" + impi;
@@ -1143,6 +1184,9 @@ public class ImsRegistrationController {
                 + " freshAttempts=" + mDiag.mFreshAttempts);
         long next = mDiag.mNextCheckElapsedMs;
         pw.println("  nextCheck: " + (next < 0 ? "none" : "in " + (next - nowElapsed) / 1000 + " s"));
+        pw.println("  refresh_new_sa: enabled="
+                + android.os.SystemProperties.getBoolean(REFRESH_NEW_SA_PROPERTY, false)
+                + " lastOutcome=" + mDiag.mLastNewSaOutcome);
     }
 
     private static String fmtAgo(long nowMs, long thenMs) {
