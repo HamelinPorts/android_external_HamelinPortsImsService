@@ -1,7 +1,7 @@
 /*
- * Host test of jni/sip_socket_guard.cpp, linked with -Wl,--wrap=socket and
- * -Wl,--wrap=connect like the JNI library: this file's socket()/connect()
- * calls reach the guard exactly as reSIProcate's and c-ares' do there.
+ * Host test of jni/sip_socket_guard.cpp, linked with -Wl,--wrap for socket,
+ * connect, sendto and sendmsg like the JNI library: this file's calls reach
+ * the guard exactly as reSIProcate's and c-ares' do there.
  * Exit status 0 = every check passed.
  */
 #include "sip_socket_guard.h"
@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -132,6 +133,108 @@ void reusedDescriptorStartsUnpinned() {
     close(listener);
 }
 
+/* The IMS family: a reused AF_INET6 number must not inherit the old pin. */
+void reusedIpv6DescriptorStartsUnpinned() {
+    const int first = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+    if (first < 0) {
+        printf("SKIP reusedIpv6DescriptorStartsUnpinned: no IPv6\n");
+        return;
+    }
+    markSocketPinned(first);
+    close(first);
+    const int second = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+    CHECK(second == first);
+    CHECK(!isSocketPinned(second));
+    sockaddr_in6 target{};
+    target.sin6_family = AF_INET6;
+    target.sin6_addr = in6addr_loopback;
+    target.sin6_port = htons(5060);
+    errno = 0;
+    CHECK(connect(second, reinterpret_cast<sockaddr*>(&target), sizeof(target)) == -1);
+    CHECK(errno == ENETUNREACH);
+    close(second);
+}
+
+/* A UDP receiver on [::1] (or 127.0.0.1 without IPv6); its address goes to *addr. */
+int openUdpReceiver(sockaddr_storage* addr, socklen_t* len) {
+    int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+    sockaddr_in6 a6{};
+    a6.sin6_family = AF_INET6;
+    a6.sin6_addr = in6addr_loopback;
+    if (fd >= 0 && bind(fd, reinterpret_cast<sockaddr*>(&a6), sizeof(a6)) == 0) {
+        *len = sizeof(sockaddr_in6);
+    } else {
+        if (fd >= 0) close(fd);
+        fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+        sockaddr_in a4 = loopback4(0);
+        if (bind(fd, reinterpret_cast<sockaddr*>(&a4), sizeof(a4)) != 0) return -1;
+        *len = sizeof(sockaddr_in);
+    }
+    getsockname(fd, reinterpret_cast<sockaddr*>(addr), len);
+    return fd;
+}
+
+void unpinnedSendtoIsRefused() {
+    sockaddr_storage to{};
+    socklen_t toLen = 0;
+    const int receiver = openUdpReceiver(&to, &toLen);
+    const int fd = socket(to.ss_family, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+    errno = 0;
+    CHECK(sendto(fd, "x", 1, 0, reinterpret_cast<sockaddr*>(&to), toLen) == -1);
+    CHECK(errno == ENETUNREACH);
+    CHECK(!readableWithin(receiver, 200));  // nothing was sent
+    markSocketPinned(fd);
+    CHECK(sendto(fd, "x", 1, 0, reinterpret_cast<sockaddr*>(&to), toLen) == 1);
+    CHECK(readableWithin(receiver, 1000));
+    close(fd);
+    close(receiver);
+}
+
+void unpinnedSendmsgIsRefused() {
+    sockaddr_storage to{};
+    socklen_t toLen = 0;
+    const int receiver = openUdpReceiver(&to, &toLen);
+    const int fd = socket(to.ss_family, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+    char byte = 'x';
+    iovec iov{&byte, 1};
+    msghdr msg{};
+    msg.msg_name = &to;
+    msg.msg_namelen = toLen;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    errno = 0;
+    CHECK(sendmsg(fd, &msg, 0) == -1);
+    CHECK(errno == ENETUNREACH);
+    CHECK(!readableWithin(receiver, 200));
+    markSocketPinned(fd);
+    CHECK(sendmsg(fd, &msg, 0) == 1);
+    CHECK(readableWithin(receiver, 1000));
+    close(fd);
+    close(receiver);
+}
+
+/* A send without an address goes to the connected peer (or fails in the
+ * kernel): the guard does not decide it. */
+void sendWithoutAddressPasses() {
+    const int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+    if (fd < 0) {
+        printf("SKIP sendWithoutAddressPasses: no IPv6\n");
+        return;
+    }
+    errno = 0;
+    CHECK(sendto(fd, "x", 1, 0, nullptr, 0) == -1);
+    CHECK(errno == EDESTADDRREQ);  // the kernel's answer, not the guard's
+    char byte = 'x';
+    iovec iov{&byte, 1};
+    msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    errno = 0;
+    CHECK(sendmsg(fd, &msg, 0) == -1);
+    CHECK(errno == EDESTADDRREQ);
+    close(fd);
+}
+
 void localSocketsPass() {
     const int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     sockaddr_un addr{};
@@ -156,6 +259,10 @@ int main() {
     unpinnedUdpProbeCannotConnect();
     dissolvingAnUnpinnedSocketPasses();
     reusedDescriptorStartsUnpinned();
+    reusedIpv6DescriptorStartsUnpinned();
+    unpinnedSendtoIsRefused();
+    unpinnedSendmsgIsRefused();
+    sendWithoutAddressPasses();
     localSocketsPass();
     printf("%s: %d checks, %d failed\n", gFailures ? "FAIL" : "PASS", gChecks, gFailures);
     return gFailures ? 1 : 0;

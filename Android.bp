@@ -67,6 +67,8 @@ cc_test_host {
     ldflags: [
         "-Wl,--wrap=socket",
         "-Wl,--wrap=connect",
+        "-Wl,--wrap=sendto",
+        "-Wl,--wrap=sendmsg",
     ],
     gtest: false,
     test_options: {
@@ -82,12 +84,15 @@ cc_library_shared {
         "jni/hamelinports_ims_jni.cpp",
         "jni/sip_socket_guard.cpp",
     ],
-    // Every socket() and connect() in this library, reSIProcate and c-ares
-    // included, goes through jni/sip_socket_guard.cpp: an IP socket the SIP
-    // socket hook did not pin to the IMS network cannot connect.
+    // Every socket(), connect(), sendto() and sendmsg() in this library,
+    // reSIProcate and c-ares included, goes through jni/sip_socket_guard.cpp:
+    // an IP socket the SIP socket hook did not pin to the IMS network cannot
+    // connect or send to an address.
     ldflags: [
         "-Wl,--wrap=socket",
         "-Wl,--wrap=connect",
+        "-Wl,--wrap=sendto",
+        "-Wl,--wrap=sendmsg",
     ],
     cppflags: [
         "-std=gnu++17",

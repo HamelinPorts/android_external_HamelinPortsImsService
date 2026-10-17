@@ -1,11 +1,11 @@
-# Every socket(), accept(), socketpair() and connect() call site in the reSIProcate sources this app compiles
-# and in jni/, with its status (checked by tests/check-sip-socket-sites.sh).
+# Every socket(), accept(), socketpair(), connect(), sendto(), sendmsg() and sendmmsg() call site in the reSIProcate
+# and c-ares sources the JNI library links and in jni/, with its status (checked by tests/check-sip-socket-sites.sh).
 #   <tree:path> TAB <occurrence of the text in the file> TAB <status> TAB <evidence or reason> TAB <code, trimmed>
 # hooked: the socket function (the JNI pin hook) runs before the socket is used; the evidence is a regex within
 #   30 lines, or @<path>@<regex> in another file of the same tree.
-# Sockets created inside c-ares (linked statically) reach the socket function through
-# ares_set_socket_configure_callback (AresDns.cxx, a structural check of the gate). Every socket()/connect() of the
-# JNI library, reSIProcate and c-ares included, also goes through the connect() guard (jni/sip_socket_guard.cpp).
+# c-ares sockets reach the socket function through ares_set_socket_configure_callback (AresDns.cxx, a structural
+# check of the gate), which c-ares calls before connect() (ares_conn.c). Every socket()/connect()/sendto()/sendmsg()
+# of the JNI library, reSIProcate and c-ares included, also goes through the guard (jni/sip_socket_guard.cpp).
 resip:resip/dum/ServerInviteSession.cxx	1	not-a-socket	DUM method accept(int code), a SIP 200, not accept(2)	ServerInviteSession::accept(int code)
 resip:resip/dum/ServerInviteSession.cxx	1	not-a-socket	log text	InfoLog (<< toData(mState) << ": accept(" << code << ")");
 resip:resip/dum/ServerOutOfDialogReq.cxx	1	not-a-socket	DUM method accept(int), a SIP response	ServerOutOfDialogReq::accept(int statusCode)
@@ -40,3 +40,12 @@ resip:rutil/hep/HepAgent.cxx	1	unreachable	HEP capture agent: only an applicatio
 resip:rutil/stun/Stun.cxx	1	no-traffic	stunFindLocalInterfaces(): SIOCGIFCONF ioctl only (STUN client, not called: transports are StunDisabled)	int s = socket(AF_INET, SOCK_DGRAM, 0);
 resip:rutil/stun/Udp.cxx	1	unreachable	openPort(): STUN client only, called from no stack code (transports are StunDisabled)	fd = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
 app:jni/sip_socket_discard.h	1	not-network	the dead AF_UNIX socket swapped into a socket the hook could not pin; never connected	const int dead = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+resip:resip/stack/UdpTransport.cxx	1	unreachable	UdpTransport::processTxOne(): no UDP transport is ever added (jni adds TCP only); its socket would be hooked in bind()	count = sendto(mFd,
+resip:resip/stack/UdpTransport.cxx	2	unreachable	UdpTransport::processTxOne() (second branch): no UDP transport is ever added	count = sendto(mFd,
+resip:rutil/hep/HepAgent.cxx	1	unreachable	HEP capture agent: only an application constructs one; this app does not	return sendto(mSocket, buf.data(), (int)buf.size(), 0, &mDestination.address, (int)mDestination.length()) < 0;
+resip:rutil/stun/Udp.cxx	1	unreachable	sendMessage(): STUN client only, called from no stack code (transports are StunDisabled)	s = sendto(fd, buf, l, 0,(sockaddr*)&to, toLen);
+cares:src/lib/ares_set_socket_functions.c	1	hooked	@src/lib/ares_conn.c@sock_config_cb\(conn->fd, stype	s = socket(domain, type, protocol);
+cares:src/lib/ares_set_socket_functions.c	1	hooked	@src/lib/ares_conn.c@sock_config_cb\(conn->fd, stype	return connect(sock, address, address_len);
+cares:src/lib/ares_set_socket_functions.c	2	hooked	@src/lib/ares_conn.c@sock_config_cb\(conn->fd, stype	return connect(sock, address, address_len);
+cares:src/lib/ares_set_socket_functions.c	3	hooked	@src/lib/ares_conn.c@sock_config_cb\(conn->fd, stype	return connect(sock, address, address_len);
+cares:src/lib/ares_set_socket_functions.c	1	c-ares	default_asendto(): c-ares sends on a socket it already connect()ed after the configure callback pinned it (0 name servers on this device: dormant)	return (ares_ssize_t)sendto((SEND_TYPE_ARG1)sock, (SEND_TYPE_ARG2)buffer,

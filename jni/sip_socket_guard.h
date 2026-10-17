@@ -1,10 +1,10 @@
 /*
- * Refuses connect() on an IP socket that the SIP socket hook has not pinned
- * to an IMS network. The library links with -Wl,--wrap=socket and
- * -Wl,--wrap=connect, so every socket() and connect() of reSIProcate,
- * c-ares and this bridge goes through sip_socket_guard.cpp: a path that
- * creates a socket without running the hook fails at once instead of
- * sending on the default network.
+ * Refuses connect(), and sendto()/sendmsg() to an IP address, on an IP
+ * socket that the SIP socket hook has not pinned to an IMS network. The
+ * library links with -Wl,--wrap for socket, connect, sendto and sendmsg, so
+ * every such call of reSIProcate, c-ares and this bridge goes through
+ * sip_socket_guard.cpp: a path that creates a socket without running the hook
+ * fails at once instead of sending on the default network.
  */
 #pragma once
 

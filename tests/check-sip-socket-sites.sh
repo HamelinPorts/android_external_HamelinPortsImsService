@@ -1,42 +1,57 @@
 #!/bin/bash
-# Fails unless every socket(), accept(), socketpair() and connect() call site in
-# the reSIProcate sources this app compiles, and in jni/, is listed in
-# tests/sip-socket-sites.txt with its status. A "hooked" site must show its
-# evidence (the socket-function call): within WINDOW lines, or, written as
-# @<path>@<regex>, in that file of the same tree. Any other status needs a
-# reason. A new, changed or unlisted site fails, and so does a stale entry.
-# The structural checks below assert that the socket
-# function reaches every socket the stack creates and that the connect() guard
-# is linked into the JNI library.
-#   usage: check-sip-socket-sites.sh [--list] [app-root] [resiprocate-root]
+# Fails unless every socket(), accept(), socketpair(), connect(), sendto(),
+# sendmsg() and sendmmsg() call site in the reSIProcate and c-ares sources the
+# JNI library links, and in jni/, is listed in tests/sip-socket-sites.txt with
+# its status. A "hooked" site must show its evidence (the socket-function
+# call): within WINDOW lines, or, written as @<path>@<regex>, in that file of
+# the same tree. Any other status needs a reason. A new, changed or unlisted
+# site fails, and so does a stale entry. The structural checks below assert
+# that the socket function reaches every socket the stack creates and that the
+# guard is linked into the JNI library.
+#   usage: check-sip-socket-sites.sh [--list] [app-root] [resiprocate-root] [c-ares-root]
 set -euo pipefail
 
 list=false
 [ "${1:-}" = --list ] && { list=true; shift; }
 app="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 resip="${2:-$app/../../../external/resiprocate}"
+cares="${3:-$app/../../../external/c-ares}"
 sites="$app/tests/sip-socket-sites.txt"
 WINDOW=30
 G=/bin/grep
 
 [ -d "$app/jni" ] || { echo "FAIL: no jni/ under $app — gate cannot see the code" >&2; exit 2; }
 [ -d "$resip/resip/stack" ] || { echo "FAIL: no resip/stack/ under $resip — gate cannot see the code" >&2; exit 2; }
+[ -d "$cares/src/lib" ] || { echo "FAIL: no src/lib/ under $cares — gate cannot see the code" >&2; exit 2; }
 
-# The compiled sources: external/resiprocate/Android.bp srcs minus exclude_srcs.
+tree_root() {
+    case "$1" in
+    resip) echo "$resip" ;;
+    cares) echo "$cares" ;;
+    *) echo "$app" ;;
+    esac
+}
+
+# The compiled sources: the srcs minus exclude_srcs of external/resiprocate and
+# external/c-ares Android.bp, and jni/.
 compiled() {
     (cd "$resip" && ls rutil/*.cxx rutil/dns/*.cxx rutil/stun/*.cxx rutil/hep/*.cxx rutil/ssl/*.cxx \
         resip/stack/*.cxx resip/stack/gen/*.cxx resip/stack/ssl/*.cxx resip/dum/*.cxx resip/dum/ssl/*.cxx 2>/dev/null) \
         | $G -v -E '^rutil/(WinCompat|Plugin|ProtonThreadBase|PyExtensionBase)\.cxx$|^rutil/dns/LocalDns\.cxx$|^resip/stack/(makeCert|ssl/MacSecurity|ssl/WinSecurity)\.cxx$' \
         | sed 's#^#resip:#'
+    (cd "$cares" && ls src/lib/*.c src/lib/dsa/*.c src/lib/event/*.c src/lib/legacy/*.c src/lib/record/*.c \
+        src/lib/str/*.c src/lib/util/*.c 2>/dev/null) \
+        | $G -v -E '^src/lib/(windows_port|ares_sysconfig_win|ares_sysconfig_mac)\.c$|^src/lib/event/ares_event_(win32|kqueue)\.c$' \
+        | sed 's#^#cares:#'
     (cd "$app" && ls jni/*.cpp jni/*.h) | sed 's#^#app:#'
 }
 
-call_re='(^|[^A-Za-z0-9_>.])(::)?(socket|accept|accept4|socketpair|connect)[[:space:]]*[(]'
+call_re='(^|[^A-Za-z0-9_>.])(::)?(socket|accept|accept4|socketpair|connect|sendto|sendmsg|sendmmsg)[[:space:]]*[(]'
 
 # One line per call site: <tree:path> TAB <occurrence of this text in the file> TAB <line> TAB <text>
 found="$(compiled | while read -r ref; do
     tree=${ref%%:*}; path=${ref#*:}
-    base=$([ "$tree" = resip ] && echo "$resip" || echo "$app")
+    base=$(tree_root "$tree")
     awk -v ref="$ref" -v re="$call_re" '
         { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
         line ~ /^(\/\/|\*|\/\*)/ { next }
@@ -68,7 +83,7 @@ while IFS=$'\t' read -r ref occ lineno text; do
         fail=1
     elif [ "$status" = hooked ]; then
         tree=${ref%%:*}; path=${ref#*:}
-        base=$([ "$tree" = resip ] && echo "$resip" || echo "$app")
+        base=$(tree_root "$tree")
         case "$evidence" in
         @*@*)
             other=${evidence#@}; other=${other%%@*}; regex=${evidence#@*@}
@@ -114,7 +129,8 @@ require "$resip/rutil/dns/AresDns.cxx" 'ares_set_socket_configure_callback\(mCha
 require "$app/jni/hamelinports_ims_jni.cpp" 'hamelinports::markSocketPinned\(fd\)' \
     "the hook does not report pinned sockets to the connect() guard"
 jni_block="$(awk '/^cc_library_shared \{/ { b = 1 } b { print } b && /^\}/ { exit }' "$app/Android.bp")"
-for flag in -Wl,--wrap=socket -Wl,--wrap=connect jni/sip_socket_guard.cpp; do
+for flag in -Wl,--wrap=socket -Wl,--wrap=connect -Wl,--wrap=sendto -Wl,--wrap=sendmsg \
+        jni/sip_socket_guard.cpp; do
     printf '%s\n' "$jni_block" | $G -q -F -- "\"$flag\"" \
         || { echo "FAIL: libhamelinports_ims_jni does not have \"$flag\" (Android.bp)"; fail=1; }
 done
@@ -124,4 +140,4 @@ if $G -q -E 'if \(transportType != resip::TCP\) return;' "$app/jni/hamelinports_
 fi
 
 [ "$fail" = 0 ] || exit 1
-echo "PASS: $n_sites call sites listed with their status; probe, DNS and connect() guard wired"
+echo "PASS: $n_sites call sites listed with their status; probe, DNS and socket guard wired"
