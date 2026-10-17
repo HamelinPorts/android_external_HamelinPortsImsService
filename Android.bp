@@ -54,11 +54,41 @@ cc_test_host {
     },
 }
 
+// Host test of the socket()/connect() guard, linked with the same wrap flags
+// as the JNI library:
+//   atest --host HamelinPortsImsSocketGuardTest
+cc_test_host {
+    name: "HamelinPortsImsSocketGuardTest",
+    srcs: [
+        "tests/host/native/sip_socket_guard_test.cpp",
+        "jni/sip_socket_guard.cpp",
+    ],
+    local_include_dirs: ["jni"],
+    ldflags: [
+        "-Wl,--wrap=socket",
+        "-Wl,--wrap=connect",
+    ],
+    gtest: false,
+    test_options: {
+        unit_test: true,
+    },
+}
+
 // Native bridge into reSIProcate. Scaffolding — the Java SipClient
 // still handles all real traffic. See jni/hamelinports_ims_jni.cpp.
 cc_library_shared {
     name: "libhamelinports_ims_jni",
-    srcs: ["jni/hamelinports_ims_jni.cpp"],
+    srcs: [
+        "jni/hamelinports_ims_jni.cpp",
+        "jni/sip_socket_guard.cpp",
+    ],
+    // Every socket() and connect() in this library, reSIProcate and c-ares
+    // included, goes through jni/sip_socket_guard.cpp: an IP socket the SIP
+    // socket hook did not pin to the IMS network cannot connect.
+    ldflags: [
+        "-Wl,--wrap=socket",
+        "-Wl,--wrap=connect",
+    ],
     cppflags: [
         "-std=gnu++17",
         "-fexceptions",

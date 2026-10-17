@@ -46,6 +46,7 @@
 #include <vector>
 
 #include "sip_socket_discard.h"
+#include "sip_socket_guard.h"
 
 #include "rutil/Data.hxx"
 #include "rutil/Log.hxx"
@@ -117,7 +118,9 @@ struct SipListenerCreation {
     SipListenerCreation& operator=(const SipListenerCreation&) = delete;
 };
 
-const char* sipSocketRole(resip::Socket fd) {
+const char* sipSocketRole(resip::Socket fd, int transportType) {
+    /* The transports are TCP: a UDP socket is the stack's route probe or DNS. */
+    if (transportType != resip::TCP) return "udp";
     if (tCreatingSipListeners) return "listening";
     sockaddr_storage peer{};
     socklen_t len = sizeof(peer);
@@ -142,8 +145,8 @@ void discardUnpinnedSipSocket(int slot, resip::Socket fd, const char* role) {
          (int)fd, role, slot, strerror(err));
 }
 
-void pinSipSocket(int slot, resip::Socket fd) {
-    const char* role = sipSocketRole(fd);
+void pinSipSocket(int slot, resip::Socket fd, int transportType) {
+    const char* role = sipSocketRole(fd, transportType);
     const net_handle_t net = gSipNetwork[slot].load(std::memory_order_acquire);
     if (net == NETWORK_UNSPECIFIED) {
         LOGE("SIP socket fd=%d (%s) slot=%d not pinned: no IMS network set",
@@ -157,23 +160,25 @@ void pinSipSocket(int slot, resip::Socket fd) {
         discardUnpinnedSipSocket(slot, fd, role);
         return;
     }
+    hamelinports::markSocketPinned(fd);
     LOGI("SIP socket fd=%d (%s) pinned slot=%d netHandle=%llu",
          (int)fd, role, slot, (unsigned long long)net);
 }
 
-/* SipStack socket-creation hook: runs for listening, accepted and outgoing
- * TCP sockets (before connect() on outgoing ones), so it covers connections
- * reSIProcate opens on its own. The hook carries no user pointer, hence one
- * instantiation per slot. */
+/* SipStack socket-creation hook. It runs for every socket the stack creates
+ * before the socket is used: listening, accepted and outgoing TCP (before
+ * connect()), the transport selector's UDP route probes and c-ares' DNS
+ * sockets. The hook carries no user pointer, hence one instantiation per slot. */
 template <int Slot>
 void applySipSocketOptions(resip::Socket fd, int transportType, const char*, int) {
     static_assert(Slot >= 0 && Slot < kMaxSipSlots, "slot out of range");
-    if (transportType != resip::TCP) return;
-    unsigned int timeoutMs = kSipTcpUserTimeoutMs;
-    if (::setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &timeoutMs, sizeof(timeoutMs)) != 0) {
-        LOGW("TCP_USER_TIMEOUT on fd %d failed: %s", (int)fd, strerror(errno));
+    if (transportType == resip::TCP) {
+        unsigned int timeoutMs = kSipTcpUserTimeoutMs;
+        if (::setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &timeoutMs, sizeof(timeoutMs)) != 0) {
+            LOGW("TCP_USER_TIMEOUT on fd %d failed: %s", (int)fd, strerror(errno));
+        }
     }
-    pinSipSocket(Slot, fd);
+    pinSipSocket(Slot, fd, transportType);
 }
 
 static_assert(kMaxSipSlots == 2, "one socket hook per slot");

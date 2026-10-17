@@ -1,0 +1,42 @@
+# Every socket(), accept(), socketpair() and connect() call site in the reSIProcate sources this app compiles
+# and in jni/, with its status (checked by tests/check-sip-socket-sites.sh).
+#   <tree:path> TAB <occurrence of the text in the file> TAB <status> TAB <evidence or reason> TAB <code, trimmed>
+# hooked: the socket function (the JNI pin hook) runs before the socket is used; the evidence is a regex within
+#   30 lines, or @<path>@<regex> in another file of the same tree.
+# Sockets created inside c-ares (linked statically) reach the socket function through
+# ares_set_socket_configure_callback (AresDns.cxx, a structural check of the gate). Every socket()/connect() of the
+# JNI library, reSIProcate and c-ares included, also goes through the connect() guard (jni/sip_socket_guard.cpp).
+resip:resip/dum/ServerInviteSession.cxx	1	not-a-socket	DUM method accept(int code), a SIP 200, not accept(2)	ServerInviteSession::accept(int code)
+resip:resip/dum/ServerInviteSession.cxx	1	not-a-socket	log text	InfoLog (<< toData(mState) << ": accept(" << code << ")");
+resip:resip/dum/ServerOutOfDialogReq.cxx	1	not-a-socket	DUM method accept(int), a SIP response	ServerOutOfDialogReq::accept(int statusCode)
+resip:resip/dum/ServerPagerMessage.cxx	1	not-a-socket	DUM method accept(int), a SIP response	ServerPagerMessage::accept(int statusCode)
+resip:resip/dum/ServerPublication.cxx	1	not-a-socket	DUM method accept(int), a SIP response	ServerPublication::accept(int statusCode)
+resip:resip/dum/ServerRegistration.cxx	1	not-a-socket	DUM method accept(SipMessage&), a SIP response	ServerRegistration::accept(SipMessage& ok)
+resip:resip/dum/ServerRegistration.cxx	1	not-a-socket	DUM method accept(int), a SIP response	ServerRegistration::accept(int statusCode)
+resip:resip/dum/ServerRegistration.cxx	1	not-a-socket	call of the DUM method above	accept(success);
+resip:resip/dum/ServerRegistration.cxx	1	not-a-socket	comment text after code	resip_assert(0); //need to call accept() or reject(), wait for asyncUpdateContacts(), then call this function.
+resip:resip/dum/ServerSubscription.cxx	1	not-a-socket	DUM method accept(int), a SIP response	ServerSubscription::accept(int statusCode)
+resip:resip/stack/InternalTransport.cxx	1	not-a-socket	definition of the socket factory InternalTransport::socket(); its callers are listed	InternalTransport::socket(TransportType type, IpVersion ipVer)
+resip:resip/stack/InternalTransport.cxx	1	factory	inside InternalTransport::socket(); every caller below runs the socket function before the socket is used	fd = ::socket(ipVer == V4 ? PF_INET : PF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+resip:resip/stack/InternalTransport.cxx	1	factory	inside InternalTransport::socket() (IPv4-only build branch)	fd = ::socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
+resip:resip/stack/InternalTransport.cxx	1	factory	inside InternalTransport::socket(); every caller below runs the socket function before the socket is used	fd = ::socket(ipVer == V4 ? PF_INET : PF_INET6, SOCK_STREAM, 0);
+resip:resip/stack/InternalTransport.cxx	1	factory	inside InternalTransport::socket() (IPv4-only build branch)	fd = ::socket(PF_INET, SOCK_STREAM, 0);
+resip:resip/stack/TcpBaseTransport.cxx	1	hooked	@resip/stack/InternalTransport.cxx@mSocketFunc\(mFd, transport\(\), __FILE__, __LINE__\);	mFd = InternalTransport::socket(TCP, version);
+resip:resip/stack/TcpBaseTransport.cxx	1	hooked	mSocketFunc\(sock, transport\(\), __FILE__, __LINE__\);	Socket sock = accept( mFd, &peer, &peerLen);
+resip:resip/stack/TcpBaseTransport.cxx	1	outgoing	makeOutgoingConnection(): its only use is the hooked connect() below (socket function before connect)	Socket sock = InternalTransport::socket( TCP, ipVersion());
+resip:resip/stack/TcpBaseTransport.cxx	1	outgoing	makeOutgoingConnection() retry branch: its only use is the hooked connect() below	sock = InternalTransport::socket( TCP, ipVersion());
+resip:resip/stack/TcpBaseTransport.cxx	1	hooked	mSocketFunc\(sock, transport\(\), __FILE__, __LINE__\);	int ret = connect( sock, &servaddr, dest.length() );
+resip:resip/stack/TransportSelector.cxx	1	hooked	mSocketFunc\(mSockets\[netNs\], UDP, __FILE__, __LINE__\);	mSockets[netNs] = InternalTransport::socket(UDP, V4); // may throw
+resip:resip/stack/TransportSelector.cxx	1	hooked	mSocketFunc\(mSocket6s\[netNs\], UDP, __FILE__, __LINE__\);	mSocket6s[netNs] = InternalTransport::socket(UDP, V6); // may throw
+resip:resip/stack/TransportSelector.cxx	1	hooked	mSocketFunc\(mSocket6s\[netNs\], UDP, __FILE__, __LINE__\);	int ret = connect(tmp,&target.getSockaddr(), target.length());
+resip:resip/stack/TransportSelector.cxx	1	dissolve	AF_UNSPEC connect: dissolves the probe's association, no route, no packet (the guard passes it)	ret = connect(mSockets[netNs],
+resip:resip/stack/TransportSelector.cxx	1	dissolve	AF_UNSPEC connect: dissolves the probe's association, no route, no packet (the guard passes it)	ret = connect(mSocket6s[netNs],
+resip:resip/stack/UdpTransport.cxx	1	hooked	@resip/stack/InternalTransport.cxx@mSocketFunc\(mFd, transport\(\), __FILE__, __LINE__\);	mFd = InternalTransport::socket(transport(), version);
+resip:rutil/DnsUtil.cxx	1	no-traffic	DnsUtil::getInterfaces(): SIOCGIFCONF ioctl only, never bound, connected or sent on	int s = socket( AF_INET, SOCK_DGRAM, 0 );
+resip:rutil/SelectInterruptor.cxx	1	unreachable	#ifdef WIN32 branch; Linux/bionic uses pipe()	mSocket = ::socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
+resip:rutil/SelectInterruptor.cxx	1	unreachable	#ifdef WIN32 branch; Linux/bionic uses pipe()	error= connect(mSocket, &mWakeupAddr, sizeof(mWakeupAddr));
+resip:rutil/hep/HepAgent.cxx	1	unreachable	HEP capture agent: only an application constructs one; this app does not	mSocket = ::socket(PF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+resip:rutil/hep/HepAgent.cxx	1	unreachable	HEP capture agent: only an application constructs one; this app does not	mSocket = ::socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
+resip:rutil/stun/Stun.cxx	1	no-traffic	stunFindLocalInterfaces(): SIOCGIFCONF ioctl only (STUN client, not called: transports are StunDisabled)	int s = socket(AF_INET, SOCK_DGRAM, 0);
+resip:rutil/stun/Udp.cxx	1	unreachable	openPort(): STUN client only, called from no stack code (transports are StunDisabled)	fd = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
+app:jni/sip_socket_discard.h	1	not-network	the dead AF_UNIX socket swapped into a socket the hook could not pin; never connected	const int dead = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);

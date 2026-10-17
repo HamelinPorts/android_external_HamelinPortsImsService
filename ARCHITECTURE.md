@@ -108,17 +108,30 @@ Native bridge between the Java service and reSIProcate. Hosts the
 handlers, exposes JNI methods for outbound REGISTER, INVITE, ACK, BYE,
 re-INVITE, MESSAGE, refresh.
 
-Every SIP TCP socket reSIProcate creates (listening, accepted, outgoing)
-passes a per-slot socket hook: `TCP_USER_TIMEOUT` plus
-`android_setsocknetwork` to the slot's IMS network. The network handle is a
-parameter of the stack start, which refuses to start without one, and is
-cleared when the stack stops. A connection opened later (e.g. for a
-registration refresh) therefore stays on the IMS network. The process is
-never bound to a network: a socket the hook cannot pin is discarded (its
-descriptor is swapped for a dead socket, `jni/sip_socket_discard.h`), so the
-request on it fails and the registration policy retries.
-`tests/check-process-binding.sh` fails on any process-binding API in `src/`
-or `jni/`.
+Every socket the stack creates passes a per-slot socket hook that pins it
+with `android_setsocknetwork` to the slot's IMS network (TCP sockets also get
+`TCP_USER_TIMEOUT`): listening, accepted and outgoing TCP sockets, the
+transport selector's connected-UDP route probe (it picks the Via source
+address, so an unpinned probe picks the default network's address) and
+c-ares' DNS sockets. The last two are handed to the hook by our
+reSIProcate tree (`TransportSelector::setSocketFunc`,
+`ares_set_socket_configure_callback`). The network handle is a parameter of
+the stack start, which refuses to start without one, and is cleared when the
+stack stops. The process is never bound to a network: a socket the hook
+cannot pin is discarded (its descriptor is swapped for a dead socket,
+`jni/sip_socket_discard.h`), so the request on it fails and the registration
+policy retries. As a backstop the JNI library links with
+`-Wl,--wrap=socket,--wrap=connect` (`jni/sip_socket_guard.cpp`): an IP socket
+the hook has not pinned cannot `connect()` (ENETUNREACH and a log line), so a
+path that bypasses the hook fails loudly instead of leaving on the default
+network.
+
+Gates: `tests/check-process-binding.sh` fails on any process-binding API in
+`src/` or `jni/`; `tests/check-sip-socket-sites.sh` fails unless every
+`socket()`/`accept()`/`socketpair()`/`connect()` site in the compiled
+reSIProcate sources and in `jni/` is listed with its status in
+`tests/sip-socket-sites.txt` (hooked sites with the hook call as evidence) and
+the probe, DNS and guard wiring is in place.
 
 Includes carrier-quirk fixes accumulated during bring-up (in-dialog
 TCP routing, SDP offer/answer matching, 5xx Retry-After parsing).

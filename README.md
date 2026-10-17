@@ -89,9 +89,11 @@ remaining, in-flight transaction, pending retry), P-CSCF list, refresh and
 fresh-attempt counters, next check alarm.
 
 Host unit tests of the renewal policy: `atest --host HamelinPortsImsPolicyTests`;
-of the unpinned-socket discard: `atest --host HamelinPortsImsSocketDiscardTest`.
+of the unpinned-socket discard: `atest --host HamelinPortsImsSocketDiscardTest`;
+of the connect() guard: `atest --host HamelinPortsImsSocketGuardTest`.
 Key-logging gate: `tests/check-no-key-logging.sh`. Process-binding gate:
-`tests/check-process-binding.sh`.
+`tests/check-process-binding.sh`. Socket-site gate:
+`tests/check-sip-socket-sites.sh`.
 
 ## Architecture & porting
 
