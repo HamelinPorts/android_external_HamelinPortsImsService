@@ -33,8 +33,12 @@ public interface RegistrationListener {
      *                      treat this as a hint to schedule a fresh
      *                      initial registration rather than declaring
      *                      the IMS feature permanently unavailable.
+     * @param fromWire      The response came from the network. False for a
+     *                      response the stack generated itself (e.g. 408
+     *                      on a transaction timeout, 503 when no transport
+     *                      could send) and for a removal without a response.
      */
-    void onDeregistered(int statusCode, String reason, int retryAfterSec);
+    void onDeregistered(int statusCode, String reason, int retryAfterSec, boolean fromWire);
 
     /** Negotiated {@code Expires} (seconds) from the REGISTER 200 OK.
      *  Fired right before {@link #onRegistered}; the Java side schedules

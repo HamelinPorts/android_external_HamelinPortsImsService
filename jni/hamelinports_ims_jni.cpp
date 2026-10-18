@@ -920,15 +920,18 @@ public:
                 retryAfterSec = (int)response.header(resip::h_RetryAfter).value();
             }
         } catch (...) {}
-        LOGE("REGISTER onFailure: %d %s retryAfter=%d",
-             code, reason.c_str(), retryAfterSec);
+        /* False for a response the transaction layer made up itself
+         * (Timer F 408, transport failure 503): no packet came back. */
+        const bool fromWire = response.isFromWire();
+        LOGE("REGISTER onFailure: %d %s retryAfter=%d fromWire=%d",
+             code, reason.c_str(), retryAfterSec, fromWire ? 1 : 0);
         logFailureCause(response);
-        upcallDeregistered(code, reason, retryAfterSec);
+        upcallDeregistered(code, reason, retryAfterSec, fromWire);
     }
     void onRemoved(resip::ClientRegistrationHandle h,
                    const resip::SipMessage& response) override {
         LOGI("REGISTER onRemoved");
-        upcallDeregistered(0, "removed", 0);
+        upcallDeregistered(0, "removed", 0, response.isFromWire());
     }
     int onRequestRetry(resip::ClientRegistrationHandle h,
                        int retrySeconds,
@@ -940,7 +943,7 @@ public:
      *  failure so Java registers fresh instead of waiting for an outcome. */
     void onRefreshNotSent() {
         LOGW("refreshRegister: registration handle no longer valid");
-        upcallDeregistered(0, "refresh not sent", 0);
+        upcallDeregistered(0, "refresh not sent", 0, false);
     }
 
 private:
@@ -980,14 +983,15 @@ private:
         if (attached) gJvm->DetachCurrentThread();
     }
     void upcallDeregistered(int code, const std::string& reason,
-                            int retryAfterSec) {
+                            int retryAfterSec, bool fromWire) {
         if (!bridgeRegListener(mBridge) || !gOnDeregisteredMethod) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
         if (!env) return;
         jstring jr = env->NewStringUTF(reason.c_str());
         env->CallVoidMethod(bridgeRegListener(mBridge), gOnDeregisteredMethod,
-                            (jint)code, jr, (jint)retryAfterSec);
+                            (jint)code, jr, (jint)retryAfterSec,
+                            fromWire ? JNI_TRUE : JNI_FALSE);
         env->DeleteLocalRef(jr);
         if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
         if (attached) gJvm->DetachCurrentThread();
@@ -2768,7 +2772,7 @@ bool resolveJavaIds(JNIEnv* env) {
     };
     static const MethodSpec kReg[] = {
         { &gOnRegisteredMethod,        "onRegistered",      "(Ljava/lang/String;)V" },
-        { &gOnDeregisteredMethod,      "onDeregistered",    "(ILjava/lang/String;I)V" },
+        { &gOnDeregisteredMethod,      "onDeregistered",    "(ILjava/lang/String;IZ)V" },
         { &gOnRegisterExpiresReported, "onExpiresReported", "(I)V" },
     };
     static const MethodSpec kCall[] = {

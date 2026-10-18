@@ -75,6 +75,7 @@ A handful of system properties tune behaviour:
 | `persist.lineage.ims.refresh.sec` | unset (window ends at max(E − 900 s, E / 2)) | Move the refresh point earlier (≥ 30 s; tests only) |
 | `persist.lineage.ims.debug.refresh_new_sa` | unset (off) | Experiment: a registration refresh offers a new Security-Client (new SPIs and port-c, same port-s) without installing new SAs; the network's answer is logged as `refresh_new_sa outcome` and shown in dumpsys. A 401 is refused by the one-AKA guard and a fresh registration follows |
 | `persist.lineage.ims.dpd.sec` | unset (300 s) | Wi-Fi calling IKE dead peer detection interval, 20..1800 s (anything else: 300 s and one warning); a device sets it in `device.mk`, IWLAN applies it at the next tunnel bring-up |
+| `persist.lineage.ims.iwlan_fallback.sec` | unset (off) | Hand IMS from Wi-Fi calling to cellular when the IWLAN data path fails: 60..3600 = the time QNS keeps IMS on cellular, 0 = off (anything else: off and one warning). Two transport failures ≥ 30 s apart on IWLAN (a REGISTER 503/408 the stack generated itself, a P-CSCF probe timeout or no route) report deregistration reason 1402. Also pushes a QNS rule for repeatedly failing IWLAN setups. QNS reads the rules once per boot: change it, then reboot. Switched off, rules an earlier boot left are cleared |
 | `persist.lineage.ims.cc_repush` | unset (off) | Push the carrier-config override again on a carrier-config change when the SIM was not loaded at the first push (Telephony saves an override to disk only then) or its content changed |
 | `persist.dbg.volte_avail_ovr` | unset | Set to `1` on `device.mk` to advertise VoLTE-by-platform when the vendor RIL doesn't |
 
@@ -87,7 +88,7 @@ dumpsys activity service org.hamelinports.ims/.HamelinPortsImsService
 The process network binding (`processBoundNetwork=none`: SIP sockets are
 pinned one by one) and a per-slot snapshot: registration state (age,
 remaining, in-flight transaction, pending retry), P-CSCF list, refresh and
-fresh-attempt counters, next check alarm.
+fresh-attempt counters, next check alarm, IWLAN fallback counters.
 
 Host unit tests of the renewal policy: `atest --host HamelinPortsImsPolicyTests`;
 of the unpinned-socket discard: `atest --host HamelinPortsImsSocketDiscardTest`;

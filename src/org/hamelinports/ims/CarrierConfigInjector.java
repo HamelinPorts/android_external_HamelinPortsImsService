@@ -13,6 +13,7 @@ import android.util.Log;
 
 import org.hamelinports.ims.config.CarrierConfigPushLedger;
 import org.hamelinports.ims.config.IwlanDpdInterval;
+import org.hamelinports.ims.config.IwlanFallbackPolicy;
 import org.xmlpull.v1.XmlPullParser;
 import org.xmlpull.v1.XmlPullParserException;
 import org.xmlpull.v1.XmlPullParserFactory;
@@ -29,6 +30,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
@@ -75,6 +77,8 @@ final class CarrierConfigInjector {
     private final Set<String> mEpdgResolved = new HashSet<>();
     private SubscriptionManager.OnSubscriptionsChangedListener mListener;
     private CarrierConfigManager.CarrierConfigChangeListener mConfigListener;
+    /** Set with the kernel defaults, once per process. */
+    private IwlanFallbackPolicy mIwlanFallback;
     /** Single-threaded background executor for the listener callback.
      *  The work it does — XML asset parsing and a DNS lookup for the
      *  ePDG FQDN — must NOT run on the main thread. */
@@ -175,6 +179,8 @@ final class CarrierConfigInjector {
                         + " — auto-enabling WFC availability");
             }
 
+            clearStaleIwlanFallbackRules(merged, subId);
+
             if (merged.isEmpty()) continue;
 
             String digest = digestOf(merged);
@@ -190,6 +196,32 @@ final class CarrierConfigInjector {
             } catch (Exception e) {
                 Log.w(TAG, "overrideConfig failed subId=" + subId + " mccmnc=" + mccmnc, e);
             }
+        }
+    }
+
+    /**
+     * With the IWLAN fallback off, overwrites QNS rule arrays that an earlier
+     * "on" left in the persistent override (keys cannot be removed by
+     * omission). A per-carrier asset that sets the key wins.
+     */
+    private void clearStaleIwlanFallbackRules(PersistableBundle merged, int subId) {
+        if (mIwlanFallback.enabled()) return;
+        PersistableBundle current;
+        try {
+            current = mCcm.getConfigForSubId(subId,
+                    IwlanFallbackPolicy.KEY_UNREGISTRATION_RULES,
+                    IwlanFallbackPolicy.KEY_INITIAL_CONNECTION_FAILURE_RULES);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "carrier config unreadable subId=" + subId + ": " + e);
+            return;
+        }
+        Map<String, String[]> clear = mIwlanFallback.overrides(
+                current.getStringArray(IwlanFallbackPolicy.KEY_UNREGISTRATION_RULES),
+                current.getStringArray(IwlanFallbackPolicy.KEY_INITIAL_CONNECTION_FAILURE_RULES));
+        for (Map.Entry<String, String[]> e : clear.entrySet()) {
+            if (merged.containsKey(e.getKey())) continue;
+            merged.putStringArray(e.getKey(), e.getValue());
+            Log.i(TAG, "IWLAN fallback off: clearing " + e.getKey() + " subId=" + subId);
         }
     }
 
@@ -297,6 +329,24 @@ final class CarrierConfigInjector {
         }
         Log.i(TAG, "IKE DPD interval " + dpd.seconds() + " s");
         b.putInt(CarrierConfigManager.Iwlan.KEY_DPD_TIMER_SEC_INT, dpd.seconds());
+
+        /* IWLAN data path failure: QNS rules that move IMS to cellular when
+         * the app reports reason 1402, or when IWLAN setups keep failing.
+         * QNS reads them once per boot. Off by default. */
+        String fallbackProperty = SystemProperties.get(IwlanFallbackPolicy.PROPERTY);
+        mIwlanFallback = IwlanFallbackPolicy.fromProperty(fallbackProperty);
+        if (mIwlanFallback.rejected()) {
+            Log.w(TAG, IwlanFallbackPolicy.PROPERTY + "=" + fallbackProperty + " is neither 0 nor "
+                    + IwlanFallbackPolicy.MIN_SEC + ".." + IwlanFallbackPolicy.MAX_SEC
+                    + " s — IWLAN fallback off");
+        }
+        if (mIwlanFallback.enabled()) {
+            for (Map.Entry<String, String[]> e : mIwlanFallback.overrides(null, null).entrySet()) {
+                b.putStringArray(e.getKey(), e.getValue());
+            }
+            Log.i(TAG, "IWLAN fallback to cellular for " + mIwlanFallback.seconds()
+                    + " s after a data path failure");
+        }
 
         mKernelDefaults = b;
         return b;

@@ -14,16 +14,21 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.PowerManager;
 import android.os.SystemClock;
+import android.system.ErrnoException;
+import android.system.OsConstants;
 import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyManager;
 import android.telephony.ims.ImsReasonInfo;
 import android.telephony.ims.stub.ImsRegistrationImplBase;
 import android.util.Log;
 
+import org.hamelinports.ims.config.IwlanFallbackPolicy;
 import org.hamelinports.ims.modem.IImsModemBridge;
 import org.hamelinports.ims.modem.ImsModemBridgeFactory;
 import org.hamelinports.ims.reg.AttemptReadiness;
 import org.hamelinports.ims.reg.DeferredRequests;
+import org.hamelinports.ims.reg.ImsPdnWatchdogPolicy;
+import org.hamelinports.ims.reg.IwlanFallbackTracker;
 import org.hamelinports.ims.reg.OutgoingGate;
 import org.hamelinports.ims.reg.RefreshPolicy;
 import org.hamelinports.ims.reg.RegistrationSnapshot;
@@ -37,7 +42,9 @@ import org.hamelinports.ims.sip.SipClient;
 
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.NoRouteToHostException;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -62,10 +69,9 @@ public class ImsRegistrationController {
     private static final String WAKELOCK_TAG = "HamelinPortsIms:reg";
     private static final String DEFERRAL_ALARM_TAG = "HamelinPortsIms:mo-deferral";
     private static final long DEFERRAL_ALARM_WINDOW_MS = 1000;
+    private static final String WATCHDOG_ALARM_TAG = "HamelinPortsIms:pdn-watchdog";
     /** Lets the in-flight SIP transactions drain before the stack is stopped. */
     private static final long STACK_DRAIN_MS = 2000;
-    /** Watchdog: IMS APN non-CONNECTED on every transport for this long forces a teardown. */
-    private static final long IMS_PDN_WATCHDOG_MS = 15_000L;
     private static final int DEFAULT_REQUESTED_EXPIRES_SEC = 3600;
     private static final int MIN_REQUESTED_EXPIRES_SEC = 60;
     /** Experiment switch: a refresh offers a new Security-Client (see refreshSecurityClient). */
@@ -101,7 +107,13 @@ public class ImsRegistrationController {
     private long mWakeLockSinceMs;
     private int mLastWwanImsState = android.telephony.TelephonyManager.DATA_DISCONNECTED;
     private int mLastWlanImsState = android.telephony.TelephonyManager.DATA_DISCONNECTED;
+    /** One watchdog alarm per episode without a CONNECTED IMS PDN. */
     private boolean mImsPdnWatchdogArmed;
+    private long mImsPdnWatchdogSinceMs = -1;
+    /** Transport failures on IWLAN and the pending report that hands IMS to cellular. */
+    private final IwlanFallbackTracker mFallback = new IwlanFallbackTracker();
+    /** Token for the end of a pending IWLAN fallback report. */
+    private final Object mFallbackExpiry = new Object();
     /** The framework wants IMS on this slot (feature ready / enableImsForSubscription). */
     private boolean mImsEnabled;
     /** Subscription the machine runs for, or NO_SUBSCRIPTION while stopped. */
@@ -130,6 +142,7 @@ public class ImsRegistrationController {
     /** Published as one object: readers never pair values of two states. */
     private volatile RegistrationSnapshot mSnapshot = RegistrationSnapshot.NONE;
     private volatile String mStateSummary = "";
+    private volatile String mFallbackSummary = "";
     /** MO lapse checks posted but not yet run; MO requests wait for them. */
     private final AtomicInteger mPendingOutgoingChecks = new AtomicInteger();
     private final DeferredRequests mDeferred = new DeferredRequests();
@@ -143,6 +156,7 @@ public class ImsRegistrationController {
         mDeferralAlarmAtMs = -1;   /* fired: re-arm for whatever is still queued */
         publishState();
     };
+    private final AlarmManager.OnAlarmListener mImsPdnWatchdogAlarm = this::onImsPdnWatchdogAlarm;
 
     private final BroadcastReceiver mWakeSignalReceiver = new BroadcastReceiver() {
         @Override
@@ -441,8 +455,9 @@ public class ImsRegistrationController {
         mState.setRunning(false);
         mRunningSubId = SlotActivation.NO_SUBSCRIPTION;
         mWaitingForSim = false;
-        mHandler.removeCallbacks(mImsPdnWatchdogRunnable);
-        mImsPdnWatchdogArmed = false;
+        cancelImsPdnWatchdog();
+        mFallback.reset();
+        mHandler.removeCallbacksAndMessages(mFallbackExpiry);
         if (mTelCallback != null) {
             try {
                 android.telephony.TelephonyManager tm =
@@ -571,6 +586,10 @@ public class ImsRegistrationController {
             boolean callActive = isCallActive();
             Log.i(TAG, "IMS PDN iface swap " + mLastBoundIface + " -> " + iface
                     + " (callActive=" + callActive + ")");
+            if (mFallback.onIfaceChanged(SystemClock.elapsedRealtime(), isIwlanIface(iface))) {
+                Log.i(TAG, "IWLAN fallback taken: IMS moved " + mLastBoundIface + " -> " + iface);
+                endFallbackPending();
+            }
             /* Latch now: the framework fires this callback twice in a row. */
             mLastBoundIface = iface;
             mPcscfAttempt = 0;
@@ -633,30 +652,86 @@ public class ImsRegistrationController {
             becameConnected = st == connected && mLastWlanImsState != connected;
             mLastWlanImsState = st;
         }
-        boolean anyHealthy = mLastWwanImsState == connected || mLastWlanImsState == connected;
-        if (anyHealthy) {
-            if (mImsPdnWatchdogArmed) {
-                mHandler.removeCallbacks(mImsPdnWatchdogRunnable);
-                mImsPdnWatchdogArmed = false;
-            }
-        } else if (!mImsPdnWatchdogArmed) {
-            mImsPdnWatchdogArmed = true;
-            mHandler.postDelayed(mImsPdnWatchdogRunnable, IMS_PDN_WATCHDOG_MS);
+        if (isImsPdnConnected()) {
+            cancelImsPdnWatchdog();
+        } else {
+            maybeArmImsPdnWatchdog();
         }
         if (becameConnected) {
             checkRegistration("PDN_CONNECTED");
         }
     }
 
-    /**
-     * Fires when the IMS APN stays non-CONNECTED on both transports: a
-     * handover that collided with a radio-state change can leave the PDN half
-     * alive without onLost. Tear down and re-request the network.
-     */
-    private final Runnable mImsPdnWatchdogRunnable = () -> {
+    private boolean isImsPdnConnected() {
+        final int connected = TelephonyManager.DATA_CONNECTED;
+        return mLastWwanImsState == connected || mLastWlanImsState == connected;
+    }
+
+    /** A transport is still bringing the IMS PDN up or handing it over. */
+    private boolean isImsPdnBringupRunning() {
+        return isBringupState(mLastWwanImsState) || isBringupState(mLastWlanImsState);
+    }
+
+    private static boolean isBringupState(int state) {
+        return state == TelephonyManager.DATA_CONNECTING
+                || state == TelephonyManager.DATA_HANDOVER_IN_PROGRESS;
+    }
+
+    /** Starts the watchdog for this episode; an exact alarm, so it also runs in suspend. */
+    private void maybeArmImsPdnWatchdog() {
+        long now = SystemClock.elapsedRealtime();
+        if (!mState.isRunning() || !ImsPdnWatchdogPolicy.shouldArm(isImsPdnConnected(),
+                mImsPdnWatchdogArmed, mFallback.isPending(now))) {
+            return;
+        }
+        mImsPdnWatchdogArmed = true;
+        mImsPdnWatchdogSinceMs = now;
+        setImsPdnWatchdogAlarm(now + ImsPdnWatchdogPolicy.CHECK_MS);
+    }
+
+    private void setImsPdnWatchdogAlarm(long atMs) {
+        /* UID 1000 is exempt from the exact-alarm permission and Doze deferral. */
+        mAlarmManager.setExact(AlarmManager.ELAPSED_REALTIME_WAKEUP, atMs, WATCHDOG_ALARM_TAG,
+                mImsPdnWatchdogAlarm, mHandler);
+    }
+
+    private void cancelImsPdnWatchdog() {
+        if (!mImsPdnWatchdogArmed) return;
+        mAlarmManager.cancel(mImsPdnWatchdogAlarm);
         mImsPdnWatchdogArmed = false;
+        mImsPdnWatchdogSinceMs = -1;
+    }
+
+    /**
+     * Runs when the IMS APN stays non-CONNECTED on both transports: a
+     * handover that collided with a radio-state change can leave the PDN half
+     * alive without onLost. A bring-up still in progress gets until the
+     * bound; then tear down and re-request the network.
+     */
+    private void onImsPdnWatchdogAlarm() {
+        /* A fire already queued on the handler survives cancel(). */
+        if (!mImsPdnWatchdogArmed) return;
+        long now = SystemClock.elapsedRealtime();
+        long since = mImsPdnWatchdogSinceMs;
+        ImsPdnWatchdogPolicy.Verdict verdict = ImsPdnWatchdogPolicy.onFire(now, since,
+                isImsPdnConnected(), isImsPdnBringupRunning(), mFallback.isPending(now));
+        if (verdict == ImsPdnWatchdogPolicy.Verdict.RECHECK) {
+            long at = ImsPdnWatchdogPolicy.recheckAtMs(now, since);
+            Log.i(TAG, "IMS PDN watchdog: bring-up still running (wwan=" + mLastWwanImsState
+                    + " wlan=" + mLastWlanImsState + ") after " + (now - since) / 1000
+                    + " s — re-checking in " + (at - now) / 1000 + " s");
+            setImsPdnWatchdogAlarm(at);
+            return;
+        }
+        mImsPdnWatchdogArmed = false;
+        mImsPdnWatchdogSinceMs = -1;
+        if (verdict == ImsPdnWatchdogPolicy.Verdict.STAND_DOWN) {
+            Log.i(TAG, "IMS PDN watchdog stands down (connected=" + isImsPdnConnected()
+                    + " fallbackPending=" + mFallback.isPending(now) + ")");
+            return;
+        }
         Log.w(TAG, "IMS PDN stuck non-CONNECTED on both transports for "
-                + (IMS_PDN_WATCHDOG_MS / 1000) + " s — forcing teardown");
+                + (now - since) / 1000 + " s — forcing teardown");
         mImsNetwork = null;
         mPcscfs = null;
         tearDown();
@@ -668,7 +743,77 @@ public class ImsRegistrationController {
         if (mState.isRunning()) {
             requestImsNetwork();
         }
-    };
+    }
+
+    private static boolean isIwlanIface(String iface) {
+        return iface != null && iface.startsWith("ipsec");
+    }
+
+    /**
+     * A transport-class failure: a REGISTER failure the stack generated
+     * itself, or a P-CSCF probe that timed out or found no route. On IWLAN
+     * enough of them report the data path as failed (see
+     * {@link IwlanFallbackTracker}); inert while {@value IwlanFallbackPolicy#PROPERTY}
+     * is off.
+     */
+    private void onTransportFailure(String evidence) {
+        long now = SystemClock.elapsedRealtime();
+        IwlanFallbackPolicy policy = IwlanFallbackPolicy.fromProperty(
+                android.os.SystemProperties.get(IwlanFallbackPolicy.PROPERTY));
+        IwlanFallbackTracker.Decision decision = mFallback.onTransportFailure(now,
+                policy.enabled(), isIwlanIface(mLastBoundIface),
+                mLastWlanImsState == TelephonyManager.DATA_CONNECTED, isCallActive());
+        switch (decision) {
+            case IGNORED:
+                return;
+            case REPORT:
+                reportIwlanFallback(evidence, now);
+                return;
+            default:
+                Log.i(TAG, "IWLAN transport failure (" + evidence + "): " + decision
+                        + " failures=" + mFallback.failures() + "/"
+                        + IwlanFallbackTracker.FAILURES_TO_REPORT);
+        }
+    }
+
+    /**
+     * Reports the failed IWLAN data path as deregistration reason 1402 while
+     * the IMS PDN is still up on WLAN; QNS then restricts Wi-Fi for IMS and
+     * hands the PDN over to cellular, and the idle iface swap registers
+     * there. Sent even if the framework already saw a deregistration: QNS
+     * acts on the reason of each one. IWLAN retries and the PDN watchdog wait
+     * while the report is pending, since a PDN disconnect would lift the
+     * restriction.
+     */
+    private void reportIwlanFallback(String evidence, long now) {
+        long pendingUntil = mFallback.pendingUntilMs();
+        Log.w(TAG, "IWLAN data path failed (" + evidence + ", "
+                + IwlanFallbackTracker.FAILURES_TO_REPORT + " transport failures on "
+                + mLastBoundIface + ") — reporting deregistration reason "
+                + IwlanFallbackPolicy.REASON_EPDG_TUNNEL_LOST_CONNECTION
+                + " so QNS moves IMS to cellular; IWLAN retries held for "
+                + (pendingUntil - now) / 1000 + " s");
+        cancelImsPdnWatchdog();
+        mState.deferFresh(pendingUntil);
+        notifyDeregistered(IwlanFallbackPolicy.REASON_EPDG_TUNNEL_LOST_CONNECTION, 0, true);
+        mHandler.removeCallbacksAndMessages(mFallbackExpiry);
+        mHandler.postAtTime(() -> checkRegistration("FALLBACK_EXPIRED"), mFallbackExpiry,
+                SystemClock.uptimeMillis() + (pendingUntil - now));
+    }
+
+    /** A pending report that ran out without the swap: log it once and resume retries. */
+    private void expireFallbackPending(long now) {
+        if (!mFallback.expirePending(now)) return;
+        Log.w(TAG, "IWLAN fallback not taken: IMS still on " + mLastBoundIface + " "
+                + IwlanFallbackTracker.PENDING_MS / 1000
+                + " s after the report — resuming registration retries");
+        endFallbackPending();
+    }
+
+    private void endFallbackPending() {
+        mHandler.removeCallbacksAndMessages(mFallbackExpiry);
+        maybeArmImsPdnWatchdog();
+    }
 
     /**
      * Applies the registration age rule (see {@link RefreshPolicy#decide}).
@@ -677,6 +822,7 @@ public class ImsRegistrationController {
      */
     private void checkRegistration(String trigger) {
         long now = SystemClock.elapsedRealtime();
+        expireFallbackPending(now);
         RefreshPolicy.Action action = RefreshPolicy.decide(mState, now);
         switch (action) {
             case REFRESH:
@@ -687,6 +833,12 @@ public class ImsRegistrationController {
                     /* Stopping the stack would drop the call's dialog. */
                     mState.deferFresh(now + RefreshPolicy.ACTIVE_CALL_RECHECK_MS);
                     Log.i(TAG, "fresh registration deferred: call active trigger=" + trigger);
+                    break;
+                }
+                if (mFallback.isPending(now)) {
+                    mState.deferFresh(mFallback.pendingUntilMs());
+                    Log.i(TAG, "fresh registration deferred: IWLAN fallback report pending"
+                            + " trigger=" + trigger);
                     break;
                 }
                 logFreshReason(trigger, now);
@@ -859,6 +1011,11 @@ public class ImsRegistrationController {
 
     private void reportDeregistered(int reasonCode, int sipCode, boolean notifyModem) {
         if (!mFrameworkRegistered) return;
+        notifyDeregistered(reasonCode, sipCode, notifyModem);
+    }
+
+    /** Tells the framework (and optionally the modem) unconditionally. */
+    private void notifyDeregistered(int reasonCode, int sipCode, boolean notifyModem) {
         mFrameworkRegistered = false;
         mRegImpl.onDeregistered(new ImsReasonInfo(reasonCode, sipCode));
         if (!notifyModem) return;
@@ -902,8 +1059,9 @@ public class ImsRegistrationController {
                 mHandler.post(() -> handleRegistered(gen, associatedUri));
             }
             @Override public void onDeregistered(int statusCode, String reason,
-                                                 int retryAfterSec) {
-                mHandler.post(() -> handleDeregistered(gen, statusCode, reason, retryAfterSec));
+                                                 int retryAfterSec, boolean fromWire) {
+                mHandler.post(() -> handleDeregistered(gen, statusCode, reason, retryAfterSec,
+                        fromWire));
             }
         };
     }
@@ -914,6 +1072,7 @@ public class ImsRegistrationController {
             return;
         }
         logNewSaOutcome("200 OK, no re-authentication");
+        mFallback.onPathProven();
         long now = SystemClock.elapsedRealtime();
         int expires = mReportedExpiresSec > 0 ? mReportedExpiresSec : mRequestedExpiresSec;
         Log.i(TAG, "*** IMS REGISTERED (native) *** gen=" + gen + " expiresS=" + expires);
@@ -951,14 +1110,20 @@ public class ImsRegistrationController {
         publishState();
     }
 
-    private void handleDeregistered(int gen, int statusCode, String reason, int retryAfterSec) {
+    private void handleDeregistered(int gen, int statusCode, String reason, int retryAfterSec,
+            boolean fromWire) {
         if (!mState.isCurrent(gen)) {
             Log.i(TAG, "dropping REGISTER failure " + statusCode + " of stale gen=" + gen);
             return;
         }
         long now = SystemClock.elapsedRealtime();
         Log.w(TAG, "REGISTER failed/removed: " + statusCode + " " + reason
-                + " retryAfter=" + retryAfterSec + " gen=" + gen);
+                + " retryAfter=" + retryAfterSec + " fromWire=" + fromWire + " gen=" + gen);
+        if (IwlanFallbackTracker.isLocalTransportFailure(statusCode, fromWire)) {
+            onTransportFailure("local REGISTER " + statusCode);
+        } else if (fromWire) {
+            mFallback.onPathProven();
+        }
         mDiag.onDeregistered(statusCode, reason);
         logNewSaOutcome(statusCode == 401
                 ? "401, the network re-authenticates (the one-AKA guard refuses; a fresh"
@@ -991,7 +1156,13 @@ public class ImsRegistrationController {
         List<InetAddress> pcscfs = mPcscfs;
         if (statusCode == 408 && pcscfs != null && mPcscfAttempt + 1 < pcscfs.size()) {
             final int next = mPcscfAttempt + 1;
-            Log.i(TAG, "P-CSCF failover after 408: trying " + (next + 1) + "/" + pcscfs.size());
+            /* A pending IWLAN fallback report holds the failover until it
+             * resolves; the swap to cellular drops it with the generation.
+             * The failover wakelock outlasts the hold. */
+            long delayMs = mFallback.isPending(now)
+                    ? Math.max(STACK_DRAIN_MS, mFallback.pendingUntilMs() - now) : STACK_DRAIN_MS;
+            Log.i(TAG, "P-CSCF failover after 408: trying " + (next + 1) + "/" + pcscfs.size()
+                    + " in " + delayMs / 1000 + " s");
             /* Part of the same fresh cycle: MO requests keep waiting, and the
              * new generation drops late callbacks of the stack being replaced. */
             int failoverGen = mState.beginFresh(now);
@@ -1002,7 +1173,7 @@ public class ImsRegistrationController {
                 startFreshRegistration("pcscf-failover");
                 armNextCheck();
                 publishState();
-            }, mDelayedRegWork, STACK_DRAIN_MS);
+            }, mDelayedRegWork, delayMs);
         } else {
             failTerminally(statusCode, "post-failure " + statusCode);
         }
@@ -1070,6 +1241,7 @@ public class ImsRegistrationController {
         RegistrationSnapshot snapshot = mState.snapshot(now);
         mSnapshot = snapshot;
         mStateSummary = mState.describe(now);
+        mFallbackSummary = mFallback.describe(now);
         return snapshot;
     }
 
@@ -1120,9 +1292,16 @@ public class ImsRegistrationController {
             localIp = stripScope(probe.getLocalAddress().getHostAddress());
             localAddr = probe.getLocalAddress();
         } catch (Exception e) {
-            Log.e(TAG, "couldn't determine local IP via P-CSCF probe", e);
+            IwlanFallbackTracker.ProbeResult result = probeResultOf(e);
+            Log.e(TAG, "couldn't determine local IP via P-CSCF probe (" + result + ")", e);
+            if (IwlanFallbackTracker.isTransportFailure(result)) {
+                onTransportFailure("P-CSCF probe " + result);
+            } else if (IwlanFallbackTracker.provesPath(result)) {
+                mFallback.onPathProven();
+            }
             return false;
         }
+        mFallback.onPathProven();
         Log.i(TAG, "local IMS PDN address = " + localIp);
 
         String securityClient = ueSec.headerValue();
@@ -1187,6 +1366,37 @@ public class ImsRegistrationController {
         pw.println("  refresh_new_sa: enabled="
                 + android.os.SystemProperties.getBoolean(REFRESH_NEW_SA_PROPERTY, false)
                 + " lastOutcome=" + mDiag.mLastNewSaOutcome);
+        IwlanFallbackPolicy fallback = IwlanFallbackPolicy.fromProperty(
+                android.os.SystemProperties.get(IwlanFallbackPolicy.PROPERTY));
+        pw.println("  iwlanFallback: enabled=" + fallback.enabled()
+                + " holdS=" + fallback.seconds() + " " + mFallbackSummary);
+    }
+
+    /**
+     * Classifies a failed P-CSCF probe. libcore throws SocketTimeoutException
+     * for a timeout (also ETIMEDOUT), NoRouteToHostException for EHOSTUNREACH
+     * and EADDRNOTAVAIL, and ConnectException carrying the ErrnoException
+     * otherwise.
+     */
+    private static IwlanFallbackTracker.ProbeResult probeResultOf(Exception e) {
+        if (e instanceof SocketTimeoutException) {
+            return IwlanFallbackTracker.ProbeResult.TIMED_OUT;
+        }
+        if (e instanceof NoRouteToHostException) {
+            return IwlanFallbackTracker.ProbeResult.UNREACHABLE;
+        }
+        for (Throwable t = e.getCause(); t != null; t = t.getCause()) {
+            if (!(t instanceof ErrnoException)) continue;
+            int errno = ((ErrnoException) t).errno;
+            if (errno == OsConstants.ENETUNREACH || errno == OsConstants.EHOSTUNREACH) {
+                return IwlanFallbackTracker.ProbeResult.UNREACHABLE;
+            }
+            if (errno == OsConstants.ECONNREFUSED) {
+                return IwlanFallbackTracker.ProbeResult.REFUSED;
+            }
+            break;
+        }
+        return IwlanFallbackTracker.ProbeResult.OTHER;
     }
 
     private static String fmtAgo(long nowMs, long thenMs) {

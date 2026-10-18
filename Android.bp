@@ -26,8 +26,8 @@ android_app {
 }
 
 // Host unit tests of the registration policy, slot activation, the IWLAN
-// DPD interval, the carrier-config push ledger and the Security-Client
-// offer (pure Java, no device):
+// DPD interval and fallback, the carrier-config push ledger, the PDN
+// watchdog and the Security-Client offer (pure Java, no device):
 //   atest --host HamelinPortsImsPolicyTests
 java_test_host {
     name: "HamelinPortsImsPolicyTests",

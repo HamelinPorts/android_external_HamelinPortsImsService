@@ -87,16 +87,26 @@ bridge implementation.
   screen on / Doze exit / PDN change / MO request). It runs only while the
   framework enables IMS on the slot and the slot has an active
   subscription; a slot without a SIM stays idle (no retry, no alarm).
+  With `persist.lineage.ims.iwlan_fallback.sec` set, a failed IWLAN data
+  path (the tunnel looks up, the P-CSCF does not answer) is reported as
+  deregistration reason 1402, and QNS hands IMS over to cellular. An
+  IMS-PDN watchdog (exact alarm) re-requests a PDN stuck without a
+  CONNECTED transport.
 - `CarrierConfigInjector.java` — one per process: pushes the carrier-config
-  overrides (kernel-supported IPsec algorithms, DPD interval, per-carrier
-  assets) as a persistent override.
+  overrides (kernel-supported IPsec algorithms, DPD interval, the QNS
+  fallback rules, per-carrier assets) as a persistent override.
 - `reg/` — `RefreshPolicy` (renewal window, lapse rule, retry floor and
   budget), `RegistrationState`, `SlotActivation` (start/stop/restart per
-  subscription, credential status → retry or idle) and `AttemptReadiness`
+  subscription, credential status → retry or idle), `AttemptReadiness`
   (no IMS network handle, P-CSCF or credentials → the attempt is not sent
-  and goes through the retry budget); pure Java, host-tested.
-- `config/` — `IwlanDpdInterval` and `CarrierConfigPushLedger` (when an
-  override is pushed again); pure Java, host-tested.
+  and goes through the retry budget), `IwlanFallbackTracker` (transport
+  failures on IWLAN → when to report, pending, taken / not taken) and
+  `ImsPdnWatchdogPolicy` (when the watchdog tears down); pure Java,
+  host-tested.
+- `config/` — `IwlanDpdInterval`, `IwlanFallbackPolicy` (the property → the
+  QNS rule arrays, or empty arrays to clear stale ones) and
+  `CarrierConfigPushLedger` (when an override is pushed again); pure Java,
+  host-tested.
 - `HamelinPortsCallSession.java` / `HamelinPortsIncomingCallSession.java` —
   MO and MT IMS call profiles + SDP negotiation.
 - `HamelinPortsSmsImpl.java` — SIP MESSAGE-based MO and MT SMS.
@@ -360,6 +370,8 @@ binding (`processBoundNetwork=none` expected) and, per slot:
 - next check alarm
 - the `refresh_new_sa` experiment switch and the network's last answer to
   a refresh that offered a new Security-Client
+- `iwlanFallback`: enabled and hold time, counted transport failures,
+  reports / taken / not taken, the last report and a pending one
 
 ## Known limitations
 
