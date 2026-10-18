@@ -110,6 +110,9 @@ public class ImsRegistrationController {
     /** One watchdog alarm per episode without a CONNECTED IMS PDN. */
     private boolean mImsPdnWatchdogArmed;
     private long mImsPdnWatchdogSinceMs = -1;
+    /** Numbers the episodes; each episode's alarm listener carries its own. */
+    private int mImsPdnWatchdogEpisode;
+    private AlarmManager.OnAlarmListener mImsPdnWatchdogAlarm;
     /** Transport failures on IWLAN and the pending report that hands IMS to cellular. */
     private final IwlanFallbackTracker mFallback = new IwlanFallbackTracker();
     /** Token for the end of a pending IWLAN fallback report. */
@@ -156,7 +159,6 @@ public class ImsRegistrationController {
         mDeferralAlarmAtMs = -1;   /* fired: re-arm for whatever is still queued */
         publishState();
     };
-    private final AlarmManager.OnAlarmListener mImsPdnWatchdogAlarm = this::onImsPdnWatchdogAlarm;
 
     private final BroadcastReceiver mWakeSignalReceiver = new BroadcastReceiver() {
         @Override
@@ -686,6 +688,8 @@ public class ImsRegistrationController {
         }
         mImsPdnWatchdogArmed = true;
         mImsPdnWatchdogSinceMs = now;
+        final int episode = ++mImsPdnWatchdogEpisode;
+        mImsPdnWatchdogAlarm = () -> onImsPdnWatchdogAlarm(episode);
         setImsPdnWatchdogAlarm(now + ImsPdnWatchdogPolicy.CHECK_MS);
     }
 
@@ -708,9 +712,12 @@ public class ImsRegistrationController {
      * alive without onLost. A bring-up still in progress gets until the
      * bound; then tear down and re-request the network.
      */
-    private void onImsPdnWatchdogAlarm() {
-        /* A fire already queued on the handler survives cancel(). */
-        if (!mImsPdnWatchdogArmed) return;
+    private void onImsPdnWatchdogAlarm(int episode) {
+        /* A fire already queued on the handler survives cancel(), also into a later episode. */
+        if (!ImsPdnWatchdogPolicy.isCurrentFire(mImsPdnWatchdogArmed, episode,
+                mImsPdnWatchdogEpisode)) {
+            return;
+        }
         long now = SystemClock.elapsedRealtime();
         long since = mImsPdnWatchdogSinceMs;
         ImsPdnWatchdogPolicy.Verdict verdict = ImsPdnWatchdogPolicy.onFire(now, since,

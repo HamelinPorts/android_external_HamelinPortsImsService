@@ -59,6 +59,15 @@ public class ImsPdnWatchdogPolicyTest {
         assertEquals(T0 + 90_000, ImsPdnWatchdogPolicy.recheckAtMs(T0 + 90_000, T0));
     }
 
+    /** A fire queued before a cancel must not act as the next episode's check. */
+    @Test
+    public void staleFireFromAnEarlierEpisodeIsIgnored() {
+        assertTrue(ImsPdnWatchdogPolicy.isCurrentFire(true, 3, 3));
+        assertFalse("cancelled, not re-armed", ImsPdnWatchdogPolicy.isCurrentFire(false, 3, 3));
+        assertFalse("re-armed for episode 4", ImsPdnWatchdogPolicy.isCurrentFire(true, 3, 4));
+        assertFalse(ImsPdnWatchdogPolicy.isCurrentFire(false, 3, 4));
+    }
+
     @Test
     public void constants() {
         assertEquals(15_000L, ImsPdnWatchdogPolicy.CHECK_MS);

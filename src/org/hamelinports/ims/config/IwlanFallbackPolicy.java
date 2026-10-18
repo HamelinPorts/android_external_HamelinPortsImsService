@@ -2,6 +2,8 @@ package org.hamelinports.ims.config;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.function.Predicate;
+import java.util.regex.Pattern;
 
 /**
  * Hand-over of IMS from Wi-Fi calling to cellular when the IWLAN data path
@@ -12,8 +14,9 @@ import java.util.Map;
  *
  * <p>The QNS rules are carrier-config string arrays. A persistent override
  * is merged into the stored one key by key, so a key cannot be removed by
- * leaving it out: with the feature off, a key that still holds rules is
- * overwritten with an empty array.
+ * leaving it out: with the feature off, a key that still holds this policy's
+ * rules (and nothing else) is overwritten with an empty array. Rules of any
+ * other shape belong to the carrier and are left alone.
  *
  * <p>Pure Java, so the host tests drive it directly.
  */
@@ -41,6 +44,9 @@ public final class IwlanFallbackPolicy {
      * 10 min, at most 3 times (QNS RestrictManager).
      */
     static final String INITIAL_CONNECTION_FAILURE_RULE = "ims:1:60000:600000:3";
+    /** {@link #unregistrationRule()} for any hold time. */
+    private static final Pattern OWN_UNREGISTRATION_RULE =
+            Pattern.compile("cause=" + REASON_EPDG_TUNNEL_LOST_CONNECTION + ", time=[0-9]+");
 
     private final int mSeconds;
     private final boolean mRejected;
@@ -91,8 +97,8 @@ public final class IwlanFallbackPolicy {
 
     /**
      * Carrier-config string arrays to push. On: both rule arrays. Off: an
-     * empty array for each key whose current merged value still holds rules
-     * (a stale override from an earlier "on"); nothing otherwise.
+     * empty array for each key whose current merged value holds only this
+     * policy's rules (a stale override from an earlier "on"); nothing otherwise.
      *
      * @param currentUnregistration current value of {@link #KEY_UNREGISTRATION_RULES}, or null
      * @param currentInitialFailure current value of {@link #KEY_INITIAL_CONNECTION_FAILURE_RULES}, or null
@@ -106,16 +112,22 @@ public final class IwlanFallbackPolicy {
                     new String[] {INITIAL_CONNECTION_FAILURE_RULE});
             return out;
         }
-        if (holdsRules(currentUnregistration)) {
+        if (holdsOnlyOwnRules(currentUnregistration,
+                rule -> OWN_UNREGISTRATION_RULE.matcher(rule).matches())) {
             out.put(KEY_UNREGISTRATION_RULES, new String[0]);
         }
-        if (holdsRules(currentInitialFailure)) {
+        if (holdsOnlyOwnRules(currentInitialFailure, INITIAL_CONNECTION_FAILURE_RULE::equals)) {
             out.put(KEY_INITIAL_CONNECTION_FAILURE_RULES, new String[0]);
         }
         return out;
     }
 
-    private static boolean holdsRules(String[] value) {
-        return value != null && value.length > 0;
+    /** Non-empty, and every rule has this policy's shape. */
+    private static boolean holdsOnlyOwnRules(String[] value, Predicate<String> own) {
+        if (value == null || value.length == 0) return false;
+        for (String rule : value) {
+            if (rule == null || !own.test(rule)) return false;
+        }
+        return true;
     }
 }

@@ -33,6 +33,14 @@ public final class ImsPdnWatchdogPolicy {
     }
 
     /**
+     * A fire acts only for the episode it was armed in: one queued before a
+     * cancel can run after the next episode was armed.
+     */
+    public static boolean isCurrentFire(boolean armed, int fireEpisode, int currentEpisode) {
+        return armed && fireEpisode == currentEpisode;
+    }
+
+    /**
      * @param episodeStartMs   when the watchdog was armed for this episode
      * @param bringupInProgress a transport is CONNECTING or HANDOVER_IN_PROGRESS
      */

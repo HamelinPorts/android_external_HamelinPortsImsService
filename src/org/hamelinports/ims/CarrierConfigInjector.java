@@ -184,7 +184,7 @@ final class CarrierConfigInjector {
             if (merged.isEmpty()) continue;
 
             String digest = digestOf(merged);
-            boolean simLoaded = isSimLoaded(s.getSimSlotIndex());
+            boolean simLoaded = isSimLoaded(subId);
             if (!mLedger.shouldPush(subId, mccmnc, digest, simLoaded)) continue;
 
             try {
@@ -225,9 +225,14 @@ final class CarrierConfigInjector {
         }
     }
 
-    private boolean isSimLoaded(int slotIndex) {
-        return mTm != null && slotIndex >= 0
-                && mTm.getSimState(slotIndex) == TelephonyManager.SIM_STATE_LOADED;
+    /**
+     * The SIM application of the subscription is LOADED, the state in which
+     * Telephony saves an override. getSimState() cannot tell: it reports
+     * LOADED as READY.
+     */
+    private boolean isSimLoaded(int subId) {
+        return mTm != null && mTm.createForSubscriptionId(subId).getSimApplicationState()
+                == TelephonyManager.SIM_STATE_LOADED;
     }
 
     /** SHA-256 of the bundle's serialised form, or "" if it cannot be serialised. */

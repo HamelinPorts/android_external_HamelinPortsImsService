@@ -135,6 +135,34 @@ public class IwlanFallbackPolicyTest {
         assertArrayEquals(new String[0], initialOnly.get(INITIAL));
     }
 
+    /** Off: rules of another shape belong to the carrier and are never blanked. */
+    @Test
+    public void offLeavesForeignRulesAlone() {
+        IwlanFallbackPolicy off = IwlanFallbackPolicy.fromProperty(null);
+        assertTrue(off.overrides(new String[] {"cause=321~378|1503, time=60000, preference=cell"},
+                new String[] {"ims:3:60000:10000:2"}).isEmpty());
+        assertTrue("1402 for the carrier's own reasons, another shape", off.overrides(
+                new String[] {"cause=1402|1403, time=60000"}, null).isEmpty());
+        assertTrue("trailing preference", off.overrides(
+                new String[] {"cause=1402, time=1800000, preference=wifi"}, null).isEmpty());
+        assertTrue("mixed with ours", off.overrides(
+                new String[] {"cause=1402, time=1800000", "cause=240, time=90000"},
+                new String[] {"ims:1:60000:600000:3", "mms:1:10000:60000:2"}).isEmpty());
+        assertTrue("null item", off.overrides(new String[] {null}, new String[] {null}).isEmpty());
+    }
+
+    @Test
+    public void offClearsOurRulesForAnyHoldTime() {
+        IwlanFallbackPolicy off = IwlanFallbackPolicy.fromProperty("0");
+        Map<String, String[]> o = off.overrides(new String[] {"cause=1402, time=180000"},
+                new String[] {"ims:1:60000:600000:3", "ims:1:60000:600000:3"});
+        assertArrayEquals(new String[0], o.get(UNREG));
+        assertArrayEquals(new String[0], o.get(INITIAL));
+        assertTrue(off.overrides(new String[] {"cause=1402, time="}, null).isEmpty());
+        assertTrue(off.overrides(new String[] {"cause=1402, time=1800000x"}, null).isEmpty());
+        assertTrue(off.overrides(null, new String[] {"ims:1:60000:600000:30"}).isEmpty());
+    }
+
     @Test
     public void namesMatchQnsAndTheDevice() {
         assertEquals("persist.lineage.ims.iwlan_fallback.sec", IwlanFallbackPolicy.PROPERTY);
