@@ -59,6 +59,19 @@ cc_test_host {
     },
 }
 
+// Host test that the SIP diagnostic log lines carry no phone number, IMSI,
+// user part or UE address:
+//   atest --host HamelinPortsImsLogRedactTest
+cc_test_host {
+    name: "HamelinPortsImsLogRedactTest",
+    srcs: ["tests/host/native/sip_log_redact_test.cpp"],
+    local_include_dirs: ["jni"],
+    gtest: false,
+    test_options: {
+        unit_test: true,
+    },
+}
+
 // Host test of the socket()/connect() guard, linked with the same wrap flags
 // as the JNI library:
 //   atest --host HamelinPortsImsSocketGuardTest

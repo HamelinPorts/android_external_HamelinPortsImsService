@@ -377,7 +377,12 @@ binding (`processBoundNetwork=none` expected) and, per slot:
 - `iwlanFallback`: enabled and hold time, counted transport failures,
   reports / taken / not taken, the last report and a pending one
 
-The app logs the decoded RP-ERROR with its raw octets (no address element).
+The JNI logs, one line each and with identities masked
+(`jni/sip_log_redact.h`, host test `HamelinPortsImsLogRedactTest`): the
+Contacts of every REGISTER 200 OK (count, `+g.3gpp.smsip`, address family and
+port), and the PAI host plus Warning / Reason / P-Debug-Info of the answer to
+an MO MESSAGE and of every inbound MESSAGE (`sm-submit-report` marked). The
+app logs the decoded RP-ERROR with its raw octets (no address element).
 
 ## Known limitations
 

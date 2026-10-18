@@ -45,6 +45,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "sip_log_redact.h"
 #include "sip_socket_discard.h"
 #include "sip_socket_guard.h"
 
@@ -65,6 +66,7 @@
 #include "resip/stack/Uri.hxx"
 #include "resip/stack/Token.hxx"
 #include "resip/stack/MethodTypes.hxx"
+#include "resip/stack/ExtensionHeader.hxx"
 #include "resip/stack/ExtensionParameter.hxx"
 #include "resip/stack/SdpContents.hxx"
 #include "resip/stack/PlainContents.hxx"
@@ -840,6 +842,80 @@ private:
 };
 
 /* --------------------------------------------------------------------- *
+ * Diagnostic fragments for the SMS and registration log lines. Identities
+ * are masked (sip_log_redact.h): no phone number, IMSI, user part or UE
+ * address reaches the log.
+ * --------------------------------------------------------------------- */
+
+/** " Warning=… Reason=… P-Debug-Info=…" of a message, or " no Warning/Reason/P-Debug-Info". */
+std::string diagHeaders(const resip::SipMessage& m) {
+    static const resip::ExtensionHeader kPDebugInfo("P-Debug-Info");
+    std::string out;
+    auto add = [&out](const char* name, const std::string& value) {
+        out += std::string(" ") + name + "=\"" + hamelinports::scrubIdentities(value) + "\"";
+    };
+    try {
+        if (m.exists(resip::h_Warnings)) {
+            for (const auto& w : m.header(resip::h_Warnings)) {
+                std::stringstream s;
+                w.encode(s);
+                add("Warning", s.str());
+            }
+        }
+        if (m.exists(resip::h_Reasons)) {
+            for (const auto& r : m.header(resip::h_Reasons)) {
+                std::stringstream s;
+                r.encode(s);
+                add("Reason", s.str());
+            }
+        }
+        if (m.exists(kPDebugInfo)) {
+            for (const auto& v : m.header(kPDebugInfo)) {
+                add("P-Debug-Info", v.value().c_str());
+            }
+        }
+    } catch (const std::exception& e) {
+        out += std::string(" (headers unreadable: ") + e.what() + ")";
+    }
+    return out.empty() ? " no Warning/Reason/P-Debug-Info" : out;
+}
+
+/** Scheme, host and port of the first P-Asserted-Identity, without its user part; "none" if absent. */
+std::string paiHost(const resip::SipMessage& m) {
+    try {
+        if (!m.exists(resip::h_PAssertedIdentities) || m.header(resip::h_PAssertedIdentities).empty()) {
+            return "none";
+        }
+        const resip::Uri& u = m.header(resip::h_PAssertedIdentities).front().uri();
+        return hamelinports::uriHostOnly(u.scheme().c_str(), u.host().c_str(), u.port());
+    } catch (const std::exception&) {
+        return "unreadable";
+    }
+}
+
+/** "N: #1 sip:*@v6:5060 smsip expires=3600 | #2 …" for the Contacts of a REGISTER 200 OK. */
+std::string maskedContacts(const resip::SipMessage& m) {
+    try {
+        if (!m.exists(resip::h_Contacts)) return "0";
+        const auto& contacts = m.header(resip::h_Contacts);
+        std::string out = std::to_string(contacts.size());
+        int i = 0;
+        for (const auto& c : contacts) {
+            std::ostringstream encoded;  /* searched for the feature tag, never logged */
+            encoded << c;
+            const bool smsip = encoded.str().find("+g.3gpp.smsip") != std::string::npos;
+            const int expires = c.exists(resip::p_expires) ? (int)c.param(resip::p_expires) : -1;
+            ++i;
+            out += (i == 1 ? ": " : " | ") + hamelinports::maskedContact(i,
+                    c.uri().scheme().c_str(), c.uri().host().c_str(), c.uri().port(), smsip, expires);
+        }
+        return out;
+    } catch (const std::exception& e) {
+        return std::string("unreadable (") + e.what() + ")";
+    }
+}
+
+/* --------------------------------------------------------------------- *
  * Minimal ClientRegistrationHandler — logs lifecycle to logcat.
  * DUM throws from makeRegistration if no handler is set.
  * --------------------------------------------------------------------- */
@@ -887,6 +963,8 @@ public:
             }
         } catch (...) {}
         LOGI("REGISTER negotiated Expires: %d s", negotiatedExpires);
+        /* Every binding the network holds for us, e.g. one left from another access. */
+        LOGI("REGISTER %d contacts=%s", code, maskedContacts(response).c_str());
         if (onExpiresReported) onExpiresReported(negotiatedExpires);
 
         /* Extract the first P-Associated-URI. Host part is the
@@ -1670,14 +1748,15 @@ public:
 
     void onSuccess(resip::ClientPagerMessageHandle, const resip::SipMessage& msg) override {
         const int code = msg.header(resip::h_StatusLine).statusCode();
-        LOGI("SMS onSuccess: %d", code);
+        LOGI("SMS onSuccess: %d PAI=%s%s", code, paiHost(msg).c_str(), diagHeaders(msg).c_str());
         upcall(gOnSmsSendSuccess, code, "");
     }
     void onFailure(resip::ClientPagerMessageHandle, const resip::SipMessage& msg,
                    std::unique_ptr<resip::Contents>) override {
         const int code = msg.header(resip::h_StatusLine).statusCode();
         const std::string r = msg.header(resip::h_StatusLine).reason().c_str();
-        LOGE("SMS onFailure: %d %s", code, r.c_str());
+        LOGE("SMS onFailure: %d %s PAI=%s%s", code, r.c_str(), paiHost(msg).c_str(),
+             diagHeaders(msg).c_str());
         upcall(gOnSmsSendFailure, code, r);
     }
     void onMessageArrived(resip::ServerPagerMessageHandle h,
@@ -1709,6 +1788,17 @@ public:
             }
             LOGI("MT PAI=%s Call-ID=%s",
                  bridgeLastMtPai(mBridge).c_str(), bridgeLastMtCallId(mBridge).c_str());
+        }
+        {
+            /* The SMSC's answer to our MO comes as a MESSAGE whose Call-ID ends ":sm-submit-report". */
+            static const std::string kSubmitReport = ":sm-submit-report";
+            const std::string callId =
+                    msg.exists(resip::h_CallId) ? msg.header(resip::h_CallId).value().c_str() : "";
+            const bool submitReport = callId.size() >= kSubmitReport.size()
+                    && callId.compare(callId.size() - kSubmitReport.size(), kSubmitReport.size(),
+                                      kSubmitReport) == 0;
+            LOGI("MT MESSAGE %s PAI=%s%s", submitReport ? "sm-submit-report" : "other",
+                 paiHost(msg).c_str(), diagHeaders(msg).c_str());
         }
 
         const resip::Contents* body = msg.getContents();
