@@ -75,6 +75,7 @@ A handful of system properties tune behaviour:
 | `persist.lineage.ims.refresh.sec` | unset (window ends at max(E − 900 s, E / 2)) | Move the refresh point earlier (≥ 30 s; tests only) |
 | `persist.lineage.ims.debug.refresh_new_sa` | unset (off) | Experiment: a registration refresh offers a new Security-Client (new SPIs and port-c, same port-s) without installing new SAs; the network's answer is logged as `refresh_new_sa outcome` and shown in dumpsys. A 401 is refused by the one-AKA guard and a fresh registration follows |
 | `persist.lineage.ims.dpd.sec` | unset (300 s) | Wi-Fi calling IKE dead peer detection interval, 20..1800 s (anything else: 300 s and one warning); a device sets it in `device.mk`, IWLAN applies it at the next tunnel bring-up |
+| `persist.lineage.ims.cc_repush` | unset (off) | Push the carrier-config override again on a carrier-config change when the SIM was not loaded at the first push (Telephony saves an override to disk only then) or its content changed |
 | `persist.dbg.volte_avail_ovr` | unset | Set to `1` on `device.mk` to advertise VoLTE-by-platform when the vendor RIL doesn't |
 
 ## Diagnostics

@@ -24,9 +24,8 @@ public class HamelinPortsImsService extends ImsService {
     private final SparseArray<HamelinPortsMmTelFeature>        mMmTelFeatures = new SparseArray<>();
     private final SparseArray<ImsRegistrationController>  mRegControllers = new SparseArray<>();
 
-    /** Strong ref to the per-carrier CarrierConfig override pump.
-     *  Held on the service so its OnSubscriptionsChangedListener
-     *  isn't garbage-collected. */
+    /** The process's CarrierConfig override pump; a second onCreate in the
+     *  same process gets the same instance. */
     @SuppressWarnings("unused")
     private CarrierConfigInjector mCarrierConfigInjector;
 

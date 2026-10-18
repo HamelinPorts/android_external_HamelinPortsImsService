@@ -87,11 +87,16 @@ bridge implementation.
   screen on / Doze exit / PDN change / MO request). It runs only while the
   framework enables IMS on the slot and the slot has an active
   subscription; a slot without a SIM stays idle (no retry, no alarm).
+- `CarrierConfigInjector.java` — one per process: pushes the carrier-config
+  overrides (kernel-supported IPsec algorithms, DPD interval, per-carrier
+  assets) as a persistent override.
 - `reg/` — `RefreshPolicy` (renewal window, lapse rule, retry floor and
   budget), `RegistrationState`, `SlotActivation` (start/stop/restart per
   subscription, credential status → retry or idle) and `AttemptReadiness`
   (no IMS network handle, P-CSCF or credentials → the attempt is not sent
   and goes through the retry budget); pure Java, host-tested.
+- `config/` — `IwlanDpdInterval` and `CarrierConfigPushLedger` (when an
+  override is pushed again); pure Java, host-tested.
 - `HamelinPortsCallSession.java` / `HamelinPortsIncomingCallSession.java` —
   MO and MT IMS call profiles + SDP negotiation.
 - `HamelinPortsSmsImpl.java` — SIP MESSAGE-based MO and MT SMS.
