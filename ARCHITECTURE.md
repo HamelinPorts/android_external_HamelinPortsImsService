@@ -109,7 +109,11 @@ bridge implementation.
   host-tested.
 - `HamelinPortsCallSession.java` / `HamelinPortsIncomingCallSession.java` —
   MO and MT IMS call profiles + SDP negotiation.
-- `HamelinPortsSmsImpl.java` — SIP MESSAGE-based MO and MT SMS.
+- `HamelinPortsSmsImpl.java` — SIP MESSAGE-based MO and MT SMS; an RP-ERROR
+  is decoded in full (`sip/RpError`), mapped to retry over IMS / CS fallback
+  by the carrier's RP-Cause lists (`sip/RpErrorPolicy`, with
+  `persist.lineage.ims.sms_rp_fallback`), and each send gets exactly one
+  outcome (`sip/PendingMoSms`); all three pure Java, host-tested.
 - `sip/` — SIP/SDP helpers, native handle lifetimes,
   `HamelinPortsSipStack` (the JNI front door), `SecurityClientOffer` (the
   UE's SPIs and ports in Security-Client; pure Java, host-tested).
@@ -372,6 +376,8 @@ binding (`processBoundNetwork=none` expected) and, per slot:
   a refresh that offered a new Security-Client
 - `iwlanFallback`: enabled and hold time, counted transport failures,
   reports / taken / not taken, the last report and a pending one
+
+The app logs the decoded RP-ERROR with its raw octets (no address element).
 
 ## Known limitations
 

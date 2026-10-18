@@ -2,14 +2,21 @@ package org.hamelinports.ims;
 
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PersistableBundle;
+import android.os.SystemProperties;
+import android.telephony.CarrierConfigManager;
 import android.telephony.SmsManager;
 import android.telephony.SmsMessage;
+import android.telephony.SubscriptionManager;
 import android.telephony.ims.stub.ImsSmsImplBase;
 import android.util.Log;
 
 import org.hamelinports.ims.reg.OutgoingGate;
 import org.hamelinports.ims.sip.HamelinPortsSipStack;
+import org.hamelinports.ims.sip.PendingMoSms;
 import org.hamelinports.ims.sip.RpData;
+import org.hamelinports.ims.sip.RpError;
+import org.hamelinports.ims.sip.RpErrorPolicy;
 import org.hamelinports.ims.sip.SipClient;
 import org.hamelinports.ims.sip.SmsSessionListener;
 
@@ -20,14 +27,15 @@ import java.util.concurrent.atomic.AtomicInteger;
  * arrivals come back through ServerPagerMessage. Both routes are
  * exposed to Java via {@link HamelinPortsSipStack}.
  *
- * <p>MO state machine:
+ * <p>MO state machine (one outcome per token, see {@link PendingMoSms}):
  * <pre>
- *   sendSms()                    → native MESSAGE submitted; latch mPendingToken
+ *   sendSms()                    → native MESSAGE submitted; tracked as pending
  *   onSendSuccess (SIP 2xx)       → log only; wait for RP-ACK/RP-ERROR
  *   onSendFailure (SIP 4xx/5xx)   → framework error now
  *   onIncomingSms RP-ACK          → framework success
- *   onIncomingSms RP-ERROR        → framework error with RP-Cause
- *   mPendingTimeout (30 s)         → optimistic framework success
+ *   onIncomingSms RP-ERROR        → framework error, retry over IMS or CS
+ *                                   fallback per {@link RpErrorPolicy}
+ *   pending timeout (30 s)        → optimistic framework success
  * </pre>
  *
  * <p>MT state machine:
@@ -68,11 +76,11 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
     private final AtomicInteger mIncomingToken = new AtomicInteger(1);
     private final Handler mMain = new Handler(Looper.getMainLooper());
 
-    /** Pending MO send awaiting SMSC RP-ACK / RP-ERROR. */
-    private int mPendingToken = -1;
-    private int mPendingMessageRef = -1;
-    private int mPendingRpMr = -1;     // RP-MR our RP-DATA used; matches incoming RP-ACK / RP-ERROR
+    /** MO send awaiting the SMSC's RP-ACK / RP-ERROR. */
+    private final PendingMoSms mPending = new PendingMoSms();
+    /** Optimistic-success timer of the pending send and the token it belongs to. */
     private Runnable mPendingTimeout = null;
+    private int mPendingTimeoutToken = -1;
 
     HamelinPortsSmsImpl(ImsRegistrationController regController) {
         mRegController = regController;
@@ -153,8 +161,7 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
 
         // Wrap TPDU in RP-DATA per 3GPP TS 24.011
         byte[] rpData = RpData.wrapMo(messageRef, SMSC_NUMBER, pdu);
-        // RP-MR is byte 1 of the wrapped RP-DATA (wrapMo writes
-        // messageRef==0 ? 1 : messageRef).
+        // RP-MR is byte 1 of the wrapped RP-DATA (wrapMo writes messageRef & 0xFF).
         int rpMr = rpData.length > 1 ? (rpData[1] & 0xFF) : -1;
         Log.i(TAG, "MO RP-DATA " + rpData.length + " bytes (TPDU " + pdu.length
                 + ") RP-MR=" + rpMr);
@@ -165,24 +172,28 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
          * MESSAGE gets routed to the wrong instance. */
         mRegController.stack().setSmsListener(this);
 
-        /* Cancel any previous pending timer so two rapid sends don't
-         * double-fire. */
-        cancelPendingTimeout();
-        mPendingToken = token;
-        mPendingMessageRef = messageRef;
-        mPendingRpMr = rpMr;
+        /* Only one send is tracked; an earlier one still pending gets no
+         * outcome (logged). */
+        int superseded = mPending.begin(token, messageRef, rpMr);
+        if (superseded >= 0) {
+            cancelPendingTimeout(superseded);
+            Log.w(TAG, "MO token=" + superseded + " superseded by token=" + token
+                    + " before its RP-ACK/RP-ERROR; it gets no outcome");
+        }
 
         boolean queued = mRegController.stack().sendSms(resolveSmscUri(SMSC_NUMBER), CONTENT_TYPE, rpData);
         if (!queued) {
-            clearPendingLocked();
-            onSendSmsResultError(token, messageRef, SEND_STATUS_ERROR,
-                    SmsManager.RESULT_ERROR_GENERIC_FAILURE, 0);
+            PendingMoSms.Outcome o = mPending.onNotSent(token);
+            if (o.ignored == null) {
+                onSendSmsResultError(token, messageRef, SEND_STATUS_ERROR,
+                        SmsManager.RESULT_ERROR_GENERIC_FAILURE, 0);
+            }
             return;
         }
         /* Arm the fallback timer. If no RP-ACK/RP-ERROR arrives within
          * the window, report optimistic success on the SIP 2xx we
          * (presumably) got — otherwise the Messaging UI hangs. */
-        armPendingTimeoutLocked();
+        armPendingTimeout(token);
     }
 
     @Override
@@ -276,14 +287,10 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
     public void onSendFailure(int statusCode, String reason) {
         /* SIP 4xx/5xx — P-CSCF rejected the MESSAGE. Final outcome. */
         Log.w(TAG, "MO SMS failed at SIP layer: " + statusCode + " " + reason);
-        int token, messageRef;
-        synchronized (this) {
-            if (mPendingToken < 0) return;
-            token = mPendingToken;
-            messageRef = mPendingMessageRef;
-            clearPendingLocked();
-        }
-        onSendSmsResultError(token, messageRef, SEND_STATUS_ERROR,
+        PendingMoSms.Outcome o = mPending.onSipFailure(statusCode);
+        if (o.ignored != null) return;
+        cancelPendingTimeout(o.token);
+        onSendSmsResultError(o.token, o.messageRef, SEND_STATUS_ERROR,
                 SmsManager.RESULT_ERROR_GENERIC_FAILURE, statusCode);
     }
 
@@ -315,7 +322,7 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
                 handleRpAck(parsed);
                 return;
             case RpData.RP_MTI_ERROR_N_TO_MS:
-                handleRpError(parsed);
+                handleRpError(RpError.parse(body));
                 return;
             case RpData.RP_MTI_DATA_N_TO_MS:
                 handleMtRpData(parsed);
@@ -331,48 +338,81 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
      *  don't surface it (framework has no hook). */
     private void handleRpAck(RpData.Parsed parsed) {
         Log.i(TAG, "RP-ACK RP-MR=" + parsed.rpMr);
-        int token, messageRef;
-        synchronized (this) {
-            if (mPendingToken < 0) {
-                Log.i(TAG, "RP-ACK with no pending MO (already completed?); ignoring");
-                return;
-            }
-            if (mPendingRpMr != -1 && parsed.rpMr != mPendingRpMr) {
-                /* Unmatched RP-MR — not for our current in-flight. Could
-                 * be a late ack of a previous send. Don't clear state. */
-                Log.w(TAG, "RP-ACK RP-MR=" + parsed.rpMr + " != pending "
-                        + mPendingRpMr + "; ignoring");
-                return;
-            }
-            token = mPendingToken;
-            messageRef = mPendingMessageRef;
-            clearPendingLocked();
+        PendingMoSms.Outcome o = mPending.onRpAck(parsed.rpMr);
+        if (o.ignored != null) {
+            /* A late ack of an earlier send must not complete the current one. */
+            Log.w(TAG, o.ignored + "; ignoring");
+            return;
         }
-        onSendSmsResultSuccess(token, messageRef);
+        cancelPendingTimeout(o.token);
+        onSendSmsResultSuccess(o.token, o.messageRef);
     }
 
-    /** RP-ERROR (n→ms, MTI=5): SMSC rejected our MO. RP-Cause (TS 24.011
-     *  §8.2.5.4) gives the reason; map common values to framework error
-     *  codes so the Messaging UI shows a meaningful "Undeliverable" state. */
-    private void handleRpError(RpData.Parsed parsed) {
-        Log.w(TAG, "RP-ERROR RP-MR=" + parsed.rpMr + " cause=" + parsed.rpCause);
-        int token, messageRef;
-        synchronized (this) {
-            if (mPendingToken < 0) {
-                Log.i(TAG, "RP-ERROR with no pending MO; ignoring");
-                return;
-            }
-            if (mPendingRpMr != -1 && parsed.rpMr != mPendingRpMr) {
-                Log.w(TAG, "RP-ERROR RP-MR=" + parsed.rpMr + " != pending "
-                        + mPendingRpMr + "; ignoring");
-                return;
-            }
-            token = mPendingToken;
-            messageRef = mPendingMessageRef;
-            clearPendingLocked();
+    /** RP-ERROR (n→ms, MTI=5): the SMSC did not store our MO. The RP-Cause
+     *  (TS 24.011 §8.2.5.4) picks the framework status ({@link RpErrorPolicy})
+     *  and the SmsManager result the Messaging app sees. */
+    private void handleRpError(RpError error) {
+        Log.w(TAG, "RP-ERROR " + error.describe());
+        PendingMoSms.Outcome o = mPending.onRpError(error, rpErrorPolicy());
+        if (o.ignored != null) {
+            Log.w(TAG, o.ignored + "; ignoring");
+            return;
         }
-        onSendSmsResultError(token, messageRef, SEND_STATUS_ERROR,
-                rpCauseToSmsManagerResult(parsed.rpCause), parsed.rpCause);
+        cancelPendingTimeout(o.token);
+        int status = toSendStatus(o.status);
+        Log.i(TAG, "RP-ERROR cause=" + error.cause + " token=" + o.token + " -> " + o.status
+                + (o.status == RpErrorPolicy.Status.ERROR_FALLBACK ? " (resend over CS)"
+                        : o.status == RpErrorPolicy.Status.ERROR_RETRY ? " (retry over IMS)" : ""));
+        onSendSmsResultError(o.token, o.messageRef, status,
+                rpCauseToSmsManagerResult(error.cause), error.cause);
+    }
+
+    /**
+     * The carrier's RP-Cause lists, read per RP-ERROR, when {@value RpErrorPolicy#PROPERTY}
+     * is on. A carrier config that cannot be read gives no retry and no fallback.
+     */
+    private RpErrorPolicy rpErrorPolicy() {
+        if (!SystemProperties.getBoolean(RpErrorPolicy.PROPERTY, false)) {
+            return RpErrorPolicy.off();
+        }
+        int subId = mRegController.activeSubscriptionId();
+        CarrierConfigManager ccm =
+                mRegController.getContext().getSystemService(CarrierConfigManager.class);
+        PersistableBundle config = null;
+        if (ccm != null && SubscriptionManager.isValidSubscriptionId(subId)) {
+            try {
+                config = ccm.getConfigForSubId(subId,
+                        CarrierConfigManager.ImsSms.KEY_SMS_RP_CAUSE_VALUES_TO_FALLBACK_INT_ARRAY,
+                        CarrierConfigManager.ImsSms.KEY_SMS_RP_CAUSE_VALUES_TO_RETRY_OVER_IMS_INT_ARRAY,
+                        CarrierConfigManager.ImsSms.KEY_SMS_CSFB_RETRY_ON_FAILURE_BOOL);
+            } catch (RuntimeException e) {
+                Log.w(TAG, "carrier config unreadable subId=" + subId + ": " + e);
+            }
+        }
+        if (config == null) {
+            return new RpErrorPolicy(true, null, null, false);
+        }
+        return new RpErrorPolicy(true,
+                config.getIntArray(
+                        CarrierConfigManager.ImsSms.KEY_SMS_RP_CAUSE_VALUES_TO_FALLBACK_INT_ARRAY),
+                config.getIntArray(
+                        CarrierConfigManager.ImsSms.KEY_SMS_RP_CAUSE_VALUES_TO_RETRY_OVER_IMS_INT_ARRAY),
+                config.getBoolean(CarrierConfigManager.ImsSms.KEY_SMS_CSFB_RETRY_ON_FAILURE_BOOL,
+                        false));
+    }
+
+    private static int toSendStatus(RpErrorPolicy.Status status) {
+        switch (status) {
+            case OK:
+                return SEND_STATUS_OK;
+            case ERROR_RETRY:
+                return SEND_STATUS_ERROR_RETRY;
+            case ERROR_FALLBACK:
+                return SEND_STATUS_ERROR_FALLBACK;
+            case ERROR:
+            default:
+                return SEND_STATUS_ERROR;
+        }
     }
 
     /** Map RP-Cause (TS 24.011 §8.2.5.4) to SmsManager.Result codes the
@@ -442,41 +482,26 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
 
     // --- pending-send bookkeeping ---
 
-    private synchronized void armPendingTimeoutLocked() {
-        final int token = mPendingToken;
-        final int messageRef = mPendingMessageRef;
-        mPendingTimeout = () -> {
-            int tk = -1, ref = -1;
-            synchronized (HamelinPortsSmsImpl.this) {
-                if (mPendingToken == token) {
-                    tk = mPendingToken;
-                    ref = mPendingMessageRef;
-                    clearPendingLocked();
-                }
-            }
-            if (tk >= 0) {
-                Log.w(TAG, "MO timed out waiting for RP-ACK — optimistic success (token="
-                        + tk + ")");
-                onSendSmsResultSuccess(tk, ref);
-            }
+    private synchronized void armPendingTimeout(int token) {
+        Runnable timeout = () -> {
+            PendingMoSms.Outcome o = mPending.onTimeout(token);
+            if (o.ignored != null) return;
+            Log.w(TAG, "MO timed out waiting for RP-ACK — optimistic success (token="
+                    + o.token + ")");
+            onSendSmsResultSuccess(o.token, o.messageRef);
         };
-        mMain.postDelayed(mPendingTimeout, MO_FALLBACK_TIMEOUT_MS);
+        if (mPendingTimeout != null) mMain.removeCallbacks(mPendingTimeout);
+        mPendingTimeout = timeout;
+        mPendingTimeoutToken = token;
+        mMain.postDelayed(timeout, MO_FALLBACK_TIMEOUT_MS);
     }
 
-    private synchronized void cancelPendingTimeout() {
-        if (mPendingTimeout != null) {
+    /** Cancels the timer of {@code token} only: a newer send keeps its own. */
+    private synchronized void cancelPendingTimeout(int token) {
+        if (mPendingTimeout != null && mPendingTimeoutToken == token) {
             mMain.removeCallbacks(mPendingTimeout);
             mPendingTimeout = null;
+            mPendingTimeoutToken = -1;
         }
-    }
-
-    private synchronized void clearPendingLocked() {
-        if (mPendingTimeout != null) {
-            mMain.removeCallbacks(mPendingTimeout);
-            mPendingTimeout = null;
-        }
-        mPendingToken = -1;
-        mPendingMessageRef = -1;
-        mPendingRpMr = -1;
     }
 }

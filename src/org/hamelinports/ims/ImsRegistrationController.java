@@ -319,6 +319,8 @@ public class ImsRegistrationController {
     }
 
     public Context getContext() { return mContext; }
+    /** The active subscription on this slot, or {@link SlotActivation#NO_SUBSCRIPTION}. */
+    public int activeSubscriptionId() { return SipClient.activeSubscriptionId(mContext, mSlotId); }
     public Network getImsNetwork() { return mImsNetwork; }
     /** Last iface seen on the IMS PDN; picks the P-Access-Network-Info flavour (rmnet* vs ipsec*). */
     public String getLastBoundIface() { return mLastBoundIface; }

@@ -27,13 +27,17 @@ android_app {
 
 // Host unit tests of the registration policy, slot activation, the IWLAN
 // DPD interval and fallback, the carrier-config push ledger, the PDN
-// watchdog and the Security-Client offer (pure Java, no device):
+// watchdog, the Security-Client offer and the MO SMS outcome (pure Java,
+// no device):
 //   atest --host HamelinPortsImsPolicyTests
 java_test_host {
     name: "HamelinPortsImsPolicyTests",
     srcs: [
         "src/org/hamelinports/ims/config/*.java",
         "src/org/hamelinports/ims/reg/*.java",
+        "src/org/hamelinports/ims/sip/PendingMoSms.java",
+        "src/org/hamelinports/ims/sip/RpError.java",
+        "src/org/hamelinports/ims/sip/RpErrorPolicy.java",
         "src/org/hamelinports/ims/sip/SecurityClientOffer.java",
         "tests/host/src/**/*.java",
     ],
