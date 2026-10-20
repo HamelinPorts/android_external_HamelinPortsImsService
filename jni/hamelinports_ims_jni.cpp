@@ -45,6 +45,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "call_listener_slot.h"
 #include "sip_log_redact.h"
 #include "sip_socket_discard.h"
 #include "sip_socket_guard.h"
@@ -207,11 +208,13 @@ class Bridge;  /* forward decl — handlers/auth manager hold a Bridge* */
  * are forward-declared here and inline-defined after Bridge below,
  * so the handler classes can use them without requiring a complete
  * Bridge type at the point of declaration. */
-jobject       bridgeAkaProvider(Bridge*);
-jobject       bridgeRegListener(Bridge*);
-jobject       bridgeCallListener(Bridge*);
-jobject       bridgeIncomingCallListener(Bridge*);
-jobject       bridgeSmsListener(Bridge*);
+using hamelinports::ListenerSlot;
+using hamelinports::ScopedListener;
+ListenerSlot& bridgeAkaProvider(Bridge*);
+ListenerSlot& bridgeRegListener(Bridge*);
+ListenerSlot& bridgeCallListener(Bridge*);
+ListenerSlot& bridgeIncomingCallListener(Bridge*);
+ListenerSlot& bridgeSmsListener(Bridge*);
 std::mutex&   bridgeLastMtPaiMu(Bridge*);
 std::string&  bridgeLastMtPai(Bridge*);
 std::string&  bridgeLastMtCallId(Bridge*);
@@ -224,28 +227,13 @@ std::string&  bridgeLastMtCallId(Bridge*);
  * --------------------------------------------------------------------- */
 
 JavaVM*   gJvm                  = nullptr;
-jmethodID gOnAuthChallengeMethod = nullptr;
 jclass    gAkaResultClass       = nullptr;   /* global ref */
 jfieldID  gFieldRes             = nullptr;
 jfieldID  gFieldCk              = nullptr;
 jfieldID  gFieldIk              = nullptr;
 jfieldID  gFieldAuts            = nullptr;
-jmethodID gOnRegisteredMethod       = nullptr;
-jmethodID gOnDeregisteredMethod     = nullptr;
-jmethodID gOnRegisterExpiresReported = nullptr;
-jmethodID gOnCallProvisional    = nullptr;
-jmethodID gOnCallConnected      = nullptr;
-jmethodID gOnCallTerminated     = nullptr;
-jmethodID gOnCallFailure        = nullptr;
-jmethodID gOnCallAnswer         = nullptr;
-jmethodID gOnCallAnswerVideo    = nullptr;
-jmethodID gOnRemoteReinvite     = nullptr;
-jmethodID gOnIncomingInvite      = nullptr;
-jmethodID gOnIncomingInviteVideo = nullptr;
-jmethodID gOnIncomingCancelled   = nullptr;
-jmethodID gOnSmsSendSuccess     = nullptr;
-jmethodID gOnSmsSendFailure     = nullptr;
-jmethodID gOnSmsIncoming        = nullptr;
+/* Listener method IDs, from the interfaces; written once in JNI_OnLoad. */
+hamelinports::ListenerMethodIds gIds;
 
 /* Cached state from the most recent successful AKA round, used by
  * later requests (Security-Verify on INVITE/MESSAGE etc.). */
@@ -690,7 +678,7 @@ private:
 
         /* JNI upcall: Java runs USIM AKA AND installs the kernel xfrm
          * policies for the four SAs (TS 33.203 §7.4) before returning. */
-        if (!bridgeAkaProvider(mBridge) || !gOnAuthChallengeMethod) {
+        if (!bridgeAkaProvider(mBridge).isSet() || !gIds.authChallenge) {
             LOGE("AKA: no provider registered");
             return false;
         }
@@ -707,12 +695,18 @@ private:
         env->SetByteArrayRegion(jAutn, 0, 16, (const jbyte*)(nonceRaw.data() + 16));
         jstring jAlg = env->NewStringUTF(alg.c_str());
 
-        jobject jResult = env->CallObjectMethod(
-                bridgeAkaProvider(mBridge), gOnAuthChallengeMethod,
-                jRand, jAutn,
-                (jlong)serverSpiC, (jlong)serverSpiS,
-                (jint)serverPortC, (jint)serverPortS,
-                jAlg);
+        jobject jResult = nullptr;
+        {
+            ScopedListener provider(env, bridgeAkaProvider(mBridge));
+            if (provider) {
+                jResult = env->CallObjectMethod(
+                        provider.get(), gIds.authChallenge,
+                        jRand, jAutn,
+                        (jlong)serverSpiC, (jlong)serverSpiS,
+                        (jint)serverPortC, (jint)serverPortS,
+                        jAlg);
+            }
+        }
 
         env->DeleteLocalRef(jRand);
         env->DeleteLocalRef(jAutn);
@@ -1050,27 +1044,37 @@ private:
     }
 
     void upcallRegistered(const std::string& associatedUri) {
-        if (!bridgeRegListener(mBridge) || !gOnRegisteredMethod) return;
+        if (!bridgeRegListener(mBridge).isSet() || !gIds.registered) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
         if (!env) return;
-        jstring jAu = env->NewStringUTF(associatedUri.c_str());
-        env->CallVoidMethod(bridgeRegListener(mBridge), gOnRegisteredMethod, jAu);
-        env->DeleteLocalRef(jAu);
+        {
+            ScopedListener listener(env, bridgeRegListener(mBridge));
+            if (listener) {
+                jstring jAu = env->NewStringUTF(associatedUri.c_str());
+                env->CallVoidMethod(listener.get(), gIds.registered, jAu);
+                env->DeleteLocalRef(jAu);
+            }
+        }
         if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
         if (attached) gJvm->DetachCurrentThread();
     }
     void upcallDeregistered(int code, const std::string& reason,
                             int retryAfterSec, bool fromWire) {
-        if (!bridgeRegListener(mBridge) || !gOnDeregisteredMethod) return;
+        if (!bridgeRegListener(mBridge).isSet() || !gIds.deregistered) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
         if (!env) return;
-        jstring jr = env->NewStringUTF(reason.c_str());
-        env->CallVoidMethod(bridgeRegListener(mBridge), gOnDeregisteredMethod,
-                            (jint)code, jr, (jint)retryAfterSec,
-                            fromWire ? JNI_TRUE : JNI_FALSE);
-        env->DeleteLocalRef(jr);
+        {
+            ScopedListener listener(env, bridgeRegListener(mBridge));
+            if (listener) {
+                jstring jr = env->NewStringUTF(reason.c_str());
+                env->CallVoidMethod(listener.get(), gIds.deregistered,
+                                    (jint)code, jr, (jint)retryAfterSec,
+                                    fromWire ? JNI_TRUE : JNI_FALSE);
+                env->DeleteLocalRef(jr);
+            }
+        }
         if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
         if (attached) gJvm->DetachCurrentThread();
     }
@@ -1150,13 +1154,18 @@ public:
 
 private:
     void upcall(jmethodID m, int code, const std::string& reason) {
-        if (!bridgeCallListener(mBridge) || !m) return;
+        if (!bridgeCallListener(mBridge).isSet() || !m) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
         if (!env) return;
-        jstring jr = env->NewStringUTF(reason.c_str());
-        env->CallVoidMethod(bridgeCallListener(mBridge), m, (jint)code, jr);
-        env->DeleteLocalRef(jr);
+        {
+            ScopedListener listener(env, bridgeCallListener(mBridge));
+            if (listener) {
+                jstring jr = env->NewStringUTF(reason.c_str());
+                env->CallVoidMethod(listener.get(), m, (jint)code, jr);
+                env->DeleteLocalRef(jr);
+            }
+        }
         if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
         if (attached) gJvm->DetachCurrentThread();
     }
@@ -1202,7 +1211,7 @@ public:
         const int code = msg.header(resip::h_StatusLine).statusCode();
         const std::string r = msg.header(resip::h_StatusLine).reason().c_str();
         LOGE("INVITE onFailure: %d %s", code, r.c_str());
-        upcall(gOnCallFailure, code, r);
+        upcall(gIds.callFailure, code, r);
     }
     void onEarlyMedia(resip::ClientInviteSessionHandle, const resip::SipMessage&,
                       const resip::SdpContents&) override {
@@ -1212,7 +1221,7 @@ public:
         const int code = msg.header(resip::h_StatusLine).statusCode();
         const std::string r = msg.header(resip::h_StatusLine).reason().c_str();
         LOGI("INVITE onProvisional: %d %s", code, r.c_str());
-        upcall(gOnCallProvisional, code, r);
+        upcall(gIds.callProvisional, code, r);
     }
     void onConnected(resip::ClientInviteSessionHandle h, const resip::SipMessage& msg) override {
         const int code = msg.header(resip::h_StatusLine).statusCode();
@@ -1259,16 +1268,16 @@ public:
         } catch (const std::exception& e) {
             LOGE("onConnected dump failed: %s", e.what());
         }
-        upcall(gOnCallConnected, code, "");
+        upcall(gIds.callConnected, code, "");
     }
     void onConnected(resip::InviteSessionHandle h, const resip::SipMessage&) override {
-        /* Fires on SERVER side when the remote ACK confirms our 200
-         * OK (dialog now established). The MO side uses the
-         * ClientInviteSession overload; here we cover MT and route
-         * the "call-is-up" event to the same upcall so the Java
-         * MT session can transition to ACTIVE and start media. */
-        LOGI("INVITE onConnected (server-side ACK received)");
-        upcall(gOnCallConnected, 200, "");
+        /* SERVER side: DUM fires this synchronously inside accept(200),
+         * when our 200 OK is sent, not when the ACK arrives (that is
+         * onConnectedConfirmed). The MO side uses the ClientInviteSession
+         * overload; here we cover MT and route the "call-is-up" event to
+         * the same upcall so the Java MT session starts media. */
+        LOGI("INVITE onConnected (server side: 200 OK sent)");
+        upcall(gIds.callConnected, 200, "");
     }
     void onTerminated(resip::InviteSessionHandle,
                       resip::InviteSessionHandler::TerminatedReason reason,
@@ -1333,16 +1342,21 @@ public:
          * session is ringing. Fire onIncomingCancelled so Java can
          * callSessionTerminated, releasing the ring and updating
          * Telecom state. Attaching to the MO listener upcall
-         * (gOnCallTerminated) would not route because MT doesn't
+         * (gIds.callTerminated) would not route because MT doesn't
          * install a CallSessionListener until accept(). */
-        if (wasMt && bridgeIncomingCallListener(mBridge) && gOnIncomingCancelled) {
+        if (wasMt && bridgeIncomingCallListener(mBridge).isSet() && gIds.incomingCancelled) {
             bool attached = false;
             JNIEnv* env = attachJni(&attached);
             if (env) {
-                jstring jCid = env->NewStringUTF(cancelledCallId.c_str());
-                env->CallVoidMethod(bridgeIncomingCallListener(mBridge),
-                        gOnIncomingCancelled, jCid, (jint)reason);
-                env->DeleteLocalRef(jCid);
+                {
+                    ScopedListener listener(env, bridgeIncomingCallListener(mBridge));
+                    if (listener) {
+                        jstring jCid = env->NewStringUTF(cancelledCallId.c_str());
+                        env->CallVoidMethod(listener.get(),
+                                gIds.incomingCancelled, jCid, (jint)reason);
+                        env->DeleteLocalRef(jCid);
+                    }
+                }
                 if (env->ExceptionCheck()) {
                     env->ExceptionDescribe();
                     env->ExceptionClear();
@@ -1350,7 +1364,7 @@ public:
                 if (attached) gJvm->DetachCurrentThread();
             }
         }
-        upcall(gOnCallTerminated, (int)reason, "");
+        upcall(gIds.callTerminated, (int)reason, "");
     }
     void onForkDestroyed(resip::ClientInviteSessionHandle) override {}
     void onRedirected(resip::ClientInviteSessionHandle, const resip::SipMessage&) override {}
@@ -1419,17 +1433,19 @@ public:
             return;
         }
 
-        if (!bridgeCallListener(mBridge) || !gOnCallAnswer) return;
+        if (!bridgeCallListener(mBridge).isSet() || !gIds.callAnswer) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
         if (!env) return;
 
+        {  /* one listener reference for both upcalls, released before the detach */
+        ScopedListener listener(env, bridgeCallListener(mBridge));
         /* Audio upcall — unchanged signature for compatibility. */
-        {
+        if (listener) {
             jstring jIp    = env->NewStringUTF(audioIp.c_str());
             jstring jName  = env->NewStringUTF(audioCodec.c_str());
             jstring jFmtp  = env->NewStringUTF(audioFmtp.c_str());
-            env->CallVoidMethod(bridgeCallListener(mBridge), gOnCallAnswer,
+            env->CallVoidMethod(listener.get(), gIds.callAnswer,
                                 jIp, (jint)audioPort, (jint)audioRtcpPort,
                                 (jint)audioPt, (jint)audioRate, jName, jFmtp);
             env->DeleteLocalRef(jIp);
@@ -1440,18 +1456,19 @@ public:
 
         /* Video upcall — only when a video m-line was offered AND
          * accepted. */
-        if (videoPort > 0 && gOnCallAnswerVideo) {
+        if (listener && videoPort > 0 && gIds.callAnswerVideo) {
             const std::string& vip = videoIp.empty() ? audioIp : videoIp;
             jstring jIp    = env->NewStringUTF(vip.c_str());
             jstring jName  = env->NewStringUTF(videoCodec.c_str());
             jstring jFmtp  = env->NewStringUTF(videoFmtp.c_str());
-            env->CallVoidMethod(bridgeCallListener(mBridge), gOnCallAnswerVideo,
+            env->CallVoidMethod(listener.get(), gIds.callAnswerVideo,
                                 jIp, (jint)videoPort, (jint)videoRtcpPort,
                                 (jint)videoPt, (jint)videoRate, jName, jFmtp);
             env->DeleteLocalRef(jIp);
             env->DeleteLocalRef(jName);
             env->DeleteLocalRef(jFmtp);
             if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+        }
         }
 
         if (attached) gJvm->DetachCurrentThread();
@@ -1569,49 +1586,56 @@ public:
          * video params in one call so Java has the complete new
          * offer shape in one hop. */
         if (isReinvite) {
-            if (!bridgeCallListener(mBridge) || !gOnRemoteReinvite) {
+            if (!bridgeCallListener(mBridge).isSet() || !gIds.callRemoteReinvite) {
                 LOGW("re-INVITE: no listener wired — rejecting implicitly (ignored)");
                 return;
             }
             bool reattached = false;
             JNIEnv* re = attachJni(&reattached);
             if (!re) return;
-            jstring jAIp     = re->NewStringUTF(audioIp.c_str());
-            jstring jACodec  = re->NewStringUTF(audioCodec.c_str());
-            jstring jAFmtp   = re->NewStringUTF(audioFmtp.c_str());
-            const std::string& vip = videoIp.empty() ? audioIp : videoIp;
-            jstring jVIp     = re->NewStringUTF(vip.c_str());
-            jstring jVCodec  = re->NewStringUTF(videoCodec.c_str());
-            jstring jVFmtp   = re->NewStringUTF(videoFmtp.c_str());
-            re->CallVoidMethod(bridgeCallListener(mBridge), gOnRemoteReinvite,
-                               jAIp, (jint)audioPort, (jint)audioRtcpPort,
-                               (jint)audioPt, (jint)audioRate, jACodec, jAFmtp,
-                               jVIp, (jint)videoPort, (jint)videoRtcpPort,
-                               (jint)videoPt, (jint)videoRate, jVCodec, jVFmtp);
-            re->DeleteLocalRef(jAIp);
-            re->DeleteLocalRef(jACodec);
-            re->DeleteLocalRef(jAFmtp);
-            re->DeleteLocalRef(jVIp);
-            re->DeleteLocalRef(jVCodec);
-            re->DeleteLocalRef(jVFmtp);
+            {
+                ScopedListener listener(re, bridgeCallListener(mBridge));
+                if (listener) {
+                    jstring jAIp     = re->NewStringUTF(audioIp.c_str());
+                    jstring jACodec  = re->NewStringUTF(audioCodec.c_str());
+                    jstring jAFmtp   = re->NewStringUTF(audioFmtp.c_str());
+                    const std::string& vip = videoIp.empty() ? audioIp : videoIp;
+                    jstring jVIp     = re->NewStringUTF(vip.c_str());
+                    jstring jVCodec  = re->NewStringUTF(videoCodec.c_str());
+                    jstring jVFmtp   = re->NewStringUTF(videoFmtp.c_str());
+                    re->CallVoidMethod(listener.get(), gIds.callRemoteReinvite,
+                                       jAIp, (jint)audioPort, (jint)audioRtcpPort,
+                                       (jint)audioPt, (jint)audioRate, jACodec, jAFmtp,
+                                       jVIp, (jint)videoPort, (jint)videoRtcpPort,
+                                       (jint)videoPt, (jint)videoRate, jVCodec, jVFmtp);
+                    re->DeleteLocalRef(jAIp);
+                    re->DeleteLocalRef(jACodec);
+                    re->DeleteLocalRef(jAFmtp);
+                    re->DeleteLocalRef(jVIp);
+                    re->DeleteLocalRef(jVCodec);
+                    re->DeleteLocalRef(jVFmtp);
+                }
+            }
             if (re->ExceptionCheck()) { re->ExceptionDescribe(); re->ExceptionClear(); }
             if (reattached) gJvm->DetachCurrentThread();
             return;
         }
 
-        if (!bridgeIncomingCallListener(mBridge) || !gOnIncomingInvite) return;
+        if (!bridgeIncomingCallListener(mBridge).isSet() || !gIds.incomingInvite) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
         if (!env) return;
 
+        {  /* one listener reference for both upcalls, released before the detach */
+        ScopedListener listener(env, bridgeIncomingCallListener(mBridge));
         /* Audio upcall — unchanged signature. */
-        {
+        if (listener) {
             jstring jCallId = env->NewStringUTF(callId.c_str());
             jstring jFrom   = env->NewStringUTF(fromUri.c_str());
             jstring jIp     = env->NewStringUTF(audioIp.c_str());
             jstring jCodec  = env->NewStringUTF(audioCodec.c_str());
             jstring jFmtp   = env->NewStringUTF(audioFmtp.c_str());
-            env->CallVoidMethod(bridgeIncomingCallListener(mBridge), gOnIncomingInvite,
+            env->CallVoidMethod(listener.get(), gIds.incomingInvite,
                                 jCallId, jFrom, jIp,
                                 (jint)audioPort, (jint)audioRtcpPort,
                                 (jint)audioPt, (jint)audioRate,
@@ -1628,13 +1652,13 @@ public:
          * was offered. Sent *after* the audio upcall so Java has the
          * session already created via onIncomingInvite before
          * receiving the video annex. */
-        if (videoPort > 0 && gOnIncomingInviteVideo) {
+        if (listener && videoPort > 0 && gIds.incomingInviteVideo) {
             const std::string& vip = videoIp.empty() ? audioIp : videoIp;
             jstring jCallId = env->NewStringUTF(callId.c_str());
             jstring jIp     = env->NewStringUTF(vip.c_str());
             jstring jCodec  = env->NewStringUTF(videoCodec.c_str());
             jstring jFmtp   = env->NewStringUTF(videoFmtp.c_str());
-            env->CallVoidMethod(bridgeIncomingCallListener(mBridge), gOnIncomingInviteVideo,
+            env->CallVoidMethod(listener.get(), gIds.incomingInviteVideo,
                                 jCallId, jIp,
                                 (jint)videoPort, (jint)videoRtcpPort,
                                 (jint)videoPt, (jint)videoRate,
@@ -1644,6 +1668,7 @@ public:
             env->DeleteLocalRef(jCodec);
             env->DeleteLocalRef(jFmtp);
             if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+        }
         }
 
         if (attached) gJvm->DetachCurrentThread();
@@ -1749,7 +1774,7 @@ public:
     void onSuccess(resip::ClientPagerMessageHandle, const resip::SipMessage& msg) override {
         const int code = msg.header(resip::h_StatusLine).statusCode();
         LOGI("SMS onSuccess: %d PAI=%s%s", code, paiHost(msg).c_str(), diagHeaders(msg).c_str());
-        upcall(gOnSmsSendSuccess, code, "");
+        upcall(gIds.smsSendSuccess, code, "");
     }
     void onFailure(resip::ClientPagerMessageHandle, const resip::SipMessage& msg,
                    std::unique_ptr<resip::Contents>) override {
@@ -1757,7 +1782,7 @@ public:
         const std::string r = msg.header(resip::h_StatusLine).reason().c_str();
         LOGE("SMS onFailure: %d %s PAI=%s%s", code, r.c_str(), paiHost(msg).c_str(),
              diagHeaders(msg).c_str());
-        upcall(gOnSmsSendFailure, code, r);
+        upcall(gIds.smsSendFailure, code, r);
     }
     void onMessageArrived(resip::ServerPagerMessageHandle h,
                           const resip::SipMessage& msg) override {
@@ -1810,15 +1835,20 @@ public:
         const auto* oc = dynamic_cast<const resip::OctetContents*>(body);
         const resip::Data& bytes = oc ? oc->octets() : body->getBodyData();
 
-        if (bridgeSmsListener(mBridge) && gOnSmsIncoming) {
+        if (bridgeSmsListener(mBridge).isSet() && gIds.smsIncoming) {
             bool attached = false;
             JNIEnv* env = attachJni(&attached);
             if (env) {
-                jbyteArray jArr = env->NewByteArray((jsize)bytes.size());
-                env->SetByteArrayRegion(jArr, 0, (jsize)bytes.size(),
-                                        (const jbyte*)bytes.data());
-                env->CallVoidMethod(bridgeSmsListener(mBridge), gOnSmsIncoming, jArr);
-                env->DeleteLocalRef(jArr);
+                {
+                    ScopedListener listener(env, bridgeSmsListener(mBridge));
+                    if (listener) {
+                        jbyteArray jArr = env->NewByteArray((jsize)bytes.size());
+                        env->SetByteArrayRegion(jArr, 0, (jsize)bytes.size(),
+                                                (const jbyte*)bytes.data());
+                        env->CallVoidMethod(listener.get(), gIds.smsIncoming, jArr);
+                        env->DeleteLocalRef(jArr);
+                    }
+                }
                 if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
                 if (attached) gJvm->DetachCurrentThread();
             }
@@ -1833,13 +1863,18 @@ public:
 
 private:
     void upcall(jmethodID m, int code, const std::string& reason) {
-        if (!bridgeSmsListener(mBridge) || !m) return;
+        if (!bridgeSmsListener(mBridge).isSet() || !m) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
         if (!env) return;
-        jstring jr = env->NewStringUTF(reason.c_str());
-        env->CallVoidMethod(bridgeSmsListener(mBridge), m, (jint)code, jr);
-        env->DeleteLocalRef(jr);
+        {
+            ScopedListener listener(env, bridgeSmsListener(mBridge));
+            if (listener) {
+                jstring jr = env->NewStringUTF(reason.c_str());
+                env->CallVoidMethod(listener.get(), m, (jint)code, jr);
+                env->DeleteLocalRef(jr);
+            }
+        }
         if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
         if (attached) gJvm->DetachCurrentThread();
     }
@@ -2728,13 +2763,13 @@ public:
      * back-pointer so their upcalls reach this slot's listener jobjects. */
     int                mSlotId = -1;
 
-    /* Per-slot Java listener jobjects (NewGlobalRef'd from the
-     * corresponding nativeSetXxxListener). Released in tearDown(). */
-    jobject            mAkaProvider = nullptr;
-    jobject            mRegListener = nullptr;
-    jobject            mCallListener = nullptr;
-    jobject            mIncomingCallListener = nullptr;
-    jobject            mSmsListener = nullptr;
+    /* Per-slot Java listeners, set by the nativeSetXxx calls (binder threads)
+     * and called from the DUM thread; see call_listener_slot.h. */
+    ListenerSlot       mAkaProvider;
+    ListenerSlot       mRegListener;
+    ListenerSlot       mCallListener;
+    ListenerSlot       mIncomingCallListener;
+    ListenerSlot       mSmsListener;
 
     /* Last received MT MESSAGE PAI and Call-ID. Java reads PAI via
      * getLastMtPai() to address the SMS-layer RP-ACK, and the decorator
@@ -2772,12 +2807,16 @@ public:
     }
 
     void upcallExpiresReported(int expires) {
-        if (!mRegListener || !gOnRegisterExpiresReported) return;
+        if (!mRegListener.isSet() || !gIds.expiresReported) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
         if (!env) return;
-        env->CallVoidMethod(mRegListener, gOnRegisterExpiresReported,
-                            (jint)expires);
+        {
+            ScopedListener listener(env, mRegListener);
+            if (listener) {
+                env->CallVoidMethod(listener.get(), gIds.expiresReported, (jint)expires);
+            }
+        }
         if (env->ExceptionCheck()) {
             env->ExceptionDescribe();
             env->ExceptionClear();
@@ -2790,11 +2829,11 @@ public:
  * at the top of this namespace. Defined after Bridge's full class
  * body so the handler/decorator/auth-manager bodies above (which only
  * see the forward decl of Bridge) can resolve these calls. */
-inline jobject       bridgeAkaProvider(Bridge* b)         { return b->mAkaProvider; }
-inline jobject       bridgeRegListener(Bridge* b)         { return b->mRegListener; }
-inline jobject       bridgeCallListener(Bridge* b)        { return b->mCallListener; }
-inline jobject       bridgeIncomingCallListener(Bridge* b){ return b->mIncomingCallListener; }
-inline jobject       bridgeSmsListener(Bridge* b)         { return b->mSmsListener; }
+inline ListenerSlot& bridgeAkaProvider(Bridge* b)         { return b->mAkaProvider; }
+inline ListenerSlot& bridgeRegListener(Bridge* b)         { return b->mRegListener; }
+inline ListenerSlot& bridgeCallListener(Bridge* b)        { return b->mCallListener; }
+inline ListenerSlot& bridgeIncomingCallListener(Bridge* b){ return b->mIncomingCallListener; }
+inline ListenerSlot& bridgeSmsListener(Bridge* b)         { return b->mSmsListener; }
 inline std::mutex&   bridgeLastMtPaiMu(Bridge* b)         { return b->mLastMtPaiMu; }
 inline std::string&  bridgeLastMtPai(Bridge* b)           { return b->mLastMtPai; }
 inline std::string&  bridgeLastMtCallId(Bridge* b)        { return b->mLastMtCallId; }
@@ -2805,124 +2844,22 @@ inline std::string&  bridgeLastMtCallId(Bridge* b)        { return b->mLastMtCal
  * Java ↔ C++ entry points
  * --------------------------------------------------------------------- */
 
-namespace {
-struct MethodSpec {
-    jmethodID*  id;
-    const char* name;
-    const char* sig;
-};
-
-/* Resolve against the declaring interface, not a listener's concrete
- * class: MO and MT sessions register different implementors, and an ID
- * taken from one class is invalid on an instance of another (CheckJNI
- * aborts, plain ART dispatches through the wrong vtable slot). Interface
- * method IDs dispatch on every implementor, default methods included. */
-template <size_t N>
-bool resolveMethods(JNIEnv* env, const char* className,
-                    const MethodSpec (&specs)[N]) {
-    jclass cls = env->FindClass(className);
-    if (!cls) {
-        LOGE("JNI_OnLoad: class %s not found", className);
-        return false;
-    }
-    bool ok = true;
-    for (const MethodSpec& m : specs) {
-        *m.id = env->GetMethodID(cls, m.name, m.sig);
-        if (!*m.id) {
-            LOGE("JNI_OnLoad: %s.%s%s not found", className, m.name, m.sig);
-            ok = false;
-            break;
-        }
-    }
-    env->DeleteLocalRef(cls);
-    return ok;
-}
-
-bool resolveAkaResult(JNIEnv* env) {
-    jclass cls = env->FindClass("org/hamelinports/ims/sip/AkaResult");
-    if (!cls) {
-        LOGE("JNI_OnLoad: AkaResult class not found");
-        return false;
-    }
-    gAkaResultClass = (jclass)env->NewGlobalRef(cls);
-    gFieldRes  = env->GetFieldID(cls, "res",  "[B");
-    gFieldCk   = env->GetFieldID(cls, "ck",   "[B");
-    gFieldIk   = env->GetFieldID(cls, "ik",   "[B");
-    gFieldAuts = env->GetFieldID(cls, "auts", "[B");
-    env->DeleteLocalRef(cls);
-    return gAkaResultClass && gFieldRes && gFieldCk && gFieldIk && gFieldAuts;
-}
-
-/* Runs inside System.loadLibrary(), so FindClass sees the app's class
- * loader and every ID is published before any SIP thread can upcall. */
-bool resolveJavaIds(JNIEnv* env) {
-    static const MethodSpec kAka[] = {
-        { &gOnAuthChallengeMethod, "onAuthChallenge",
-          "([B[BJJIILjava/lang/String;)Lorg/hamelinports/ims/sip/AkaResult;" },
-    };
-    static const MethodSpec kReg[] = {
-        { &gOnRegisteredMethod,        "onRegistered",      "(Ljava/lang/String;)V" },
-        { &gOnDeregisteredMethod,      "onDeregistered",    "(ILjava/lang/String;IZ)V" },
-        { &gOnRegisterExpiresReported, "onExpiresReported", "(I)V" },
-    };
-    static const MethodSpec kCall[] = {
-        { &gOnCallProvisional, "onProvisional", "(ILjava/lang/String;)V" },
-        { &gOnCallConnected,   "onConnected",   "(ILjava/lang/String;)V" },
-        { &gOnCallTerminated,  "onTerminated",  "(ILjava/lang/String;)V" },
-        { &gOnCallFailure,     "onFailure",     "(ILjava/lang/String;)V" },
-        { &gOnCallAnswer,      "onAnswer",
-          "(Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)V" },
-        { &gOnCallAnswerVideo, "onAnswerVideo",
-          "(Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)V" },
-        /* (audioIp, audioPort, audioRtcp, audioPt, audioRate, audioCodec,
-         *  audioFmtp, videoIp, videoPort, videoRtcp, videoPt, videoRate,
-         *  videoCodec, videoFmtp) — video port=0 when the re-INVITE
-         *  dropped video. */
-        { &gOnRemoteReinvite,  "onRemoteReinvite",
-          "(Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;"
-          "Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)V" },
-    };
-    static const MethodSpec kIncoming[] = {
-        /* (callId, fromUri, remoteIp, remotePort, rtcpPort, pt,
-         *  clockRate, codecName, fmtp) */
-        { &gOnIncomingInvite,      "onIncomingInvite",
-          "(Ljava/lang/String;Ljava/lang/String;"
-          "Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)V" },
-        { &gOnIncomingInviteVideo, "onIncomingInviteVideo",
-          "(Ljava/lang/String;Ljava/lang/String;"
-          "IIIILjava/lang/String;Ljava/lang/String;)V" },
-        { &gOnIncomingCancelled,   "onIncomingCancelled",
-          "(Ljava/lang/String;I)V" },
-    };
-    static const MethodSpec kSms[] = {
-        { &gOnSmsSendSuccess, "onSendSuccess", "(ILjava/lang/String;)V" },
-        { &gOnSmsSendFailure, "onSendFailure", "(ILjava/lang/String;)V" },
-        { &gOnSmsIncoming,    "onIncomingSms", "([B)V" },
-    };
-    return resolveMethods(env, "org/hamelinports/ims/sip/AkaProvider", kAka)
-        && resolveMethods(env, "org/hamelinports/ims/sip/RegistrationListener", kReg)
-        && resolveMethods(env, "org/hamelinports/ims/sip/CallSessionListener", kCall)
-        && resolveMethods(env, "org/hamelinports/ims/sip/IncomingCallListener", kIncoming)
-        && resolveMethods(env, "org/hamelinports/ims/sip/SmsSessionListener", kSms)
-        && resolveAkaResult(env);
-}
-}  // namespace
-
 extern "C" JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM* vm, void* /*reserved*/)
 {
     gJvm = vm;
     JNIEnv* env = nullptr;
-    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK)
-        return JNI_ERR;
-    if (!resolveJavaIds(env)) {
-        /* Java/native skew: fail the load so HamelinPortsSipStack reports
-         * the bridge unavailable instead of upcalling through null IDs. */
-        if (env->ExceptionCheck()) {
-            env->ExceptionDescribe();
-            env->ExceptionClear();
-        }
-        return JNI_ERR;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK || !env) {
+        LOGE("JNI_OnLoad: no JNIEnv, listener methods unresolved");
+        return JNI_VERSION_1_6;
+    }
+    /* Here FindClass uses the loader of the class that loaded this library,
+     * so the app's listener interfaces are visible. */
+    const int missing = hamelinports::resolveListenerMethods(env, &gIds);
+    if (missing) {
+        LOGE("JNI_OnLoad: %d listener method(s) unresolved; their upcalls are skipped", missing);
+    } else {
+        LOGI("JNI_OnLoad: listener methods resolved from their interfaces");
     }
     return JNI_VERSION_1_6;
 }
@@ -2950,16 +2887,25 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetAkaProvider(
         JNIEnv* env, jclass /*clazz*/, jint slotId, jobject provider)
 {
     BRIDGE_OR_VOID();
-    if (b->mAkaProvider) {
-        env->DeleteGlobalRef(b->mAkaProvider);
-        b->mAkaProvider = nullptr;
-    }
+    b->mAkaProvider.set(env, provider);
     if (provider == nullptr) {
         LOGI("AKA provider cleared slot=%d", (int)slotId);
         return;
     }
 
-    b->mAkaProvider = env->NewGlobalRef(provider);
+    if (!gAkaResultClass) {
+        jclass cls = env->FindClass("org/hamelinports/ims/sip/AkaResult");
+        if (!cls) {
+            LOGE("AkaResult class not found");
+            return;
+        }
+        gAkaResultClass = (jclass)env->NewGlobalRef(cls);
+        gFieldRes  = env->GetFieldID(cls, "res",  "[B");
+        gFieldCk   = env->GetFieldID(cls, "ck",   "[B");
+        gFieldIk   = env->GetFieldID(cls, "ik",   "[B");
+        gFieldAuts = env->GetFieldID(cls, "auts", "[B");
+        env->DeleteLocalRef(cls);
+    }
     LOGI("AKA provider registered slot=%d", (int)slotId);
 }
 
@@ -3023,12 +2969,7 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetCallSessionListener(
         JNIEnv* env, jclass /*clazz*/, jint slotId, jobject listener)
 {
     BRIDGE_OR_VOID();
-    if (b->mCallListener) {
-        env->DeleteGlobalRef(b->mCallListener);
-        b->mCallListener = nullptr;
-    }
-    if (!listener) return;
-    b->mCallListener = env->NewGlobalRef(listener);
+    b->mCallListener.set(env, listener);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -3103,12 +3044,7 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetIncomingCallListener
         JNIEnv* env, jclass /*clazz*/, jint slotId, jobject listener)
 {
     BRIDGE_OR_VOID();
-    if (b->mIncomingCallListener) {
-        env->DeleteGlobalRef(b->mIncomingCallListener);
-        b->mIncomingCallListener = nullptr;
-    }
-    if (!listener) return;
-    b->mIncomingCallListener = env->NewGlobalRef(listener);
+    b->mIncomingCallListener.set(env, listener);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -3147,12 +3083,7 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetSmsListener(
         JNIEnv* env, jclass /*clazz*/, jint slotId, jobject listener)
 {
     BRIDGE_OR_VOID();
-    if (b->mSmsListener) {
-        env->DeleteGlobalRef(b->mSmsListener);
-        b->mSmsListener = nullptr;
-    }
-    if (!listener) return;
-    b->mSmsListener = env->NewGlobalRef(listener);
+    b->mSmsListener.set(env, listener);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -3187,12 +3118,7 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetRegistrationListener
         JNIEnv* env, jclass /*clazz*/, jint slotId, jobject listener)
 {
     BRIDGE_OR_VOID();
-    if (b->mRegListener) {
-        env->DeleteGlobalRef(b->mRegListener);
-        b->mRegListener = nullptr;
-    }
-    if (!listener) return;
-    b->mRegListener = env->NewGlobalRef(listener);
+    b->mRegListener.set(env, listener);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

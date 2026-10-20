@@ -59,6 +59,23 @@ cc_test_host {
     },
 }
 
+// Host test of the JNI listener slots and method-ID resolution against a fake
+// JNIEnv (IDs from the interfaces, no use of a deleted global reference):
+//   atest --host HamelinPortsImsListenerSlotTest
+cc_test_host {
+    name: "HamelinPortsImsListenerSlotTest",
+    srcs: [
+        "tests/host/native/call_listener_slot_test.cpp",
+        "jni/call_listener_slot.cpp",
+    ],
+    local_include_dirs: ["jni"],
+    header_libs: ["jni_headers"],
+    gtest: false,
+    test_options: {
+        unit_test: true,
+    },
+}
+
 // Host test that the SIP diagnostic log lines carry no phone number, IMSI,
 // user part or UE address:
 //   atest --host HamelinPortsImsLogRedactTest
@@ -99,6 +116,7 @@ cc_test_host {
 cc_library_shared {
     name: "libhamelinports_ims_jni",
     srcs: [
+        "jni/call_listener_slot.cpp",
         "jni/hamelinports_ims_jni.cpp",
         "jni/sip_socket_guard.cpp",
     ],

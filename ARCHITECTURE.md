@@ -147,6 +147,19 @@ log line; a send without an address goes to the connected peer and passes),
 so a path that bypasses the hook fails loudly instead of leaving on the
 default network.
 
+Upcalls into Java (`jni/call_listener_slot.{h,cpp}`): every listener method ID
+is resolved once, in `JNI_OnLoad`, from the listener interface
+(`CallSessionListener`, `IncomingCallListener`, `SmsSessionListener`,
+`RegistrationListener`, `AkaProvider`). An ID taken from one implementation's
+class would be dispatched by that class's vtable slot on every other one (the
+MO and MT call sessions are different classes). Each listener sits in a
+`ListenerSlot`: Java threads replace it under a mutex, and each upcall on the
+DUM thread works on its own local reference, so a replacement never frees a
+reference in use. Host test `HamelinPortsImsListenerSlotTest` (fake JNIEnv);
+`tests/check-jni-listener-ids.sh` fails on `GetObjectClass` in `jni/`, on a
+`GetMethodID` call outside the resolver, or on a file-scope or static
+`jmethodID` cache.
+
 Gates: `tests/check-process-binding.sh` fails on any process-binding API in
 `src/` or `jni/`; `tests/check-sip-socket-sites.sh` fails unless every
 `socket()`/`accept()`/`socketpair()`/`connect()`/`sendto()`/`sendmsg()`/
