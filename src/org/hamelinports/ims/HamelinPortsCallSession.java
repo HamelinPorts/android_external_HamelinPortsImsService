@@ -7,6 +7,7 @@ import android.telephony.ims.ImsStreamMediaProfile;
 import android.telephony.ims.stub.ImsCallSessionImplBase;
 import android.util.Log;
 
+import org.hamelinports.ims.call.SipStatus;
 import org.hamelinports.ims.reg.DeferredRequests;
 import org.hamelinports.ims.reg.OutgoingGate;
 import org.hamelinports.ims.sip.CallSessionListener;
@@ -612,6 +613,11 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
                 }
             }
             @Override public void onFailure(int code, String reason) {
+                if (!SipStatus.isFailure(code)) {
+                    Log.e(TAG, "call onFailure with non-failure status " + code + " " + reason
+                            + " — misdirected upcall, ignored");
+                    return;
+                }
                 Log.w(TAG, "call onFailure: " + code + " " + reason);
                 cleanup();
                 if (mListener != null) {

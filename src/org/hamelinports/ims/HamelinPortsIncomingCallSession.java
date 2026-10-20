@@ -13,6 +13,7 @@ import android.telephony.ims.ImsStreamMediaProfile;
 import android.telephony.ims.stub.ImsCallSessionImplBase;
 import android.util.Log;
 
+import org.hamelinports.ims.call.MtCallState;
 import org.hamelinports.ims.sip.CallSessionListener;
 import org.hamelinports.ims.sip.HamelinPortsSipStack;
 
@@ -69,7 +70,8 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
     private int mRtpPort;
     private int mRtcpPort;
     private HamelinPortsImsMediaSession mImsMedia;
-    private boolean mAccepted = false;
+    /** Accepted / ended, and the one terminated report; see MtCallState. */
+    private final MtCallState mCall = new MtCallState();
     private boolean mGoneFired = false;
 
     /* Video state — populated by {@link #setRemoteVideo} when the
@@ -185,8 +187,7 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
     @Override
     public void accept(int callType, ImsStreamMediaProfile profile) {
         Log.i(TAG, "MT accept callType=" + callType + " callId=" + mCallId);
-        if (mAccepted) return;
-        mAccepted = true;
+        if (!mCall.accept()) return;
         mState = ImsCallSessionImplBase.State.ESTABLISHING;
         new Thread(() -> {
             try {
@@ -194,6 +195,8 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
             } catch (Exception e) {
                 Log.e(TAG, "MT accept failed", e);
                 fireGoneOnce();
+                if (!mCall.endLocally()) return;
+                mState = ImsCallSessionImplBase.State.TERMINATED;
                 if (mListener != null) {
                     mListener.callSessionTerminated(new ImsReasonInfo(
                             ImsReasonInfo.CODE_LOCAL_INTERNAL_ERROR, 0, e.getMessage()));
@@ -205,6 +208,10 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
     @Override
     public void reject(int reason) {
         Log.i(TAG, "MT reject reason=" + reason + " callId=" + mCallId);
+        if (!mCall.endLocally()) {
+            Log.i(TAG, "MT reject: call already ended — nothing to send or report");
+            return;
+        }
         mState = ImsCallSessionImplBase.State.TERMINATED;
         int sipCode = mapRejectReasonToSip(reason);
         if (mCallId != null) {
@@ -224,7 +231,7 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
      *  {@code CODE_LOCAL_NETWORK_NO_SERVICE}, skip the SIP BYE
      *  (sockets already dead). */
     void handleImsPdnLost() {
-        if (mState == ImsCallSessionImplBase.State.TERMINATED) return;
+        if (!mCall.endLocally()) return;
         mState = ImsCallSessionImplBase.State.TERMINATED;
         Log.w(TAG, "MT handleImsPdnLost — terminating call locally");
         cleanup();
@@ -249,13 +256,14 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
      *  {@link #doAccept}; firing {@code callSessionTerminated} again
      *  from here would be a redundant notification. */
     void handleRemoteCancel(int nativeReason) {
-        if (mState == ImsCallSessionImplBase.State.TERMINATED) return;
-        if (mAccepted) {
+        if (mCall.isTerminated()) return;
+        if (mCall.isAccepted()) {
             Log.i(TAG, "MT handleRemoteCancel post-accept — deferring to"
                     + " CallSessionListener.onTerminated, nativeReason="
                     + nativeReason + " callId=" + mCallId);
             return;
         }
+        if (!mCall.endLocally()) return;
         mState = ImsCallSessionImplBase.State.TERMINATED;
         Log.i(TAG, "MT handleRemoteCancel nativeReason=" + nativeReason
                 + " callId=" + mCallId);
@@ -270,11 +278,16 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
     @Override
     public void terminate(int reason) {
         Log.i(TAG, "MT terminate reason=" + reason + " callId=" + mCallId
-                + " accepted=" + mAccepted);
-        if (!mAccepted) {
+                + " accepted=" + mCall.isAccepted());
+        if (!mCall.isAccepted()) {
             /* Pre-accept terminate = reject. Frameworks use this for
              * missed-call timeouts. */
             reject(reason);
+            return;
+        }
+        if (!mCall.endLocally()) {
+            Log.i(TAG, "MT terminate: call already ended — no BYE, no second report");
+            cleanup();
             return;
         }
         /* Post-accept terminate = BYE on the MT server dialog. The
@@ -355,7 +368,9 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
                                            int clockRate, String codecName,
                                            String fmtp) { /* only MO path fires */ }
             @Override public void onConnected(int code, String reason) {
-                Log.i(TAG, "MT onConnected (remote ACK'd our 200 OK)");
+                MtCallState.Action action = mCall.onConnected();
+                Log.i(TAG, "MT onConnected (our 200 OK sent) -> " + action);
+                if (action != MtCallState.Action.ESTABLISH) return;
                 mState = ImsCallSessionImplBase.State.ESTABLISHED;
                 if (mListener != null) {
                     mListener.callSessionInitiated(mProfile);
@@ -363,7 +378,9 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
                 startMediaEngine();
             }
             @Override public void onTerminated(int reasonCode, String reason) {
-                Log.i(TAG, "MT onTerminated: " + reasonCode + " " + reason);
+                MtCallState.Action action = mCall.onTerminated();
+                Log.i(TAG, "MT onTerminated: " + reasonCode + " " + reason + " -> " + action);
+                if (action != MtCallState.Action.TERMINATE) return;
                 mState = ImsCallSessionImplBase.State.TERMINATED;
                 cleanup();
                 if (mListener != null) {
@@ -372,7 +389,18 @@ public class HamelinPortsIncomingCallSession extends ImsCallSessionImplBase {
                 }
             }
             @Override public void onFailure(int code, String reason) {
-                Log.w(TAG, "MT onFailure: " + code + " " + reason);
+                MtCallState.Action action = mCall.onFailure(code);
+                if (action == MtCallState.Action.REFUSE) {
+                    Log.e(TAG, "MT onFailure with non-failure status " + code + " " + reason
+                            + " — misdirected upcall, ignored");
+                    return;
+                }
+                Log.w(TAG, "MT onFailure: " + code + " " + reason + " -> " + action);
+                if (action == MtCallState.Action.NONE) return;
+                if (action == MtCallState.Action.END_DIALOG_AND_TERMINATE) {
+                    boolean sent = mRegController.stack().endCallByCallId(mCallId);
+                    Log.i(TAG, "MT BYE after failure queued=" + sent + " callId=" + mCallId);
+                }
                 mState = ImsCallSessionImplBase.State.TERMINATED;
                 cleanup();
                 if (mListener != null) {

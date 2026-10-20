@@ -108,7 +108,10 @@ bridge implementation.
   `CarrierConfigPushLedger` (when an override is pushed again); pure Java,
   host-tested.
 - `HamelinPortsCallSession.java` / `HamelinPortsIncomingCallSession.java` —
-  MO and MT IMS call profiles + SDP negotiation.
+  MO and MT IMS call profiles + SDP negotiation. The MT session follows
+  `call/MtCallState` (one terminated report; a failure after accept also ends
+  the dialog with a BYE); both refuse an onFailure without a failure status
+  (`call/SipStatus`); pure Java, host-tested.
 - `HamelinPortsSmsImpl.java` — SIP MESSAGE-based MO and MT SMS; an RP-ERROR
   is decoded in full (`sip/RpError`), mapped to retry over IMS / CS fallback
   by the carrier's RP-Cause lists (`sip/RpErrorPolicy`, with
