@@ -4,7 +4,9 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <ctype.h>
+#include <fcntl.h>
 #include <arpa/inet.h>
+#include <sys/file.h>
 #include <sys/system_properties.h>
 
 static int run_ip(char *const argv[]) {
@@ -182,6 +184,154 @@ static int get_slot_prop(const char *slot, const char *suffix, char *out) {
     return __system_property_get(key, out) > 0;
 }
 
+/*
+ * One slot's prop bag: the install bag (trigger) or the flush bag (f_*,
+ * flush). The stamp is the value of the trigger/flush property; the
+ * service writes it from a monotonic clock, so the larger stamp is the
+ * later request.
+ */
+struct xfrm_bag {
+    char pcscf[PROP_VALUE_MAX];
+    char local[PROP_VALUE_MAX];
+    char ue_portc[PROP_VALUE_MAX];
+    char ue_ports[PROP_VALUE_MAX];
+    char pc_portc[PROP_VALUE_MAX];
+    char pc_ports[PROP_VALUE_MAX];
+    char server_spic[PROP_VALUE_MAX];   /* install bag only */
+    char server_spis[PROP_VALUE_MAX];   /* install bag only */
+    unsigned long long stamp;
+    int valid;
+};
+
+static unsigned long long parse_stamp(const char *s) {
+    if (!*s) return 0;
+    for (const char *c = s; *c; c++) {
+        if (!isdigit(*c)) return 0;
+    }
+    return strtoull(s, NULL, 10);
+}
+
+static void get_bag_prop(const char *slot, int flush_bag, const char *name, char *out) {
+    char suffix[32];
+    snprintf(suffix, sizeof(suffix), "%s%s", flush_bag ? "f_" : "", name);
+    get_slot_prop(slot, suffix, out);
+}
+
+static void read_bag(const char *slot, int flush_bag, struct xfrm_bag *b) {
+    char stamp[PROP_VALUE_MAX] = {0};
+
+    memset(b, 0, sizeof(*b));
+    /* Stamp first: the service writes it after the fields, so the fields
+     * read below are at least as new as the stamp. */
+    get_slot_prop(slot, flush_bag ? "flush" : "trigger", stamp);
+    b->stamp = parse_stamp(stamp);
+
+    get_bag_prop(slot, flush_bag, "pcscf",       b->pcscf);
+    get_bag_prop(slot, flush_bag, "local",       b->local);
+    get_bag_prop(slot, flush_bag, "ue_portc",    b->ue_portc);
+    get_bag_prop(slot, flush_bag, "ue_ports",    b->ue_ports);
+    get_bag_prop(slot, flush_bag, "pcscf_portc", b->pc_portc);
+    get_bag_prop(slot, flush_bag, "pcscf_ports", b->pc_ports);
+    if (!flush_bag) {
+        get_slot_prop(slot, "server_spic", b->server_spic);
+        get_slot_prop(slot, "server_spis", b->server_spis);
+    }
+    b->valid = valid_ipv6(b->pcscf) && valid_ipv6(b->local)
+            && valid_port(b->ue_portc) && valid_port(b->ue_ports)
+            && valid_port(b->pc_portc) && valid_port(b->pc_ports)
+            && (flush_bag || (valid_spi(b->server_spic) && valid_spi(b->server_spis)));
+}
+
+/* Selector of one of the four policies; spi is set for outbound only. */
+struct xfrm_sel {
+    const char *src, *dst, *sport, *dport, *dir, *spi;
+};
+
+static void bag_policies(const struct xfrm_bag *b, struct xfrm_sel p[4]) {
+    /* SA1 out: UE:portC -> PCSCF:portS, spi = server's spi-s */
+    p[0] = (struct xfrm_sel){b->local, b->pcscf, b->ue_portc, b->pc_ports, "out", b->server_spis};
+    /* SA2 in: PCSCF:portS -> UE:portC */
+    p[1] = (struct xfrm_sel){b->pcscf, b->local, b->pc_ports, b->ue_portc, "in", NULL};
+    /* SA3 out: UE:portS -> PCSCF:portC, spi = server's spi-c */
+    p[2] = (struct xfrm_sel){b->local, b->pcscf, b->ue_ports, b->pc_portc, "out", b->server_spic};
+    /* SA4 in: PCSCF:portC -> UE:portS */
+    p[3] = (struct xfrm_sel){b->pcscf, b->local, b->pc_portc, b->ue_ports, "in", NULL};
+}
+
+static int same_selector(const struct xfrm_sel *a, const struct xfrm_sel *b) {
+    return !strcmp(a->src, b->src) && !strcmp(a->dst, b->dst)
+        && !strcmp(a->sport, b->sport) && !strcmp(a->dport, b->dport)
+        && !strcmp(a->dir, b->dir);
+}
+
+/*
+ * True if bag `other` names policy `p` and was requested after `mine`.
+ * Runs take the lock in any order (see lock_helper()) and read the current
+ * bags, so each run acts only on the policies whose latest request is its
+ * own; the result then matches the request order. Checked per policy: a
+ * re-registration may keep ports, so the old and new quartets can share
+ * single policies.
+ */
+static int superseded(const struct xfrm_sel *p, const struct xfrm_bag *mine,
+                      const struct xfrm_bag *other) {
+    if (!other->valid || other->stamp <= mine->stamp) return 0;
+    struct xfrm_sel q[4];
+    bag_policies(other, q);
+    for (int i = 0; i < 4; i++) {
+        if (same_selector(p, &q[i])) return 1;
+    }
+    return 0;
+}
+
+static int install_slot(const char *slot) {
+    struct xfrm_bag inst, flush;
+    read_bag(slot, 0, &inst);
+    read_bag(slot, 1, &flush);
+    if (!inst.valid) { fprintf(stderr, "invalid install bag\n"); return 1; }
+
+    struct xfrm_sel p[4];
+    bag_policies(&inst, p);
+    for (int i = 0; i < 4; i++) {
+        if (superseded(&p[i], &inst, &flush)) continue;
+        /* Wipe a stale version first (ignore errors). */
+        del_policy(p[i].src, p[i].dst, p[i].sport, p[i].dport, p[i].dir);
+        int rc = p[i].spi
+            ? add_out_policy(p[i].src, p[i].dst, p[i].sport, p[i].dport, p[i].spi)
+            : add_in_policy(p[i].src, p[i].dst, p[i].sport, p[i].dport);
+        if (rc != 0) { fprintf(stderr, "SA%d %s failed rc=%d\n", i + 1, p[i].dir, rc); return 10 + i; }
+    }
+    return 0;
+}
+
+static int flush_slot(const char *slot) {
+    struct xfrm_bag inst, flush;
+    read_bag(slot, 1, &flush);
+    read_bag(slot, 0, &inst);
+    /* Empty bag: nothing to flush. */
+    if (!flush.valid) return 0;
+
+    struct xfrm_sel p[4];
+    bag_policies(&flush, p);
+    for (int i = 0; i < 4; i++) {
+        if (superseded(&p[i], &flush, &inst)) continue;
+        del_policy(p[i].src, p[i].dst, p[i].sport, p[i].dport, p[i].dir);
+    }
+    return 0;
+}
+
+/*
+ * Init starts each run with exec_background so a slow or hung `ip` cannot
+ * stall its action queue; runs may therefore overlap. Serialise them on an
+ * exclusive lock of this executable, which the kernel drops when the
+ * process exits.
+ */
+static int lock_helper(void) {
+    int fd = open("/system/bin/ims_xfrm", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { perror("open lock"); return -1; }
+    if (flock(fd, LOCK_EX) != 0) { perror("flock"); close(fd); return -1; }
+    return fd;
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "usage: ims_xfrm addprop <slot> | flushprop <slot> | add ... | flush ...\n");
@@ -193,67 +343,17 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Held until exit. */
+    if (lock_helper() < 0) return 1;
+
     if (strcmp(argv[1], "addprop") == 0 && argc >= 3) {
-        const char *slot = argv[2];
-        if (!valid_slot(slot)) { fprintf(stderr, "invalid slot\n"); return 1; }
-
-        char pcscf[PROP_VALUE_MAX]      = {0};
-        char local[PROP_VALUE_MAX]      = {0};
-        char ue_portc[PROP_VALUE_MAX]   = {0};
-        char ue_ports[PROP_VALUE_MAX]   = {0};
-        char pc_portc[PROP_VALUE_MAX]   = {0};
-        char pc_ports[PROP_VALUE_MAX]   = {0};
-        char server_spic[PROP_VALUE_MAX] = {0};
-        char server_spis[PROP_VALUE_MAX] = {0};
-        get_slot_prop(slot, "pcscf",       pcscf);
-        get_slot_prop(slot, "local",       local);
-        get_slot_prop(slot, "ue_portc",    ue_portc);
-        get_slot_prop(slot, "ue_ports",    ue_ports);
-        get_slot_prop(slot, "pcscf_portc", pc_portc);
-        get_slot_prop(slot, "pcscf_ports", pc_ports);
-        get_slot_prop(slot, "server_spic", server_spic);
-        get_slot_prop(slot, "server_spis", server_spis);
-
-        if (!valid_ipv6(pcscf) || !valid_ipv6(local)) {
-            fprintf(stderr, "invalid ipv6\n"); return 1;
-        }
-        if (!valid_port(ue_portc) || !valid_port(ue_ports)
-         || !valid_port(pc_portc) || !valid_port(pc_ports)) {
-            fprintf(stderr, "invalid port\n"); return 1;
-        }
-        if (!valid_spi(server_spic) || !valid_spi(server_spis)) {
-            fprintf(stderr, "invalid spi\n"); return 1;
-        }
-        return do_install(pcscf, local, ue_portc, ue_ports,
-                          pc_portc, pc_ports, server_spic, server_spis);
+        if (!valid_slot(argv[2])) { fprintf(stderr, "invalid slot\n"); return 1; }
+        return install_slot(argv[2]);
     }
 
     if (strcmp(argv[1], "flushprop") == 0 && argc >= 3) {
-        const char *slot = argv[2];
-        if (!valid_slot(slot)) { fprintf(stderr, "invalid slot\n"); return 1; }
-
-        char pcscf[PROP_VALUE_MAX]    = {0};
-        char local[PROP_VALUE_MAX]    = {0};
-        char ue_portc[PROP_VALUE_MAX] = {0};
-        char ue_ports[PROP_VALUE_MAX] = {0};
-        char pc_portc[PROP_VALUE_MAX] = {0};
-        char pc_ports[PROP_VALUE_MAX] = {0};
-        /* The flush bag (f_*) names the policies being removed. The install
-         * bag may already describe the next registration's policies by the
-         * time init runs this. */
-        get_slot_prop(slot, "f_pcscf",       pcscf);
-        get_slot_prop(slot, "f_local",       local);
-        get_slot_prop(slot, "f_ue_portc",    ue_portc);
-        get_slot_prop(slot, "f_ue_ports",    ue_ports);
-        get_slot_prop(slot, "f_pcscf_portc", pc_portc);
-        get_slot_prop(slot, "f_pcscf_ports", pc_ports);
-
-        /* Empty bag: nothing to flush — bail cleanly so init's exec
-         * doesn't log a failure. */
-        if (!valid_ipv6(pcscf) || !valid_ipv6(local)) return 0;
-        if (!valid_port(ue_portc) || !valid_port(ue_ports)
-         || !valid_port(pc_portc) || !valid_port(pc_ports)) return 0;
-        return do_flush(pcscf, local, ue_portc, ue_ports, pc_portc, pc_ports);
+        if (!valid_slot(argv[2])) { fprintf(stderr, "invalid slot\n"); return 1; }
+        return flush_slot(argv[2]);
     }
 
     if (strcmp(argv[1], "add") == 0 && argc >= 10) {

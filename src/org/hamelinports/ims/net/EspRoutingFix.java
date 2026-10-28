@@ -1,5 +1,6 @@
 package org.hamelinports.ims.net;
 
+import android.os.SystemClock;
 import android.util.Log;
 
 /**
@@ -60,10 +61,7 @@ public final class EspRoutingFix {
                 android.os.SystemProperties.set(p + "pcscf_ports", Integer.toString(pcscfPortS));
                 android.os.SystemProperties.set(p + "server_spic", String.format("0x%08x", serverSpiC));
                 android.os.SystemProperties.set(p + "server_spis", String.format("0x%08x", serverSpiS));
-                /* Trigger — monotonic value so the property always changes
-                 * and init re-fires the on-property action. */
-                android.os.SystemProperties.set(p + "trigger",
-                        String.valueOf(System.currentTimeMillis()));
+                android.os.SystemProperties.set(p + "trigger", requestStamp());
                 Log.i(TAG, "xfrm 4-policy trigger set: slot=" + slotId + " "
                         + pcscfIpv6 + "[" + pcscfPortC + "/" + pcscfPortS + "] <-> "
                         + localIpv6 + "[" + uePortC + "/" + uePortS + "]");
@@ -93,14 +91,23 @@ public final class EspRoutingFix {
                 android.os.SystemProperties.set(p + "f_ue_ports",    Integer.toString(uePortS));
                 android.os.SystemProperties.set(p + "f_pcscf_portc", Integer.toString(pcscfPortC));
                 android.os.SystemProperties.set(p + "f_pcscf_ports", Integer.toString(pcscfPortS));
-                android.os.SystemProperties.set(p + "flush",
-                        String.valueOf(System.currentTimeMillis()));
+                android.os.SystemProperties.set(p + "flush", requestStamp());
                 Log.i(TAG, "xfrm flush trigger set: slot=" + slotId + " ports "
                         + uePortC + "/" + uePortS);
             } catch (Exception e) {
                 Log.w(TAG, "xfrm flush trigger failed", e);
             }
         }
+    }
+
+    /**
+     * Value for the trigger/flush property. It always changes, so init re-fires
+     * the action, and it is monotonic within a boot (the properties do not
+     * survive one): the helper compares install and flush stamps to apply
+     * overlapping requests in order.
+     */
+    private static String requestStamp() {
+        return Long.toString(SystemClock.elapsedRealtimeNanos());
     }
 
     public static void removeRule(String localIpv6) {

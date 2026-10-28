@@ -1,11 +1,14 @@
+# exec_background: init does not wait for the helper, so a slow or hung
+# netlink call cannot stall its action queue. The helper serialises its
+# runs and orders install against flush itself (see ims_xfrm.c).
 on property:lineage.ims.xfrm.0.trigger=*
-    exec - root root -- /system/bin/ims_xfrm addprop 0
+    exec_background - root root -- /system/bin/ims_xfrm addprop 0
 
 on property:lineage.ims.xfrm.1.trigger=*
-    exec - root root -- /system/bin/ims_xfrm addprop 1
+    exec_background - root root -- /system/bin/ims_xfrm addprop 1
 
 on property:lineage.ims.xfrm.0.flush=*
-    exec - root root -- /system/bin/ims_xfrm flushprop 0
+    exec_background - root root -- /system/bin/ims_xfrm flushprop 0
 
 on property:lineage.ims.xfrm.1.flush=*
-    exec - root root -- /system/bin/ims_xfrm flushprop 1
+    exec_background - root root -- /system/bin/ims_xfrm flushprop 1

@@ -24,3 +24,7 @@ allow ims_xfrm system_file:file { read open execute execute_no_trans getattr map
 
 # Process
 allow ims_xfrm self:process { fork };
+
+# Runs overlap (exec_background); they serialise on a lock of the helper's
+# own executable.
+allow ims_xfrm ims_xfrm_exec:file lock;
