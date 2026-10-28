@@ -1171,8 +1171,7 @@ public:
         }
 
         /* Video upcall — only when a video m-line was offered AND
-         * accepted. gOnCallAnswerVideo resolved via GetMethodID at
-         * setCallSessionListener time; OK to no-op if not present. */
+         * accepted. */
         if (videoPort > 0 && gOnCallAnswerVideo) {
             const std::string& vip = videoIp.empty() ? audioIp : videoIp;
             jstring jIp    = env->NewStringUTF(vip.c_str());
@@ -2507,10 +2506,125 @@ inline std::string&  bridgeLastMtCallId(Bridge* b)        { return b->mLastMtCal
  * Java ↔ C++ entry points
  * --------------------------------------------------------------------- */
 
+namespace {
+struct MethodSpec {
+    jmethodID*  id;
+    const char* name;
+    const char* sig;
+};
+
+/* Resolve against the declaring interface, not a listener's concrete
+ * class: MO and MT sessions register different implementors, and an ID
+ * taken from one class is invalid on an instance of another (CheckJNI
+ * aborts, plain ART dispatches through the wrong vtable slot). Interface
+ * method IDs dispatch on every implementor, default methods included. */
+template <size_t N>
+bool resolveMethods(JNIEnv* env, const char* className,
+                    const MethodSpec (&specs)[N]) {
+    jclass cls = env->FindClass(className);
+    if (!cls) {
+        LOGE("JNI_OnLoad: class %s not found", className);
+        return false;
+    }
+    bool ok = true;
+    for (const MethodSpec& m : specs) {
+        *m.id = env->GetMethodID(cls, m.name, m.sig);
+        if (!*m.id) {
+            LOGE("JNI_OnLoad: %s.%s%s not found", className, m.name, m.sig);
+            ok = false;
+            break;
+        }
+    }
+    env->DeleteLocalRef(cls);
+    return ok;
+}
+
+bool resolveAkaResult(JNIEnv* env) {
+    jclass cls = env->FindClass("org/hamelinports/ims/sip/AkaResult");
+    if (!cls) {
+        LOGE("JNI_OnLoad: AkaResult class not found");
+        return false;
+    }
+    gAkaResultClass = (jclass)env->NewGlobalRef(cls);
+    gFieldRes  = env->GetFieldID(cls, "res",  "[B");
+    gFieldCk   = env->GetFieldID(cls, "ck",   "[B");
+    gFieldIk   = env->GetFieldID(cls, "ik",   "[B");
+    gFieldAuts = env->GetFieldID(cls, "auts", "[B");
+    env->DeleteLocalRef(cls);
+    return gAkaResultClass && gFieldRes && gFieldCk && gFieldIk && gFieldAuts;
+}
+
+/* Runs inside System.loadLibrary(), so FindClass sees the app's class
+ * loader and every ID is published before any SIP thread can upcall. */
+bool resolveJavaIds(JNIEnv* env) {
+    static const MethodSpec kAka[] = {
+        { &gOnAuthChallengeMethod, "onAuthChallenge",
+          "([B[BJJIILjava/lang/String;)Lorg/hamelinports/ims/sip/AkaResult;" },
+    };
+    static const MethodSpec kReg[] = {
+        { &gOnRegisteredMethod,        "onRegistered",      "(Ljava/lang/String;)V" },
+        { &gOnDeregisteredMethod,      "onDeregistered",    "(ILjava/lang/String;I)V" },
+        { &gOnRegisterExpiresReported, "onExpiresReported", "(I)V" },
+    };
+    static const MethodSpec kCall[] = {
+        { &gOnCallProvisional, "onProvisional", "(ILjava/lang/String;)V" },
+        { &gOnCallConnected,   "onConnected",   "(ILjava/lang/String;)V" },
+        { &gOnCallTerminated,  "onTerminated",  "(ILjava/lang/String;)V" },
+        { &gOnCallFailure,     "onFailure",     "(ILjava/lang/String;)V" },
+        { &gOnCallAnswer,      "onAnswer",
+          "(Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)V" },
+        { &gOnCallAnswerVideo, "onAnswerVideo",
+          "(Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)V" },
+        /* (audioIp, audioPort, audioRtcp, audioPt, audioRate, audioCodec,
+         *  audioFmtp, videoIp, videoPort, videoRtcp, videoPt, videoRate,
+         *  videoCodec, videoFmtp) — video port=0 when the re-INVITE
+         *  dropped video. */
+        { &gOnRemoteReinvite,  "onRemoteReinvite",
+          "(Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;"
+          "Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)V" },
+    };
+    static const MethodSpec kIncoming[] = {
+        /* (callId, fromUri, remoteIp, remotePort, rtcpPort, pt,
+         *  clockRate, codecName, fmtp) */
+        { &gOnIncomingInvite,      "onIncomingInvite",
+          "(Ljava/lang/String;Ljava/lang/String;"
+          "Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)V" },
+        { &gOnIncomingInviteVideo, "onIncomingInviteVideo",
+          "(Ljava/lang/String;Ljava/lang/String;"
+          "IIIILjava/lang/String;Ljava/lang/String;)V" },
+        { &gOnIncomingCancelled,   "onIncomingCancelled",
+          "(Ljava/lang/String;I)V" },
+    };
+    static const MethodSpec kSms[] = {
+        { &gOnSmsSendSuccess, "onSendSuccess", "(ILjava/lang/String;)V" },
+        { &gOnSmsSendFailure, "onSendFailure", "(ILjava/lang/String;)V" },
+        { &gOnSmsIncoming,    "onIncomingSms", "([B)V" },
+    };
+    return resolveMethods(env, "org/hamelinports/ims/sip/AkaProvider", kAka)
+        && resolveMethods(env, "org/hamelinports/ims/sip/RegistrationListener", kReg)
+        && resolveMethods(env, "org/hamelinports/ims/sip/CallSessionListener", kCall)
+        && resolveMethods(env, "org/hamelinports/ims/sip/IncomingCallListener", kIncoming)
+        && resolveMethods(env, "org/hamelinports/ims/sip/SmsSessionListener", kSms)
+        && resolveAkaResult(env);
+}
+}  // namespace
+
 extern "C" JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM* vm, void* /*reserved*/)
 {
     gJvm = vm;
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK)
+        return JNI_ERR;
+    if (!resolveJavaIds(env)) {
+        /* Java/native skew: fail the load so HamelinPortsSipStack reports
+         * the bridge unavailable instead of upcalling through null IDs. */
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+        }
+        return JNI_ERR;
+    }
     return JNI_VERSION_1_6;
 }
 
@@ -2547,32 +2661,6 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetAkaProvider(
     }
 
     b->mAkaProvider = env->NewGlobalRef(provider);
-
-    if (!gOnAuthChallengeMethod) {
-        jclass providerCls = env->GetObjectClass(provider);
-        gOnAuthChallengeMethod = env->GetMethodID(
-                providerCls, "onAuthChallenge",
-                "([B[BJJIILjava/lang/String;)Lorg/hamelinports/ims/sip/AkaResult;");
-        env->DeleteLocalRef(providerCls);
-        if (!gOnAuthChallengeMethod) {
-            LOGE("AKA provider missing onAuthChallenge method");
-            return;
-        }
-    }
-
-    if (!gAkaResultClass) {
-        jclass cls = env->FindClass("org/hamelinports/ims/sip/AkaResult");
-        if (!cls) {
-            LOGE("AkaResult class not found");
-            return;
-        }
-        gAkaResultClass = (jclass)env->NewGlobalRef(cls);
-        gFieldRes  = env->GetFieldID(cls, "res",  "[B");
-        gFieldCk   = env->GetFieldID(cls, "ck",   "[B");
-        gFieldIk   = env->GetFieldID(cls, "ik",   "[B");
-        gFieldAuts = env->GetFieldID(cls, "auts", "[B");
-        env->DeleteLocalRef(cls);
-    }
     LOGI("AKA provider registered slot=%d", (int)slotId);
 }
 
@@ -2642,36 +2730,6 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetCallSessionListener(
     }
     if (!listener) return;
     b->mCallListener = env->NewGlobalRef(listener);
-    if (gOnCallProvisional) return;  /* method-id cache filled already */
-    jclass cls = env->GetObjectClass(listener);
-    gOnCallProvisional = env->GetMethodID(cls, "onProvisional", "(ILjava/lang/String;)V");
-    gOnCallConnected   = env->GetMethodID(cls, "onConnected",   "(ILjava/lang/String;)V");
-    gOnCallTerminated  = env->GetMethodID(cls, "onTerminated",  "(ILjava/lang/String;)V");
-    gOnCallFailure     = env->GetMethodID(cls, "onFailure",     "(ILjava/lang/String;)V");
-    gOnCallAnswer      = env->GetMethodID(cls, "onAnswer",
-            "(Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)V");
-    gOnCallAnswerVideo = env->GetMethodID(cls, "onAnswerVideo",
-            "(Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)V");
-    if (env->ExceptionCheck()) {
-        /* onAnswerVideo is optional on listeners that pre-date C.2;
-         * clear NoSuchMethodError so we don't leave a pending
-         * exception when the Bridge returns to the VM. */
-        env->ExceptionClear();
-        gOnCallAnswerVideo = nullptr;
-    }
-    /* Signature: (audioIp, audioPort, audioRtcp, audioPt, audioRate,
-     *             audioCodec, audioFmtp,
-     *             videoIp, videoPort, videoRtcp, videoPt, videoRate,
-     *             videoCodec, videoFmtp) — video fields carry port=0
-     *             when the remote re-INVITE dropped video. */
-    gOnRemoteReinvite = env->GetMethodID(cls, "onRemoteReinvite",
-            "(Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;"
-            "Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)V");
-    if (env->ExceptionCheck()) {
-        env->ExceptionClear();
-        gOnRemoteReinvite = nullptr;
-    }
-    env->DeleteLocalRef(cls);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -2752,24 +2810,6 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetIncomingCallListener
     }
     if (!listener) return;
     b->mIncomingCallListener = env->NewGlobalRef(listener);
-    if (gOnIncomingInvite) return;  /* method-id cache filled already */
-    jclass cls = env->GetObjectClass(listener);
-    /* Signature: (callId, fromUri, remoteIp, remotePort, rtcpPort,
-     *             pt, clockRate, codecName, fmtp) */
-    gOnIncomingInvite = env->GetMethodID(cls, "onIncomingInvite",
-            "(Ljava/lang/String;Ljava/lang/String;"
-            "Ljava/lang/String;IIIILjava/lang/String;Ljava/lang/String;)V");
-    gOnIncomingInviteVideo = env->GetMethodID(cls, "onIncomingInviteVideo",
-            "(Ljava/lang/String;Ljava/lang/String;"
-            "IIIILjava/lang/String;Ljava/lang/String;)V");
-    if (env->ExceptionCheck()) {
-        /* Optional — pre-C.5 listeners don't have this method. */
-        env->ExceptionClear();
-        gOnIncomingInviteVideo = nullptr;
-    }
-    gOnIncomingCancelled = env->GetMethodID(cls, "onIncomingCancelled",
-            "(Ljava/lang/String;I)V");
-    env->DeleteLocalRef(cls);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -2814,12 +2854,6 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetSmsListener(
     }
     if (!listener) return;
     b->mSmsListener = env->NewGlobalRef(listener);
-    if (gOnSmsSendSuccess) return;  /* method-id cache filled already */
-    jclass cls = env->GetObjectClass(listener);
-    gOnSmsSendSuccess = env->GetMethodID(cls, "onSendSuccess", "(ILjava/lang/String;)V");
-    gOnSmsSendFailure = env->GetMethodID(cls, "onSendFailure", "(ILjava/lang/String;)V");
-    gOnSmsIncoming    = env->GetMethodID(cls, "onIncomingSms", "([B)V");
-    env->DeleteLocalRef(cls);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -2860,12 +2894,6 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetRegistrationListener
     }
     if (!listener) return;
     b->mRegListener = env->NewGlobalRef(listener);
-    if (gOnRegisteredMethod) return;  /* method-id cache filled already */
-    jclass cls = env->GetObjectClass(listener);
-    gOnRegisteredMethod   = env->GetMethodID(cls, "onRegistered",   "(Ljava/lang/String;)V");
-    gOnDeregisteredMethod = env->GetMethodID(cls, "onDeregistered", "(ILjava/lang/String;I)V");
-    gOnRegisterExpiresReported = env->GetMethodID(cls, "onExpiresReported", "(I)V");
-    env->DeleteLocalRef(cls);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
