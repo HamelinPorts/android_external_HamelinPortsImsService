@@ -61,7 +61,22 @@ const ListenerMethodSpec* listenerMethodSpecs(size_t* count);
  * (JNI_OnLoad). Leaves no exception pending. Returns the number of methods
  * that could not be resolved (their IDs stay null).
  */
-int resolveListenerMethods(JNIEnv* env, ListenerMethodIds* ids);
+using MissingIdLogger = void (*)(const char* owner, const char* name, const char* signature);
+int resolveListenerMethods(JNIEnv* env, ListenerMethodIds* ids, MissingIdLogger log = nullptr);
+
+struct AkaResultIds {
+    jclass resultClass = nullptr;
+    jfieldID res = nullptr;
+    jfieldID ck = nullptr;
+    jfieldID ik = nullptr;
+    jfieldID auts = nullptr;
+};
+
+/** Resolves AKA result fields at load time; clears lookup exceptions and reports every missing ID. */
+int resolveAkaResult(JNIEnv* env, AkaResultIds* ids, MissingIdLogger log = nullptr);
+
+/** JNI_OnLoad gate: every required method and field must resolve before the library is usable. */
+jint initializeJni(JavaVM* vm, ListenerMethodIds* methods, AkaResultIds* aka, MissingIdLogger log);
 
 /** One Java listener, replaced from Java threads and called from native threads. */
 class ListenerSlot {

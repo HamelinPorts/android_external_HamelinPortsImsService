@@ -83,6 +83,7 @@
 #include "resip/dum/ClientInviteSession.hxx"
 #include "resip/dum/ServerInviteSession.hxx"
 #include "resip/dum/AppDialogSetFactory.hxx"
+#include "resip/dum/AppDialogSet.hxx"
 #include "resip/dum/PagerMessageHandler.hxx"
 #include "resip/dum/ClientPagerMessage.hxx"
 #include "resip/dum/ServerPagerMessage.hxx"
@@ -227,11 +228,7 @@ std::string&  bridgeLastMtCallId(Bridge*);
  * --------------------------------------------------------------------- */
 
 JavaVM*   gJvm                  = nullptr;
-jclass    gAkaResultClass       = nullptr;   /* global ref */
-jfieldID  gFieldRes             = nullptr;
-jfieldID  gFieldCk              = nullptr;
-jfieldID  gFieldIk              = nullptr;
-jfieldID  gFieldAuts            = nullptr;
+hamelinports::AkaResultIds gAkaIds;
 /* Listener method IDs, from the interfaces; written once in JNI_OnLoad. */
 hamelinports::ListenerMethodIds gIds;
 
@@ -725,7 +722,7 @@ private:
             return false;
         }
 
-        jbyteArray jRes = (jbyteArray)env->GetObjectField(jResult, gFieldRes);
+        jbyteArray jRes = (jbyteArray)env->GetObjectField(jResult, gAkaIds.res);
         env->DeleteLocalRef(jResult);
         if (!jRes) {
             if (attached) gJvm->DetachCurrentThread();
@@ -1112,6 +1109,58 @@ private:
  * connect, and either be ended by us or the remote).
  * --------------------------------------------------------------------- */
 
+/* State belongs to the INVITE set, including forks surviving local hangup.
+ * DUM owns the object; every access runs on its processing thread. */
+std::shared_ptr<ListenerSlot> snapshotCallListener(Bridge* bridge) {
+    bool attached = false;
+    JNIEnv* env = attachJni(&attached);
+    if (!env) return nullptr;
+    auto snapshot = std::shared_ptr<ListenerSlot>(new ListenerSlot, [](ListenerSlot* slot) {
+        bool attached = false;
+        JNIEnv* env = attachJni(&attached);
+        if (env) slot->set(env, nullptr);
+        delete slot;
+        if (attached) gJvm->DetachCurrentThread();
+    });
+    {
+        ScopedListener current(env, bridgeCallListener(bridge));
+        if (current) snapshot->set(env, current.get());
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (attached) gJvm->DetachCurrentThread();
+    return snapshot->isSet() ? snapshot : nullptr;
+}
+
+class OutgoingCallDialogSet : public resip::AppDialogSet {
+public:
+    OutgoingCallDialogSet(resip::DialogUsageManager& dum,
+                          std::shared_ptr<ListenerSlot> listener)
+        : resip::AppDialogSet(dum), listener(std::move(listener)) {}
+    const std::shared_ptr<ListenerSlot> listener;
+    bool locallyEnded = false;
+    bool connected = false;
+    resip::ClientInviteSessionHandle winner;
+};
+
+struct OutgoingCallConfig {
+    std::string pcscfHost;
+    unsigned int transportKey;
+    int pcscfPort;
+    std::shared_ptr<resip::MasterProfile> profile;
+};
+
+class CallControlCommand : public resip::DumCommandAdapter {
+public:
+    explicit CallControlCommand(std::function<void()> action)
+        : mAction(std::move(action)) {}
+    void executeCommand() override { mAction(); }
+    EncodeStream& encodeBrief(EncodeStream& strm) const override {
+        return strm << "CallControlCommand";
+    }
+private:
+    std::function<void()> mAction;
+};
+
 class HamelinPortsInviteHandler : public resip::InviteSessionHandler {
 public:
     HamelinPortsInviteHandler() = default;
@@ -1119,6 +1168,35 @@ public:
     /** Bridge owning this handler. Set during Bridge construction so
      *  upcalls reach the right slot's call/incoming-call listeners. */
     Bridge* mBridge = nullptr;
+
+    void beginOutgoing(OutgoingCallDialogSet& dialogSet) {
+        std::lock_guard<std::mutex> g(mMu);
+        mOutgoing = dialogSet.getHandle();
+        mActive = resip::ClientInviteSessionHandle::NotValid();
+    }
+
+    void endOutgoing() {
+        resip::AppDialogSetHandle set;
+        resip::ClientInviteSessionHandle active;
+        bool connected;
+        {
+            std::lock_guard<std::mutex> g(mMu);
+            set = mOutgoing;
+            if (!set.isValid()) return;
+            auto* call = static_cast<OutgoingCallDialogSet*>(set.get());
+            if (call->locallyEnded) return;
+            call->locallyEnded = true;
+            connected = call->connected;
+            active = mActive;
+        }
+        // Ending one early dialog sends BYE; ending its set sends CANCEL.
+        if (connected && active.isValid()) active->end();
+        else set->end();
+    }
+
+    void callSetupFailed(const ListenerSlot& listener) {
+        upcall(gIds.callFailure, 500, "Call setup failed", &listener);
+    }
 
     resip::ClientInviteSessionHandle takeActive() {
         std::lock_guard<std::mutex> g(mMu);
@@ -1132,6 +1210,7 @@ public:
     void clearActive() {
         std::lock_guard<std::mutex> g(mMu);
         mActive = resip::ClientInviteSessionHandle::NotValid();
+        mOutgoing = resip::AppDialogSetHandle::NotValid();
         mServerByCallId.clear();
     }
 
@@ -1153,13 +1232,22 @@ public:
     }
 
 private:
-    void upcall(jmethodID m, int code, const std::string& reason) {
-        if (!bridgeCallListener(mBridge).isSet() || !m) return;
+    const ListenerSlot& listenerFor(resip::AppDialogSetHandle set) {
+        static const ListenerSlot empty;
+        if (!set.isValid()) return empty;
+        auto* call = dynamic_cast<OutgoingCallDialogSet*>(set.get());
+        return call ? *call->listener : bridgeCallListener(mBridge);
+    }
+
+    void upcall(jmethodID m, int code, const std::string& reason,
+                const ListenerSlot* selected = nullptr) {
+        const auto& slot = selected ? *selected : bridgeCallListener(mBridge);
+        if (!slot.isSet() || !m) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
         if (!env) return;
         {
-            ScopedListener listener(env, bridgeCallListener(mBridge));
+            ScopedListener listener(env, slot);
             if (listener) {
                 jstring jr = env->NewStringUTF(reason.c_str());
                 env->CallVoidMethod(listener.get(), m, (jint)code, jr);
@@ -1173,8 +1261,7 @@ private:
 public:
     void onNewSession(resip::ClientInviteSessionHandle h,
                       resip::InviteSession::OfferAnswerType, const resip::SipMessage&) override {
-        std::lock_guard<std::mutex> g(mMu);
-        mActive = h;
+        // A provisional fork must never replace the connected winner.
         LOGI("INVITE onNewSession (client)");
     }
     void onNewSession(resip::ServerInviteSessionHandle h,
@@ -1207,37 +1294,43 @@ public:
             mPendingIncomingFromUri = fromUri;
         }
     }
-    void onFailure(resip::ClientInviteSessionHandle, const resip::SipMessage& msg) override {
+    void onFailure(resip::ClientInviteSessionHandle h, const resip::SipMessage& msg) override {
+        if (!h.isValid() || !shouldReportOutgoingTerminal(h->getSessionHandle())) return;
         const int code = msg.header(resip::h_StatusLine).statusCode();
         const std::string r = msg.header(resip::h_StatusLine).reason().c_str();
         LOGE("INVITE onFailure: %d %s", code, r.c_str());
-        upcall(gIds.callFailure, code, r);
+        upcall(gIds.callFailure, code, r, &listenerFor(h->getAppDialogSet()));
     }
     void onEarlyMedia(resip::ClientInviteSessionHandle, const resip::SipMessage&,
                       const resip::SdpContents&) override {
         LOGI("INVITE onEarlyMedia");
     }
-    void onProvisional(resip::ClientInviteSessionHandle, const resip::SipMessage& msg) override {
+    void onProvisional(resip::ClientInviteSessionHandle h, const resip::SipMessage& msg) override {
+        if (!isCurrentOutgoing(h)) return;
         const int code = msg.header(resip::h_StatusLine).statusCode();
         const std::string r = msg.header(resip::h_StatusLine).reason().c_str();
         LOGI("INVITE onProvisional: %d %s", code, r.c_str());
-        upcall(gIds.callProvisional, code, r);
+        upcall(gIds.callProvisional, code, r, &listenerFor(h->getAppDialogSet()));
     }
     void onConnected(resip::ClientInviteSessionHandle h, const resip::SipMessage& msg) override {
         const int code = msg.header(resip::h_StatusLine).statusCode();
         LOGI("INVITE onConnected (client): %d", code);
-        /* Re-anchor mActive to the fork that actually won. When the
-         * network forks our INVITE (o2-de Mavenir does on every MO),
-         * onNewSession(ClientInviteSessionHandle) fires for EACH branch
-         * and the last one clobbers mActive — which is frequently a
-         * still-ringing branch, not the one that got 200 OK. Without
-         * this re-anchor, endCall() sends BYE on the losing fork and
-         * the winning (connected) dialog stays live until the network
-         * session-timer BYEs us ~10 s later — observed as "audio kept
-         * going for 10 s after user hangup". */
+        bool accept;
         {
             std::lock_guard<std::mutex> g(mMu);
-            mActive = h;
+            auto set = h->getAppDialogSet();
+            auto* call = set.isValid() ? dynamic_cast<OutgoingCallDialogSet*>(set.get()) : nullptr;
+            accept = call && set == mOutgoing && !call->locallyEnded
+                    && (!call->connected || mActive == h);
+            if (accept) {
+                call->connected = true;
+                call->winner = h;
+                mActive = h;
+            }
+        }
+        if (!accept) {
+            h->end();  // ACK is handled by DUM; dispose any late accepted fork.
+            return;
         }
         try {
             if (msg.exists(resip::h_SessionExpires)) {
@@ -1268,7 +1361,7 @@ public:
         } catch (const std::exception& e) {
             LOGE("onConnected dump failed: %s", e.what());
         }
-        upcall(gIds.callConnected, code, "");
+        upcall(gIds.callConnected, code, "", &listenerFor(h->getAppDialogSet()));
     }
     void onConnected(resip::InviteSessionHandle h, const resip::SipMessage&) override {
         /* SERVER side: DUM fires this synchronously inside accept(200),
@@ -1276,12 +1369,25 @@ public:
          * onConnectedConfirmed). The MO side uses the ClientInviteSession
          * overload; here we cover MT and route the "call-is-up" event to
          * the same upcall so the Java MT session starts media. */
+        if (!h->getAppDialogSet().isValid()) return;
         LOGI("INVITE onConnected (server side: 200 OK sent)");
         upcall(gIds.callConnected, 200, "");
     }
-    void onTerminated(resip::InviteSessionHandle,
+    void onTerminated(resip::InviteSessionHandle h,
                       resip::InviteSessionHandler::TerminatedReason reason,
                       const resip::SipMessage* msg) override {
+        auto set = h->getAppDialogSet();
+        if (!set.isValid()) return;
+        if (dynamic_cast<OutgoingCallDialogSet*>(set.get())) {
+            if (!shouldReportOutgoingTerminal(h)) return;
+            {
+                std::lock_guard<std::mutex> g(mMu);
+                if (set == mOutgoing) mActive = resip::ClientInviteSessionHandle::NotValid();
+            }
+            // Old sets own their listener; never clear a newer call or MT state.
+            upcall(gIds.callTerminated, (int)reason, "", &listenerFor(set));
+            return;
+        }
         LOGI("INVITE onTerminated reason=%d", (int)reason);
         if (msg != nullptr) {
             try {
@@ -1364,12 +1470,20 @@ public:
                 if (attached) gJvm->DetachCurrentThread();
             }
         }
-        upcall(gIds.callTerminated, (int)reason, "");
+        upcall(gIds.callTerminated, (int)reason, "", &listenerFor(h->getAppDialogSet()));
     }
     void onForkDestroyed(resip::ClientInviteSessionHandle) override {}
     void onRedirected(resip::ClientInviteSessionHandle, const resip::SipMessage&) override {}
-    void onAnswer(resip::InviteSessionHandle, const resip::SipMessage&,
+    void onAnswer(resip::InviteSessionHandle h, const resip::SipMessage&,
                   const resip::SdpContents& sdp) override {
+        auto set = h->getAppDialogSet();
+        if (!set.isValid()) return;
+        if (dynamic_cast<OutgoingCallDialogSet*>(set.get())) {
+            std::lock_guard<std::mutex> g(mMu);
+            auto* call = static_cast<OutgoingCallDialogSet*>(set.get());
+            if (set != mOutgoing || call->locallyEnded || (call->connected
+                    && (!mActive.isValid() || mActive.getId() != h.getId()))) return;
+        }
         LOGI("INVITE onAnswer (remote SDP received)");
 
         /* Walk the session's m-lines once. Audio fields drive the
@@ -1433,13 +1547,13 @@ public:
             return;
         }
 
-        if (!bridgeCallListener(mBridge).isSet() || !gIds.callAnswer) return;
+        if (!listenerFor(h->getAppDialogSet()).isSet() || !gIds.callAnswer) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
         if (!env) return;
 
         {  /* one listener reference for both upcalls, released before the detach */
-        ScopedListener listener(env, bridgeCallListener(mBridge));
+        ScopedListener listener(env, listenerFor(h->getAppDialogSet()));
         /* Audio upcall — unchanged signature for compatibility. */
         if (listener) {
             jstring jIp    = env->NewStringUTF(audioIp.c_str());
@@ -1586,7 +1700,7 @@ public:
          * video params in one call so Java has the complete new
          * offer shape in one hop. */
         if (isReinvite) {
-            if (!bridgeCallListener(mBridge).isSet() || !gIds.callRemoteReinvite) {
+            if (!listenerFor(h->getAppDialogSet()).isSet() || !gIds.callRemoteReinvite) {
                 LOGW("re-INVITE: no listener wired — rejecting implicitly (ignored)");
                 return;
             }
@@ -1594,7 +1708,7 @@ public:
             JNIEnv* re = attachJni(&reattached);
             if (!re) return;
             {
-                ScopedListener listener(re, bridgeCallListener(mBridge));
+                ScopedListener listener(re, listenerFor(h->getAppDialogSet()));
                 if (listener) {
                     jstring jAIp     = re->NewStringUTF(audioIp.c_str());
                     jstring jACodec  = re->NewStringUTF(audioCodec.c_str());
@@ -1691,6 +1805,27 @@ public:
 private:
     std::mutex                       mMu;
     resip::ClientInviteSessionHandle mActive;
+    resip::AppDialogSetHandle mOutgoing;
+
+    bool isCurrentOutgoing(resip::ClientInviteSessionHandle h) {
+        std::lock_guard<std::mutex> g(mMu);
+        if (!h.isValid()) return false;
+        auto set = h->getAppDialogSet();
+        if (!set.isValid()) return false;
+        auto* call = dynamic_cast<OutgoingCallDialogSet*>(set.get());
+        return call && set == mOutgoing && !call->locallyEnded
+                && (!call->connected || (mActive.isValid() && mActive == h));
+    }
+
+    bool shouldReportOutgoingTerminal(resip::InviteSessionHandle h) {
+        std::lock_guard<std::mutex> g(mMu);
+        if (!h.isValid()) return false;
+        auto set = h->getAppDialogSet();
+        if (!set.isValid()) return false;
+        auto* call = dynamic_cast<OutgoingCallDialogSet*>(set.get());
+        return call && (!call->connected || (call->winner.isValid()
+                && call->winner.getId() == h.getId()));
+    }
     /* Active server-side sessions, keyed by Call-ID. Writen in
      * onNewSession(server), read by Java accept/reject/progress
      * via takeServer(). Erased in onTerminated when the session
@@ -1777,12 +1912,21 @@ public:
         upcall(gIds.smsSendSuccess, code, "");
     }
     void onFailure(resip::ClientPagerMessageHandle, const resip::SipMessage& msg,
-                   std::unique_ptr<resip::Contents>) override {
+                   std::unique_ptr<resip::Contents> contents) override {
         const int code = msg.header(resip::h_StatusLine).statusCode();
         const std::string r = msg.header(resip::h_StatusLine).reason().c_str();
         LOGE("SMS onFailure: %d %s PAI=%s%s", code, r.c_str(), paiHost(msg).c_str(),
              diagHeaders(msg).c_str());
-        upcall(gIds.smsSendFailure, code, r);
+        int rpMr = -1;
+        if (contents) {
+            const auto* octets = dynamic_cast<const resip::OctetContents*>(contents.get());
+            const resip::Data& bytes = octets ? octets->octets() : contents->getBodyData();
+            // Only an MO RP-DATA failure belongs to a pending framework send.
+            if (bytes.size() >= 2 && static_cast<unsigned char>(bytes[0]) == 0) {
+                rpMr = static_cast<unsigned char>(bytes[1]);
+            }
+        }
+        upcall(gIds.smsSendFailure, code, r, rpMr);
     }
     void onMessageArrived(resip::ServerPagerMessageHandle h,
                           const resip::SipMessage& msg) override {
@@ -1862,7 +2006,7 @@ public:
     }
 
 private:
-    void upcall(jmethodID m, int code, const std::string& reason) {
+    void upcall(jmethodID m, int code, const std::string& reason, int rpMr = -1) {
         if (!bridgeSmsListener(mBridge).isSet() || !m) return;
         bool attached = false;
         JNIEnv* env = attachJni(&attached);
@@ -1871,7 +2015,11 @@ private:
             ScopedListener listener(env, bridgeSmsListener(mBridge));
             if (listener) {
                 jstring jr = env->NewStringUTF(reason.c_str());
-                env->CallVoidMethod(listener.get(), m, (jint)code, jr);
+                if (m == gIds.smsSendFailure) {
+                    env->CallVoidMethod(listener.get(), m, (jint)rpMr, (jint)code, jr);
+                } else {
+                    env->CallVoidMethod(listener.get(), m, (jint)code, jr);
+                }
                 env->DeleteLocalRef(jr);
             }
         }
@@ -2339,7 +2487,21 @@ public:
      *                   correctly — see project_a51_volte_root_cause memory.
      *  @param sdpOffer  SDP body (as a string) Java already built. */
     bool startCall(const std::string& targetUri, const std::string& sdpOffer) {
+        auto listener = snapshotCallListener(this);
+        if (!listener) return false;
         std::lock_guard<std::mutex> g(mMu);
+        if (!mStarted || !mDumRun || !mDum || !mProf) return false;
+        const OutgoingCallConfig config{mPcscfHostForSends, mPortCTransportKey,
+                mAkaCache.pcscfPortS, std::make_shared<resip::MasterProfile>(*mProf)};
+        mDum->post(new CallControlCommand([this, targetUri, sdpOffer, listener, config] {
+            if (!startCallOnDum(targetUri, sdpOffer, listener, config)) mInviteHandler.callSetupFailed(*listener);
+        }));
+        return true;
+    }
+
+    bool startCallOnDum(const std::string& targetUri, const std::string& sdpOffer,
+                        const std::shared_ptr<ListenerSlot>& listener,
+                        const OutgoingCallConfig& config) {
         if (!mStarted || !mDum) {
             LOGE("startCall: bridge not started");
             return false;
@@ -2349,7 +2511,16 @@ public:
             resip::HeaderFieldValue hfv(sdpOffer.data(), sdpOffer.size());
             resip::Mime sdpMime("application", "sdp");
             resip::SdpContents sdp(hfv, sdpMime);
-            auto inv = mDum->makeInviteSession(target, mProf, &sdp);
+            auto* dialogSet = new OutgoingCallDialogSet(*mDum, listener);
+            std::shared_ptr<resip::SipMessage> inv;
+            try {
+                inv = mDum->makeInviteSession(target, config.profile, &sdp, dialogSet);
+            } catch (...) {
+                // Before adoption DUM has no dialog set to destroy for us.
+                if (!dialogSet->getUserProfile()) delete dialogSet;
+                throw;
+            }
+            mInviteHandler.beginOutgoing(*dialogSet);
 
             /* Pin the outbound INVITE to the portC transport, same as
              * sendSms() does for MESSAGE. Without this, reSIProcate
@@ -2357,17 +2528,16 @@ public:
              * src=44267) that misses the xfrm out-policy (which keys
              * on sport=portC), so the SYN goes cleartext, P-CSCF
              * ignores it, and the INVITE times out 408. */
-            if (mPortCTransportKey != 0 && mAkaCache.pcscfPortS != 0) {
-                resip::Tuple dst(resip::Data(mPcscfHostForSends),
-                                 mAkaCache.pcscfPortS,
+            if (config.transportKey != 0 && config.pcscfPort != 0) {
+                resip::Tuple dst(resip::Data(config.pcscfHost),
+                                 config.pcscfPort,
                                  resip::TCP);
-                dst.mTransportKey = mPortCTransportKey;
+                dst.mTransportKey = config.transportKey;
                 inv->setDestination(dst);
             }
 
             mDum->send(inv);
-            LOGI("INVITE submitted: target=%s sdp=%u bytes",
-                 targetUri.c_str(), (unsigned)sdpOffer.size());
+            LOGI("INVITE submitted: sdp=%u bytes", (unsigned)sdpOffer.size());
             return true;
         } catch (const std::exception& e) {
             LOGE("startCall threw: %s", e.what());
@@ -2472,22 +2642,7 @@ public:
     /** Tear down the active outbound call (BYE if connected, CANCEL
      *  if early, otherwise no-op). */
     void endCall() {
-        std::lock_guard<std::mutex> g(mMu);
-        /* Safety: if the whole Bridge was torn down (e.g. IMS PDN
-         * lost mid-call), mActive still references a handle whose
-         * HandleManager is gone — isValid() would segfault. Skip
-         * everything when mStarted is false. */
-        if (!mStarted || !mDum) {
-            LOGI("endCall: bridge not started, no-op");
-            return;
-        }
-        try {
-            auto h = mInviteHandler.takeActive();
-            if (h.isValid()) {
-                h->end();
-                LOGI("endCall: end() invoked");
-            }
-        } catch (...) {}
+        postCallControl([this] { mInviteHandler.endOutgoing(); });
     }
 
     /** Respond 200 OK with {@code sdpAnswer} to an incoming re-INVITE
@@ -2560,7 +2715,12 @@ public:
      *  hang-up never reaches the wire, leaving the remote to time us
      *  out on RTCP silence (observed ~8 s). */
     bool endCallByCallId(const std::string& callId) {
-        std::lock_guard<std::mutex> g(mMu);
+        return postCallControl([this, callId] {
+            endCallByCallIdOnDum(callId);
+        });
+    }
+
+    bool endCallByCallIdOnDum(const std::string& callId) {
         if (!mStarted || !mDum) return false;
         try {
             auto h = mInviteHandler.takeServer(callId);
@@ -2587,7 +2747,12 @@ public:
      *  the PRACK handshake automatically if the INVITE required
      *  100rel (Mavenir on o2-de does). */
     bool progressRinging(const std::string& callId) {
-        std::lock_guard<std::mutex> g(mMu);
+        return postCallControl([this, callId] {
+            progressRingingOnDum(callId);
+        });
+    }
+
+    bool progressRingingOnDum(const std::string& callId) {
         if (!mStarted || !mDum) return false;
         try {
             auto h = mInviteHandler.takeServer(callId);
@@ -2621,7 +2786,15 @@ public:
      *  back on the handler). */
     bool acceptIncomingCall(const std::string& callId,
                             const std::string& sdpAnswer) {
-        std::lock_guard<std::mutex> g(mMu);
+        auto listener = snapshotCallListener(this);
+        if (!listener) return false;
+        return postCallControl([this, callId, sdpAnswer, listener] {
+            if (!acceptIncomingCallOnDum(callId, sdpAnswer)) mInviteHandler.callSetupFailed(*listener);
+        });
+    }
+
+    bool acceptIncomingCallOnDum(const std::string& callId,
+                            const std::string& sdpAnswer) {
         if (!mStarted || !mDum) return false;
         try {
             auto h = mInviteHandler.takeServer(callId);
@@ -2652,7 +2825,12 @@ public:
      *  the user taps reject in the incoming-call UI or the framework
      *  times out. */
     bool rejectIncomingCall(const std::string& callId, int sipCode) {
-        std::lock_guard<std::mutex> g(mMu);
+        return postCallControl([this, callId, sipCode] {
+            rejectIncomingCallOnDum(callId, sipCode);
+        });
+    }
+
+    bool rejectIncomingCallOnDum(const std::string& callId, int sipCode) {
         if (!mStarted || !mDum) return false;
         try {
             auto h = mInviteHandler.takeServer(callId);
@@ -2680,6 +2858,13 @@ public:
     }
 
 private:
+    bool postCallControl(std::function<void()> action) {
+        std::lock_guard<std::mutex> g(mMu);
+        if (!mStarted || !mDumRun || !mDum) return false;
+        mDum->post(new CallControlCommand(std::move(action)));
+        return true;
+    }
+
     explicit Bridge(int slotId) {
         mSlotId = slotId;
         /* Wire back-pointers so the handlers and the auth manager we
@@ -2848,20 +3033,17 @@ extern "C" JNIEXPORT jint JNICALL
 JNI_OnLoad(JavaVM* vm, void* /*reserved*/)
 {
     gJvm = vm;
-    JNIEnv* env = nullptr;
-    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK || !env) {
-        LOGE("JNI_OnLoad: no JNIEnv, listener methods unresolved");
-        return JNI_VERSION_1_6;
-    }
-    /* Here FindClass uses the loader of the class that loaded this library,
-     * so the app's listener interfaces are visible. */
-    const int missing = hamelinports::resolveListenerMethods(env, &gIds);
-    if (missing) {
-        LOGE("JNI_OnLoad: %d listener method(s) unresolved; their upcalls are skipped", missing);
+    auto missingId = [](const char* owner, const char* name, const char* signature) {
+        LOGE("JNI_OnLoad: unresolved %s.%s %s", owner, name, signature);
+    };
+    // FindClass uses the app loader here; all cached IDs become immutable before any upcall.
+    jint version = hamelinports::initializeJni(vm, &gIds, &gAkaIds, missingId);
+    if (version == JNI_ERR) {
+        LOGE("JNI_OnLoad: refusing to load: unresolved JNI IDs");
     } else {
-        LOGI("JNI_OnLoad: listener methods resolved from their interfaces");
+        LOGI("JNI_OnLoad: listener methods and AKA result fields resolved");
     }
-    return JNI_VERSION_1_6;
+    return version;
 }
 
 namespace {
@@ -2893,19 +3075,6 @@ Java_org_hamelinports_ims_sip_HamelinPortsSipStack_nativeSetAkaProvider(
         return;
     }
 
-    if (!gAkaResultClass) {
-        jclass cls = env->FindClass("org/hamelinports/ims/sip/AkaResult");
-        if (!cls) {
-            LOGE("AkaResult class not found");
-            return;
-        }
-        gAkaResultClass = (jclass)env->NewGlobalRef(cls);
-        gFieldRes  = env->GetFieldID(cls, "res",  "[B");
-        gFieldCk   = env->GetFieldID(cls, "ck",   "[B");
-        gFieldIk   = env->GetFieldID(cls, "ik",   "[B");
-        gFieldAuts = env->GetFieldID(cls, "auts", "[B");
-        env->DeleteLocalRef(cls);
-    }
     LOGI("AKA provider registered slot=%d", (int)slotId);
 }
 

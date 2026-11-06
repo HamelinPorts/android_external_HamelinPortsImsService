@@ -141,6 +141,8 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
     /** Set by {@link #terminate} or a CS fallback; a terminated session never sends its INVITE. */
     private final java.util.concurrent.atomic.AtomicBoolean mTerminated =
             new java.util.concurrent.atomic.AtomicBoolean();
+    private final java.util.concurrent.atomic.AtomicBoolean mTerminalReported =
+            new java.util.concurrent.atomic.AtomicBoolean();
     /** Set just before the INVITE goes to the stack. */
     private volatile boolean mInviteSent;
     /** From the creation profile (or the start profile); see {@link #isEmergency()}. */
@@ -168,6 +170,7 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
      *  already aborted, reSIProcate's stack may be torn down, and
      *  the endCall path is now no-op-guarded anyway. */
     void handleImsPdnLost() {
+        if (!mTerminalReported.compareAndSet(false, true)) return;
         Log.w(TAG, "MO handleImsPdnLost — terminating call locally");
         cleanup();
         if (mListener != null) {
@@ -321,6 +324,7 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
     private void failToCircuitSwitched(boolean emergency, String why) {
         mDeferredStart = null;
         if (!mTerminated.compareAndSet(false, true)) return;
+        if (!mTerminalReported.compareAndSet(false, true)) return;
         Log.w(TAG, "CallSession: " + why + " — CS retry (emergency=" + emergency + ")");
         if (mListener != null) {
             mListener.callSessionInitiatedFailed(new ImsReasonInfo(
@@ -350,6 +354,8 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
                 doOutgoingCall(callee);
             } catch (Exception e) {
                 Log.e(TAG, "outgoing call failed", e);
+                if (!mTerminalReported.compareAndSet(false, true)) return;
+                cleanup();
                 if (mListener != null) {
                     mListener.callSessionInitiatedFailed(new ImsReasonInfo(
                             ImsReasonInfo.CODE_LOCAL_INTERNAL_ERROR, 0, e.getMessage()));
@@ -372,6 +378,8 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
                     + " — suppressed (SRVCC HO in-flight)");
             return;
         }
+        // DUM can silently destroy an ended set before any early dialog exists.
+        if (!mTerminalReported.compareAndSet(false, true)) return;
         Log.i(TAG, "CallSession.terminate reason=" + reason);
         /* A deferred start must never send its INVITE after this. */
         mTerminated.set(true);
@@ -385,7 +393,18 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
         } catch (Exception e) {
             Log.e(TAG, "endCall failed", e);
         }
-        cleanup();
+        try {
+            cleanup();
+        } finally {
+            if (mListener != null) {
+                try {
+                    mListener.callSessionTerminated(new ImsReasonInfo(
+                            ImsReasonInfo.CODE_USER_TERMINATED, 0, "Local end"));
+                } catch (Exception e) {
+                    Log.w(TAG, "local callSessionTerminated failed", e);
+                }
+            }
+        }
     }
 
     /**
@@ -400,6 +419,7 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
      * {@link HamelinPortsMmTelFeature#onSrvccCompleted()} exactly once.
      */
     void srvccSilentTerminate() {
+        if (!mTerminalReported.compareAndSet(false, true)) return;
         Log.i(TAG, "CallSession.srvccSilentTerminate — no BYE on wire");
         cleanup();
         if (mListener != null) {
@@ -471,6 +491,8 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
         Network imsNet = mRegController.getImsNetwork();
         InetAddress bindAddr = pickImsLocalIpv6(imsNet);
         if (bindAddr == null) {
+            if (!mTerminalReported.compareAndSet(false, true)) return;
+            cleanup();
             Log.e(TAG, "no IMS-PDN global IPv6 to bind RTP to");
             if (mListener != null) {
                 mListener.callSessionInitiatedFailed(new android.telephony.ims.ImsReasonInfo(
@@ -510,6 +532,8 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
         // network domain only as a last resort.
         String carrierHost = mRegController.getPublicDomain();
         if (carrierHost == null || carrierHost.isEmpty()) {
+            if (!mTerminalReported.compareAndSet(false, true)) return;
+            cleanup();
             Log.w(TAG, "no carrier public domain — REGISTER did not yet succeed?");
             if (mListener != null) {
                 mListener.callSessionInitiatedFailed(new android.telephony.ims.ImsReasonInfo(
@@ -597,6 +621,7 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
                 if (mImsMedia != null) applyReinviteAnswer();
             }
             @Override public void onConnected(int code, String reason) {
+                if (mTerminated.get() || mTerminalReported.get()) return;
                 Log.i(TAG, "call onConnected: " + code);
                 mCallStartNs = System.nanoTime();
                 if (mListener != null) {
@@ -605,6 +630,7 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
                 startMediaEngine();
             }
             @Override public void onTerminated(int reasonCode, String reason) {
+                if (!mTerminalReported.compareAndSet(false, true)) return;
                 Log.i(TAG, "call onTerminated: " + reasonCode + " " + reason);
                 cleanup();
                 if (mListener != null) {
@@ -619,6 +645,7 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
                     return;
                 }
                 Log.w(TAG, "call onFailure: " + code + " " + reason);
+                if (!mTerminalReported.compareAndSet(false, true)) return;
                 cleanup();
                 if (mListener != null) {
                     mListener.callSessionInitiatedFailed(new ImsReasonInfo(
@@ -644,9 +671,12 @@ public class HamelinPortsCallSession extends ImsCallSessionImplBase {
             /* terminate() raced the send: end the dialog it just opened. */
             mRegController.stack().endCall();
         }
-        if (!queued && mListener != null) {
-            mListener.callSessionInitiatedFailed(new ImsReasonInfo(
-                    ImsReasonInfo.CODE_LOCAL_INTERNAL_ERROR, 0, "queue failed"));
+        if (!queued && mTerminalReported.compareAndSet(false, true)) {
+            cleanup();
+            if (mListener != null) {
+                mListener.callSessionInitiatedFailed(new ImsReasonInfo(
+                        ImsReasonInfo.CODE_LOCAL_INTERNAL_ERROR, 0, "queue failed"));
+            }
         }
     }
 

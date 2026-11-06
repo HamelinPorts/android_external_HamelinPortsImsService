@@ -5,6 +5,7 @@
  * std::string (no reSIProcate types), so the host test drives it directly. */
 
 #include <cctype>
+#include <regex>
 #include <string>
 
 namespace hamelinports {
@@ -14,32 +15,42 @@ constexpr size_t kMaskDigitRun = 7;
 
 /** Masks the user part of sip:/sips:/tel: URIs and every run of kMaskDigitRun+ digits. */
 inline std::string scrubIdentities(const std::string& in) {
+    // Mask entire device URNs, including their short serial and check-digit fields.
+    static const std::regex imei("urn:gsma:imei:[^\\s;>,\"]+", std::regex::icase);
+    static const std::regex ipv4("[0-9]{1,3}(\\.[0-9]{1,3}){3}");
+    static const std::regex ipv6(
+            "([0-9a-f]{0,4}:){2,}[0-9a-f:.]*(%[a-z0-9_.-]+)?", std::regex::icase);
+    std::string safe = std::regex_replace(in, imei, "urn:gsma:imei:*");
+    safe = std::regex_replace(safe, ipv6, "[ip]");
+    safe = std::regex_replace(safe, ipv4, "[ip]");
+    std::string lower = safe;
+    for (char& c : lower) c = std::tolower(static_cast<unsigned char>(c));
     std::string out;
-    out.reserve(in.size());
+    out.reserve(safe.size());
     size_t i = 0;
-    while (i < in.size()) {
-        bool atWordStart = i == 0 || !std::isalnum(static_cast<unsigned char>(in[i - 1]));
-        if (atWordStart && in.compare(i, 4, "tel:") == 0) {
+    while (i < safe.size()) {
+        bool atWordStart = i == 0 || !std::isalnum(static_cast<unsigned char>(safe[i - 1]));
+        if (atWordStart && lower.compare(i, 4, "tel:") == 0) {
             out += "tel:*";
             i += 4;
-            while (i < in.size() && in[i] != ';' && in[i] != '>' && in[i] != ',' && in[i] != '"'
-                    && !std::isspace(static_cast<unsigned char>(in[i]))) {
+            while (i < safe.size() && safe[i] != ';' && safe[i] != '>' && safe[i] != ',' && safe[i] != '"'
+                    && !std::isspace(static_cast<unsigned char>(safe[i]))) {
                 i++;
             }
             continue;
         }
         size_t scheme = 0;
-        if (atWordStart && in.compare(i, 5, "sips:") == 0) scheme = 5;
-        else if (atWordStart && in.compare(i, 4, "sip:") == 0) scheme = 4;
+        if (atWordStart && lower.compare(i, 5, "sips:") == 0) scheme = 5;
+        else if (atWordStart && lower.compare(i, 4, "sip:") == 0) scheme = 4;
         if (scheme) {
             size_t end = i + scheme;
-            while (end < in.size() && in[end] != '@' && in[end] != ';' && in[end] != '>'
-                    && in[end] != ',' && in[end] != '"'
-                    && !std::isspace(static_cast<unsigned char>(in[end]))) {
+            while (end < safe.size() && safe[end] != '@' && safe[end] != ';' && safe[end] != '>'
+                    && safe[end] != ',' && safe[end] != '"'
+                    && !std::isspace(static_cast<unsigned char>(safe[end]))) {
                 end++;
             }
-            out.append(in, i, scheme);
-            if (end < in.size() && in[end] == '@') {
+            out.append(safe, i, scheme);
+            if (end < safe.size() && safe[end] == '@') {
                 out += "*@";
                 i = end + 1;
             } else {
@@ -47,19 +58,31 @@ inline std::string scrubIdentities(const std::string& in) {
             }
             continue;
         }
-        if (std::isdigit(static_cast<unsigned char>(in[i]))) {
+        if (std::isdigit(static_cast<unsigned char>(safe[i]))) {
             size_t end = i;
-            while (end < in.size() && std::isdigit(static_cast<unsigned char>(in[end]))) end++;
-            if (end - i >= kMaskDigitRun) {
+            size_t digits = 0;
+            size_t lastDigit = i;
+            while (end < safe.size()) {
+                unsigned char c = safe[end];
+                if (std::isdigit(c)) {
+                    digits++;
+                    lastDigit = end + 1;
+                } else if (c != ' ' && c != '-' && c != '.' && c != '(' && c != ')') {
+                    break;
+                }
+                end++;
+            }
+            if (digits >= kMaskDigitRun) {
                 if (!out.empty() && out.back() == '+') out.pop_back();
                 out += '#';
+                i = lastDigit;
             } else {
-                out.append(in, i, end - i);
+                out.append(safe, i, end - i);
+                i = end;
             }
-            i = end;
             continue;
         }
-        out += in[i++];
+        out += safe[i++];
     }
     return out;
 }

@@ -32,16 +32,16 @@ public class PendingMoSmsTest {
         assertNull(o.status);
     }
 
-    private static PendingMoSms pending(int token, int rpMr) {
+    private static PendingMoSms pending(int token) {
         PendingMoSms p = new PendingMoSms();
-        assertEquals(-1, p.begin(token, 40 + token, rpMr));
+        assertEquals(1, p.begin(token, 40 + token));
         return p;
     }
 
     @Test
     public void rpAckIsSuccess() {
-        PendingMoSms p = pending(5, 0);
-        Outcome o = p.onRpAck(0);
+        PendingMoSms p = pending(5);
+        Outcome o = p.onRpAck(1);
         assertCompleted(o, 5, Status.OK, 0);
         assertEquals(45, o.messageRef);
         assertFalse(p.isPending(5));
@@ -50,118 +50,166 @@ public class PendingMoSmsTest {
     @Test
     public void barredOnLteFallsBackToCs() {
         for (int cause : new int[] {8, 10, 50}) {
-            PendingMoSms p = pending(5, 0);
-            assertCompleted(p.onRpError(rpError(0, cause), ON), 5, Status.ERROR_FALLBACK, cause);
+            PendingMoSms p = pending(5);
+            assertCompleted(p.onRpError(rpError(1, cause), ON), 5, Status.ERROR_FALLBACK, cause);
         }
     }
 
     @Test
     public void temporaryFailureRetriesOverIms() {
-        assertCompleted(pending(5, 0).onRpError(rpError(0, 41), ON), 5, Status.ERROR_RETRY, 41);
+        assertCompleted(pending(5).onRpError(rpError(1, 41), ON), 5, Status.ERROR_RETRY, 41);
     }
 
     @Test
     public void unlistedCauseIsAnError() {
-        assertCompleted(pending(5, 0).onRpError(rpError(0, 22), ON), 5, Status.ERROR, 22);
+        assertCompleted(pending(5).onRpError(rpError(1, 22), ON), 5, Status.ERROR, 22);
     }
 
     @Test
     public void mismatchedRpMrIsIgnored() {
-        PendingMoSms p = pending(5, 3);
+        PendingMoSms p = pending(5);
         assertIgnored(p.onRpError(rpError(4, 10), ON));
         assertIgnored(p.onRpAck(2));
         assertTrue("still pending", p.isPending(5));
-        assertCompleted(p.onRpError(rpError(3, 10), ON), 5, Status.ERROR_FALLBACK, 10);
+        assertCompleted(p.onRpError(rpError(1, 10), ON), 5, Status.ERROR_FALLBACK, 10);
     }
 
     @Test
     public void unknownRpMrNeverFallsBack() {
-        assertCompleted(pending(5, -1).onRpError(rpError(9, 10), ON), 5, Status.ERROR, 10);
+        assertIgnored(pending(5).onRpError(rpError(9, 10), ON));
     }
 
     @Test
     public void oneOutcomePerToken() {
-        PendingMoSms p = pending(5, 0);
-        assertCompleted(p.onRpError(rpError(0, 10), ON), 5, Status.ERROR_FALLBACK, 10);
-        assertIgnored(p.onRpError(rpError(0, 10), ON));
-        assertIgnored(p.onRpAck(0));
-        assertIgnored(p.onSipFailure(503));
-        assertIgnored(p.onTimeout(5));
+        PendingMoSms p = pending(5);
+        assertCompleted(p.onRpError(rpError(1, 10), ON), 5, Status.ERROR_FALLBACK, 10);
+        assertIgnored(p.onRpError(rpError(1, 10), ON));
+        assertIgnored(p.onRpAck(1));
+        assertIgnored(p.onSipFailure(1, 503));
+        assertIgnored(p.onTimeout(5, 1));
         assertIgnored(p.onNotSent(5));
     }
 
     @Test
     public void neverFallBackAfterAnRpAck() {
-        PendingMoSms p = pending(5, 0);
-        assertCompleted(p.onRpAck(0), 5, Status.OK, 0);
-        assertIgnored(p.onRpError(rpError(0, 10), ON));
+        PendingMoSms p = pending(5);
+        assertCompleted(p.onRpAck(1), 5, Status.OK, 0);
+        assertIgnored(p.onRpError(rpError(1, 10), ON));
     }
 
     /** Unchanged: no RP outcome in time is an optimistic success, and nothing falls back later. */
     @Test
     public void timeoutIsOptimisticSuccessAndFinal() {
-        PendingMoSms p = pending(5, 0);
-        assertCompleted(p.onTimeout(5), 5, Status.OK, 0);
-        assertIgnored(p.onRpError(rpError(0, 10), ON));
-        assertIgnored(p.onRpAck(0));
+        PendingMoSms p = pending(5);
+        assertCompleted(p.onTimeout(5, 1), 5, Status.OK, 0);
+        assertIgnored(p.onRpError(rpError(1, 10), ON));
+        assertIgnored(p.onRpAck(1));
     }
 
     @Test
     public void staleTimeoutDoesNotCompleteTheNextSend() {
-        PendingMoSms p = pending(5, 0);
-        assertCompleted(p.onRpAck(0), 5, Status.OK, 0);
-        assertEquals(-1, p.begin(6, 46, 0));
-        assertIgnored(p.onTimeout(5));
+        PendingMoSms p = pending(5);
+        assertCompleted(p.onRpAck(1), 5, Status.OK, 0);
+        assertEquals(2, p.begin(6, 46));
+        assertIgnored(p.onTimeout(5, 1));
         assertTrue(p.isPending(6));
-        assertCompleted(p.onTimeout(6), 6, Status.OK, 0);
+        assertCompleted(p.onTimeout(6, 2), 6, Status.OK, 0);
     }
 
     @Test
     public void sipFailureIsAnErrorEvenWithTheFallbackOn() {
-        PendingMoSms p = pending(5, 0);
-        assertCompleted(p.onSipFailure(403), 5, Status.ERROR, 403);
-        assertIgnored(p.onRpError(rpError(0, 10), ON));
+        PendingMoSms p = pending(5);
+        assertCompleted(p.onSipFailure(1, 403), 5, Status.ERROR, 403);
+        assertIgnored(p.onRpError(rpError(1, 10), ON));
     }
 
     @Test
     public void notQueuedIsAnError() {
-        PendingMoSms p = pending(5, 0);
+        PendingMoSms p = pending(5);
         assertIgnored(p.onNotSent(6));
         assertCompleted(p.onNotSent(5), 5, Status.ERROR, 0);
     }
 
     @Test
-    public void aNewSendSupersedesTheOldOne() {
-        PendingMoSms p = pending(5, 0);
-        assertEquals(5, p.begin(6, 46, 1));
-        assertFalse(p.isPending(5));
-        assertIgnored(p.onTimeout(5));
-        assertIgnored(p.onRpError(rpError(0, 10), ON));
-        assertCompleted(p.onRpError(rpError(1, 10), ON), 6, Status.ERROR_FALLBACK, 10);
+    public void multipartOutcomesAreIndependentAndOutOfOrder() {
+        PendingMoSms p = pending(5);
+        assertEquals(2, p.begin(6, 46));
+        assertCompleted(p.onRpError(rpError(2, 10), ON), 6, Status.ERROR_FALLBACK, 10);
+        assertTrue(p.isPending(5));
+        assertIgnored(p.onRpError(rpError(2, 10), ON));
+        assertCompleted(p.onRpAck(1), 5, Status.OK, 0);
+    }
+
+    @Test
+    public void lateErrorAfterTimeoutCannotFallBackTheNextSend() {
+        PendingMoSms p = pending(5);
+        assertCompleted(p.onTimeout(5, 1), 5, Status.OK, 0);
+        assertEquals(2, p.begin(6, 46));
+        assertIgnored(p.onRpError(rpError(1, 10), ON));
+        assertIgnored(p.onSipFailure(1, 503));
+        assertCompleted(p.onRpAck(2), 6, Status.OK, 0);
+    }
+
+    @Test
+    public void sipFailureAndNotQueuedDoNotCompleteOtherParts() {
+        PendingMoSms p = pending(5);
+        assertEquals(2, p.begin(6, 46));
+        assertEquals(3, p.begin(7, 47));
+        assertCompleted(p.onSipFailure(2, 503), 6, Status.ERROR, 503);
+        assertCompleted(p.onNotSent(7), 7, Status.ERROR, 0);
+        assertCompleted(p.onTimeout(5, 1), 5, Status.OK, 0);
+    }
+
+    @Test
+    public void reusedTokenDoesNotAcceptThePreviousTimeout() {
+        PendingMoSms p = pending(5);
+        assertCompleted(p.onRpAck(1), 5, Status.OK, 0);
+        assertEquals(2, p.begin(5, 49));
+        assertIgnored(p.onTimeout(5, 1));
+        assertCompleted(p.onTimeout(5, 2), 5, Status.OK, 0);
+    }
+
+    @Test
+    public void referencesSkipPendingAndRetiredOnWrapAndRefuseExhaustion() {
+        long[] now = {1};
+        PendingMoSms p = new PendingMoSms(() -> now[0]);
+        for (int i = 1; i <= 255; i++) assertEquals(i, p.begin(i, 900 + i));
+        assertEquals(-1, p.begin(256, 0));
+        assertEquals(-1, p.begin(1, 0));
+        assertCompleted(p.onTimeout(1, 1), 1, Status.OK, 0);
+        assertEquals(-1, p.begin(256, 0));
+        now[0] += 129_999;
+        assertEquals(-1, p.begin(256, 0));
+        now[0]++;
+        assertEquals(1, p.begin(256, 22));
+        Outcome o = p.onRpAck(1);
+        assertCompleted(o, 256, Status.OK, 0);
+        assertEquals(22, o.messageRef);
+        assertTrue(p.isPending(255));
     }
 
     /** gta8: property off ⇒ the RP-ERROR is reported as before (ERROR with its cause). */
     @Test
     public void propertyOffReportsTheOldError() {
-        assertCompleted(pending(5, 0).onRpError(rpError(0, 10), RpErrorPolicy.off()),
+        assertCompleted(pending(5).onRpError(rpError(1, 10), RpErrorPolicy.off()),
                 5, Status.ERROR, 10);
-        assertCompleted(pending(5, 0).onRpError(rpError(0, 41), RpErrorPolicy.off()),
+        assertCompleted(pending(5).onRpError(rpError(1, 41), RpErrorPolicy.off()),
                 5, Status.ERROR, 41);
     }
 
     @Test
     public void rpErrorWithoutCauseIsAnError() {
-        RpError noCause = RpError.parse(new byte[] {0x05, 0x00});
-        assertCompleted(pending(5, 0).onRpError(noCause, ON), 5, Status.ERROR, -1);
+        RpError noCause = RpError.parse(new byte[] {0x05, 0x01});
+        assertCompleted(pending(5).onRpError(noCause, ON), 5, Status.ERROR, -1);
     }
 
     @Test
     public void nothingPending() {
         PendingMoSms p = new PendingMoSms();
-        assertIgnored(p.onRpAck(0));
-        assertIgnored(p.onRpError(rpError(0, 10), ON));
-        assertIgnored(p.onSipFailure(500));
-        assertIgnored(p.onTimeout(1));
+        assertIgnored(p.onRpAck(1));
+        assertIgnored(p.onRpError(rpError(1, 10), ON));
+        assertIgnored(p.onSipFailure(1, 500));
+        assertIgnored(p.onTimeout(1, 1));
         assertFalse(p.isPending(-1));
     }
 }

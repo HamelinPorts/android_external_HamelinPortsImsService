@@ -53,7 +53,7 @@ void userPartsAreMasked() {
              "sip:*@ims.mnc001.mcc001.3gppnetwork.org");
     CHECK_EQ(scrubIdentities("<sips:alice@example.com>;tag=1"), "<sips:*@example.com>;tag=1");
     CHECK_EQ(scrubIdentities("tel:+12025550123;phone-context=x"), "tel:*;phone-context=x");
-    CHECK_EQ(scrubIdentities("sip:192.0.2.10:5060"), "sip:192.0.2.10:5060");
+    CHECK_EQ(scrubIdentities("sip:192.0.2.10:5060"), "sip:[ip]:5060");
     CHECK_EQ(scrubIdentities("msip:alice@x"), "msip:alice@x");  /* not a URI scheme */
     CHECK_EQ(scrubIdentities("xsips:alice@x"), "xsips:alice@x");
     CHECK_EQ(scrubIdentities("xtel:abc"), "xtel:abc");
@@ -82,14 +82,29 @@ void warningReasonDebugInfoCarryNoIdentity() {
 }
 
 void paiKeepsOnlyTheNode() {
-    CHECK_EQ(uriHostOnly("sip", "192.0.2.10", 5060), "sip:192.0.2.10:5060");
+    CHECK_EQ(uriHostOnly("sip", "192.0.2.10", 5060), "sip:[ip]:5060");
     CHECK_EQ(uriHostOnly("sip", "example.net", 0), "sip:example.net");
-    CHECK_EQ(uriHostOnly("sip", "2001:db8::1", 5060), "sip:[2001:db8::1]:5060");
+    CHECK_EQ(uriHostOnly("sip", "2001:db8::1", 5060), "sip:[[ip]]:5060");
     CHECK_EQ(uriHostOnly("tel", "", 0), "tel:*");
     CHECK_EQ(uriHostOnly("tel", "12025550123", 0), "tel:*");
     CHECK_EQ(uriHostOnly("", "", 0), "?:*");
     CHECK_EQ(uriHostOnly("sip", "12025550123.example", 0), "sip:#.example");
     CHECK(hasNoIdentity(uriHostOnly("sip", "12025550123.example", 0)));
+}
+
+void freeTextDoesNotLeakSeparatedOrUppercaseIdentities() {
+    CHECK_EQ(scrubIdentities("+1 202 555 0123"), "#");
+    CHECK_EQ(scrubIdentities("1202-555-0123"), "#");
+    CHECK_EQ(scrubIdentities("1202.555.0123"), "#");
+    CHECK_EQ(scrubIdentities("SIP:alice@example.com"), "SIP:*@example.com");
+    CHECK_EQ(scrubIdentities("SiPs:alice@example.com"), "SiPs:*@example.com");
+    CHECK_EQ(scrubIdentities("TEL:+1-202-555-0123"), "tel:*");
+    CHECK_EQ(scrubIdentities("urn:gsma:imei:00000000-123456-0"), "urn:gsma:imei:*");
+    CHECK_EQ(scrubIdentities("URN:GSMA:IMEI:00000000-123456-0"), "urn:gsma:imei:*");
+    CHECK_EQ(scrubIdentities("UE 192.0.2.9 / 2001:db8::12 / ::1"), "UE [ip] / [ip] / [ip]");
+    CHECK_EQ(scrubIdentities("UE [fe80::1%wlan0]"), "UE [[ip]]");
+    CHECK_EQ(scrubIdentities("SIP;cause=503;text=\"barred +1 (202) 555-0123\""),
+             "SIP;cause=503;text=\"barred #\"");
 }
 
 void contactsShowFamilyPortAndFeatureTagOnly() {
@@ -110,6 +125,7 @@ int main() {
     warningReasonDebugInfoCarryNoIdentity();
     paiKeepsOnlyTheNode();
     contactsShowFamilyPortAndFeatureTagOnly();
+    freeTextDoesNotLeakSeparatedOrUppercaseIdentities();
     printf("%s: %d checks, %d failed\n", gFailures ? "FAIL" : "PASS", gChecks, gFailures);
     return gFailures ? 1 : 0;
 }

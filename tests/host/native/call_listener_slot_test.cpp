@@ -63,6 +63,8 @@ struct FakeVm {
     std::vector<std::string> foundClasses;
     std::set<std::string> missingClasses;   /* FindClass fails for these */
     std::set<std::string> missingMethods;   /* GetMethodID fails for these names */
+    std::set<std::string> missingFields;
+    bool failGlobalRef = false;
     int getObjectClassCalls = 0;
     int violations = 0;
     bool exceptionPending = false;
@@ -94,11 +96,13 @@ jobject J(Handle* h) { return reinterpret_cast<jobject>(h); }
 /* A reference is usable if it is a live global or local ref, or a plain object (a JNI argument). */
 bool usable(Handle* h) {
     if (h == nullptr) return false;
-    if (h->kind == Kind::Object) return true;
+    if (h->kind == Kind::Object || h->kind == Kind::Class) return true;
     return (h->kind == Kind::Global || h->kind == Kind::Local) && h->alive && h->referent->alive;
 }
 
-Handle* referentOf(Handle* h) { return h->kind == Kind::Object ? h : h->referent; }
+Handle* referentOf(Handle* h) {
+    return h->kind == Kind::Object || h->kind == Kind::Class ? h : h->referent;
+}
 
 /* Like CheckJNI: only the exception and reference-deletion calls are allowed with an exception pending. */
 void requireNoPendingException() {
@@ -139,6 +143,16 @@ jclass fakeGetObjectClass(JNIEnv*, jobject) {
     return nullptr;
 }
 
+jfieldID fakeGetFieldID(JNIEnv*, jclass, const char* name, const char* signature) {
+    requireNoPendingException();
+    if (strcmp(signature, "[B") != 0) gVm->violations++;
+    if (gVm->missingFields.count(name)) {
+        gVm->exceptionPending = true;
+        return nullptr;
+    }
+    return reinterpret_cast<jfieldID>(const_cast<char*>(name));
+}
+
 jboolean fakeExceptionCheck(JNIEnv*) {
     std::lock_guard<std::mutex> g(gVm->mu);
     return gVm->exceptionPending ? JNI_TRUE : JNI_FALSE;
@@ -152,6 +166,10 @@ void fakeExceptionClear(JNIEnv*) {
 jobject fakeNewGlobalRef(JNIEnv*, jobject o) {
     std::lock_guard<std::mutex> g(gVm->mu);
     requireNoPendingException();
+    if (gVm->failGlobalRef) {
+        gVm->exceptionPending = true;
+        return nullptr;
+    }
     Handle* h = H(o);
     if (!usable(h)) {
         gVm->violations++;
@@ -203,6 +221,7 @@ struct FakeEnv {
         table.GetMethodID = fakeGetMethodID;
         table.GetObjectClass = fakeGetObjectClass;
         table.ExceptionCheck = fakeExceptionCheck;
+        table.GetFieldID = fakeGetFieldID;
         table.ExceptionClear = fakeExceptionClear;
         table.NewGlobalRef = fakeNewGlobalRef;
         table.NewLocalRef = fakeNewLocalRef;
@@ -260,7 +279,7 @@ const Expected kExpected[] = {
     {"org/hamelinports/ims/sip/IncomingCallListener", "onIncomingInviteVideo", kInviteVideo.c_str(), &ListenerMethodIds::incomingInviteVideo},
     {"org/hamelinports/ims/sip/IncomingCallListener", "onIncomingCancelled", "(Ljava/lang/String;I)V", &ListenerMethodIds::incomingCancelled},
     {"org/hamelinports/ims/sip/SmsSessionListener", "onSendSuccess", "(ILjava/lang/String;)V", &ListenerMethodIds::smsSendSuccess},
-    {"org/hamelinports/ims/sip/SmsSessionListener", "onSendFailure", "(ILjava/lang/String;)V", &ListenerMethodIds::smsSendFailure},
+    {"org/hamelinports/ims/sip/SmsSessionListener", "onSendFailure", "(IILjava/lang/String;)V", &ListenerMethodIds::smsSendFailure},
     {"org/hamelinports/ims/sip/SmsSessionListener", "onIncomingSms", "([B)V", &ListenerMethodIds::smsIncoming},
     {"org/hamelinports/ims/sip/RegistrationListener", "onRegistered", "(Ljava/lang/String;)V", &ListenerMethodIds::registered},
     {"org/hamelinports/ims/sip/RegistrationListener", "onDeregistered", "(ILjava/lang/String;IZ)V", &ListenerMethodIds::deregistered},
@@ -434,9 +453,87 @@ void concurrentSetsAndUpcalls() {
     CHECK(gVm->violations == 0);
 }
 
+std::vector<std::string> missingIds;
+JNIEnv* loadEnv = nullptr;
+jint getLoadEnv(JavaVM*, void** env, jint version) {
+    CHECK(version == JNI_VERSION_1_6);
+    *env = loadEnv;
+    return loadEnv ? JNI_OK : JNI_EDETACHED;
+}
+void logMissing(const char* owner, const char* name, const char* signature) {
+    missingIds.push_back(std::string(owner) + "." + name + signature);
+}
+
+void loadTimeIdsReportEveryFailure() {
+    resetVm();
+    FakeEnv fe;
+    ListenerMethodIds methods;
+    hamelinports::AkaResultIds aka;
+    missingIds.clear();
+    gVm->missingMethods = {"onSendFailure", "onConnected"};
+    gVm->missingClasses = {"org/hamelinports/ims/sip/AkaProvider"};
+    gVm->missingFields = {"ck", "auts"};
+    CHECK(hamelinports::resolveListenerMethods(&fe.env, &methods, logMissing) == 3);
+    CHECK(hamelinports::resolveAkaResult(&fe.env, &aka, logMissing) == 2);
+    CHECK(missingIds.size() == 5);
+    CHECK(aka.resultClass && aka.res && aka.ik && !aka.ck && !aka.auts);
+    CHECK(!gVm->exceptionPending && gVm->violations == 0);
+    fe.env.DeleteGlobalRef(aka.resultClass);
+    CHECK(gVm->liveGlobals() == 0 && gVm->liveLocals() == 0);
+
+    resetVm();
+    missingIds.clear();
+    gVm->missingClasses = {"org/hamelinports/ims/sip/AkaResult"};
+    CHECK(hamelinports::resolveAkaResult(&fe.env, &aka, logMissing) == 5);
+    CHECK(missingIds.size() == 5);
+    CHECK(!aka.resultClass && !aka.res && !aka.ck && !aka.ik && !aka.auts);
+    CHECK(!gVm->exceptionPending && gVm->violations == 0);
+
+    resetVm();
+    missingIds.clear();
+    gVm->failGlobalRef = true;
+    CHECK(hamelinports::resolveAkaResult(&fe.env, &aka, logMissing) == 1);
+    CHECK(missingIds.size() == 1);
+    CHECK(!aka.resultClass && aka.res && aka.ck && aka.ik && aka.auts);
+    CHECK(!gVm->exceptionPending && gVm->violations == 0);
+}
+
+void initializationFailsClosed() {
+    resetVm();
+    FakeEnv fe;
+    JNIInvokeInterface invoke{};
+    invoke.GetEnv = getLoadEnv;
+    JavaVM vm{&invoke};
+    ListenerMethodIds methods;
+    hamelinports::AkaResultIds aka;
+    loadEnv = &fe.env;
+    missingIds.clear();
+    CHECK(hamelinports::initializeJni(&vm, &methods, &aka, logMissing) == JNI_VERSION_1_6);
+    CHECK(methods.callConnected && methods.smsSendFailure && aka.resultClass && aka.res);
+    CHECK(missingIds.empty());
+    fe.env.DeleteGlobalRef(aka.resultClass);
+
+    resetVm();
+    missingIds.clear();
+    gVm->missingMethods = {"onConnected", "onSendFailure"};
+    gVm->missingFields = {"res", "ik"};
+    CHECK(hamelinports::initializeJni(&vm, &methods, &aka, logMissing) == JNI_ERR);
+    CHECK(missingIds.size() == 4);
+    CHECK(!methods.callConnected && !methods.smsSendFailure && !aka.resultClass && !aka.ck);
+    CHECK(gVm->liveGlobals() == 0 && gVm->liveLocals() == 0);
+    CHECK(!gVm->exceptionPending && gVm->violations == 0);
+
+    loadEnv = nullptr;
+    missingIds.clear();
+    CHECK(hamelinports::initializeJni(&vm, &methods, &aka, logMissing) == JNI_ERR);
+    CHECK(missingIds.size() == 1);
+}
+
 }  // namespace
 
 int main() {
+    loadTimeIdsReportEveryFailure();
+    initializationFailsClosed();
     idsComeFromTheInterfaces();
     aSecondListenerClassDoesNotChangeTheIds();
     missingMethodsAreCountedAndCleared();

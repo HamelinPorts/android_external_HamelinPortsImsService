@@ -97,9 +97,6 @@ public final class SipClient {
         } catch (Exception e) {
             Log.w(TAG, "couldn't get IMEI", e);
         }
-        if (c.imeiUrn == null) {
-            c.imeiUrn = "<urn:gsma:imei:90420156-025763-0>"; // fallback
-        }
         Log.i(TAG, "creds imsi=" + redact(imsi) + " mccMnc=" + mccMnc + " domain=" + c.domain);
         return new CredentialResult(SlotActivation.CredentialStatus.READY, c);
     }

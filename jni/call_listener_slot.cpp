@@ -37,7 +37,7 @@ const ListenerMethodSpec kSpecs[] = {
     {kIncoming, "onIncomingCancelled", "(Ljava/lang/String;I)V",
      &ListenerMethodIds::incomingCancelled},
     {kSms, "onSendSuccess", "(ILjava/lang/String;)V", &ListenerMethodIds::smsSendSuccess},
-    {kSms, "onSendFailure", "(ILjava/lang/String;)V", &ListenerMethodIds::smsSendFailure},
+    {kSms, "onSendFailure", "(IILjava/lang/String;)V", &ListenerMethodIds::smsSendFailure},
     {kSms, "onIncomingSms", "([B)V", &ListenerMethodIds::smsIncoming},
     {kRegistration, "onRegistered", "(Ljava/lang/String;)V", &ListenerMethodIds::registered},
     {kRegistration, "onDeregistered", "(ILjava/lang/String;IZ)V",
@@ -55,13 +55,14 @@ const ListenerMethodSpec* listenerMethodSpecs(size_t* count) {
     return kSpecs;
 }
 
-int resolveListenerMethods(JNIEnv* env, ListenerMethodIds* ids) {
+int resolveListenerMethods(JNIEnv* env, ListenerMethodIds* ids, MissingIdLogger log) {
     int missing = 0;
     for (const ListenerMethodSpec& spec : kSpecs) {
         jclass iface = env->FindClass(spec.interfaceName);
         if (iface == nullptr) {
             if (env->ExceptionCheck()) env->ExceptionClear();
             ids->*spec.id = nullptr;
+            if (log) log(spec.interfaceName, spec.name, spec.signature);
             missing++;
             continue;
         }
@@ -69,9 +70,63 @@ int resolveListenerMethods(JNIEnv* env, ListenerMethodIds* ids) {
         if (id == nullptr && env->ExceptionCheck()) env->ExceptionClear();
         env->DeleteLocalRef(iface);
         ids->*spec.id = id;
-        if (id == nullptr) missing++;
+        if (id == nullptr) {
+            if (log) log(spec.interfaceName, spec.name, spec.signature);
+            missing++;
+        }
     }
     return missing;
+}
+
+int resolveAkaResult(JNIEnv* env, AkaResultIds* ids, MissingIdLogger log) {
+    constexpr const char* owner = "org/hamelinports/ims/sip/AkaResult";
+    *ids = AkaResultIds{};
+    jclass cls = env->FindClass(owner);
+    int missing = 0;
+    if (!cls) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (log) log(owner, "<class>", "");
+        missing++;
+    } else {
+        ids->resultClass = static_cast<jclass>(env->NewGlobalRef(cls));
+        if (!ids->resultClass) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            if (log) log(owner, "<global-ref>", "");
+            missing++;
+        }
+    }
+    const struct { const char* name; jfieldID AkaResultIds::*id; } fields[] = {
+        {"res", &AkaResultIds::res}, {"ck", &AkaResultIds::ck},
+        {"ik", &AkaResultIds::ik}, {"auts", &AkaResultIds::auts},
+    };
+    for (const auto& field : fields) {
+        jfieldID id = cls ? env->GetFieldID(cls, field.name, "[B") : nullptr;
+        if (!id) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            if (log) log(owner, field.name, "[B");
+            missing++;
+        }
+        ids->*field.id = id;
+    }
+    if (cls) env->DeleteLocalRef(cls);
+    return missing;
+}
+
+jint initializeJni(JavaVM* vm, ListenerMethodIds* methods, AkaResultIds* aka, MissingIdLogger log) {
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK || !env) {
+        if (log) log("JNIEnv", "GetEnv", "JNI_VERSION_1_6");
+        return JNI_ERR;
+    }
+    int missing = resolveListenerMethods(env, methods, log);
+    missing += resolveAkaResult(env, aka, log);
+    if (missing) {
+        if (aka->resultClass) env->DeleteGlobalRef(aka->resultClass);
+        *aka = AkaResultIds{};
+        *methods = ListenerMethodIds{};
+        return JNI_ERR;
+    }
+    return JNI_VERSION_1_6;
 }
 
 void ListenerSlot::set(JNIEnv* env, jobject listener) {

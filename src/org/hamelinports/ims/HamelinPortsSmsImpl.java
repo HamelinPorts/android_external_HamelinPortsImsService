@@ -79,8 +79,7 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
     /** MO send awaiting the SMSC's RP-ACK / RP-ERROR. */
     private final PendingMoSms mPending = new PendingMoSms();
     /** Optimistic-success timer of the pending send and the token it belongs to. */
-    private Runnable mPendingTimeout = null;
-    private int mPendingTimeoutToken = -1;
+    private final java.util.Map<Integer, Runnable> mPendingTimeouts = new java.util.HashMap<>();
 
     HamelinPortsSmsImpl(ImsRegistrationController regController) {
         mRegController = regController;
@@ -160,9 +159,12 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
                 mRegController.stack());
 
         // Wrap TPDU in RP-DATA per 3GPP TS 24.011
-        byte[] rpData = RpData.wrapMo(messageRef, SMSC_NUMBER, pdu);
-        // RP-MR is byte 1 of the wrapped RP-DATA (wrapMo writes messageRef & 0xFF).
-        int rpMr = rpData.length > 1 ? (rpData[1] & 0xFF) : -1;
+        int rpMr = mPending.begin(token, messageRef);
+        if (rpMr < 0) {
+            failSmsRetryable(token, messageRef, "no free RP-MR");
+            return;
+        }
+        byte[] rpData = RpData.wrapMo(rpMr, SMSC_NUMBER, pdu);
         Log.i(TAG, "MO RP-DATA " + rpData.length + " bytes (TPDU " + pdu.length
                 + ") RP-MR=" + rpMr);
 
@@ -171,15 +173,6 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
          * last-writer-wins. Without this re-claim the SMSC RP-ACK
          * MESSAGE gets routed to the wrong instance. */
         mRegController.stack().setSmsListener(this);
-
-        /* Only one send is tracked; an earlier one still pending gets no
-         * outcome (logged). */
-        int superseded = mPending.begin(token, messageRef, rpMr);
-        if (superseded >= 0) {
-            cancelPendingTimeout(superseded);
-            Log.w(TAG, "MO token=" + superseded + " superseded by token=" + token
-                    + " before its RP-ACK/RP-ERROR; it gets no outcome");
-        }
 
         boolean queued = mRegController.stack().sendSms(resolveSmscUri(SMSC_NUMBER), CONTENT_TYPE, rpData);
         if (!queued) {
@@ -193,7 +186,7 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
         /* Arm the fallback timer. If no RP-ACK/RP-ERROR arrives within
          * the window, report optimistic success on the SIP 2xx we
          * (presumably) got — otherwise the Messaging UI hangs. */
-        armPendingTimeout(token);
+        armPendingTimeout(token, rpMr);
     }
 
     @Override
@@ -284,12 +277,12 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
     }
 
     @Override
-    public void onSendFailure(int statusCode, String reason) {
+    public void onSendFailure(int rpMr, int statusCode, String reason) {
         /* SIP 4xx/5xx — P-CSCF rejected the MESSAGE. Final outcome. */
         Log.w(TAG, "MO SMS failed at SIP layer: " + statusCode + " " + reason);
-        PendingMoSms.Outcome o = mPending.onSipFailure(statusCode);
+        PendingMoSms.Outcome o = mPending.onSipFailure(rpMr, statusCode);
         if (o.ignored != null) return;
-        cancelPendingTimeout(o.token);
+        cancelPendingTimeout(rpMr);
         onSendSmsResultError(o.token, o.messageRef, SEND_STATUS_ERROR,
                 SmsManager.RESULT_ERROR_GENERIC_FAILURE, statusCode);
     }
@@ -344,7 +337,7 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
             Log.w(TAG, o.ignored + "; ignoring");
             return;
         }
-        cancelPendingTimeout(o.token);
+        cancelPendingTimeout(parsed.rpMr);
         onSendSmsResultSuccess(o.token, o.messageRef);
     }
 
@@ -358,7 +351,7 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
             Log.w(TAG, o.ignored + "; ignoring");
             return;
         }
-        cancelPendingTimeout(o.token);
+        cancelPendingTimeout(error.rpMr);
         int status = toSendStatus(o.status);
         Log.i(TAG, "RP-ERROR cause=" + error.cause + " token=" + o.token + " -> " + o.status
                 + (o.status == RpErrorPolicy.Status.ERROR_FALLBACK ? " (resend over CS)"
@@ -482,26 +475,23 @@ public class HamelinPortsSmsImpl extends ImsSmsImplBase implements SmsSessionLis
 
     // --- pending-send bookkeeping ---
 
-    private synchronized void armPendingTimeout(int token) {
+    private synchronized void armPendingTimeout(int token, int rpMr) {
+        if (!mPending.isPending(token)) return;
         Runnable timeout = () -> {
-            PendingMoSms.Outcome o = mPending.onTimeout(token);
+            cancelPendingTimeout(rpMr);
+            PendingMoSms.Outcome o = mPending.onTimeout(token, rpMr);
             if (o.ignored != null) return;
             Log.w(TAG, "MO timed out waiting for RP-ACK — optimistic success (token="
                     + o.token + ")");
             onSendSmsResultSuccess(o.token, o.messageRef);
         };
-        if (mPendingTimeout != null) mMain.removeCallbacks(mPendingTimeout);
-        mPendingTimeout = timeout;
-        mPendingTimeoutToken = token;
+        mPendingTimeouts.put(rpMr, timeout);
         mMain.postDelayed(timeout, MO_FALLBACK_TIMEOUT_MS);
     }
 
-    /** Cancels the timer of {@code token} only: a newer send keeps its own. */
-    private synchronized void cancelPendingTimeout(int token) {
-        if (mPendingTimeout != null && mPendingTimeoutToken == token) {
-            mMain.removeCallbacks(mPendingTimeout);
-            mPendingTimeout = null;
-            mPendingTimeoutToken = -1;
-        }
+    /** Cancels the timer of this RP-MR only; other sends keep their own. */
+    private synchronized void cancelPendingTimeout(int rpMr) {
+        Runnable timeout = mPendingTimeouts.remove(rpMr);
+        if (timeout != null) mMain.removeCallbacks(timeout);
     }
 }

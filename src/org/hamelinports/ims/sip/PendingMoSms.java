@@ -1,7 +1,7 @@
 package org.hamelinports.ims.sip;
 
 /**
- * The MO SMS awaiting its RP-ACK or RP-ERROR, and the one outcome it gets.
+ * Concurrent MO sends, each awaiting its own RP-ACK or RP-ERROR.
  *
  * <p>Whatever completes first (RP-ACK, RP-ERROR, a SIP failure, the
  * optimistic-success timeout) clears the send, so every later event for it
@@ -37,79 +37,75 @@ public final class PendingMoSms {
         }
     }
 
-    private static final int NONE = -1;
+    /** Keep completed references unavailable for TR1M to reject delayed replies. */
+    private static final long RETIRE_MS = 130_000L;
+    private final java.util.Map<Integer, Outcome> mPending = new java.util.HashMap<>();
+    private final long[] mRetiredUntil = new long[256];
+    private final java.util.function.LongSupplier mClock;
+    private int mNext = 1;
 
-    private int mToken = NONE;
-    private int mMessageRef = NONE;
-    private int mRpMr = NONE;
+    public PendingMoSms() {
+        this(() -> System.nanoTime() / 1_000_000L);
+    }
 
-    /**
-     * Starts tracking a send. Returns the token it supersedes without an
-     * outcome, or -1 (only one send is tracked).
-     */
-    public synchronized int begin(int token, int messageRef, int rpMr) {
-        int superseded = mToken;
-        mToken = token;
-        mMessageRef = messageRef;
-        mRpMr = rpMr;
-        return superseded;
+    PendingMoSms(java.util.function.LongSupplier clock) {
+        mClock = clock;
+    }
+
+    /** Returns an unused RP-MR in 1..255, or -1 without disturbing any pending send. */
+    public synchronized int begin(int token, int messageRef) {
+        if (isPending(token)) return -1;
+        long now = mClock.getAsLong();
+        for (int n = 0; n < 255; n++) {
+            int rpMr = mNext;
+            mNext = mNext == 255 ? 1 : mNext + 1;
+            if (!mPending.containsKey(rpMr) && now >= mRetiredUntil[rpMr]) {
+                mPending.put(rpMr, new Outcome(token, messageRef, null, 0, null));
+                return rpMr;
+            }
+        }
+        return -1;
     }
 
     public synchronized boolean isPending(int token) {
-        return mToken != NONE && mToken == token;
+        return rpMrFor(token) != -1;
     }
 
-    /** RP-ACK: the SMSC stored the message. */
     public synchronized Outcome onRpAck(int rpMr) {
-        String why = mismatch("RP-ACK", rpMr);
-        if (why != null) return Outcome.ignored(why);
-        return complete(RpErrorPolicy.Status.OK, 0);
+        return complete(rpMr, RpErrorPolicy.Status.OK, 0);
     }
 
-    /** RP-ERROR: the SMSC did not store the message; the policy picks the status. */
     public synchronized Outcome onRpError(RpError error, RpErrorPolicy policy) {
-        String why = mismatch("RP-ERROR", error.rpMr);
-        if (why != null) return Outcome.ignored(why);
-        RpErrorPolicy.Status status = mRpMr == NONE
-                ? RpErrorPolicy.Status.ERROR : policy.statusFor(error.cause);
-        return complete(status, error.cause);
+        return complete(error.rpMr, policy.statusFor(error.cause), error.cause);
     }
 
-    /** A SIP final failure for the MESSAGE (no RP outcome). */
-    public synchronized Outcome onSipFailure(int sipStatus) {
-        if (mToken == NONE) return Outcome.ignored("SIP failure with no pending MO");
-        return complete(RpErrorPolicy.Status.ERROR, sipStatus);
+    public synchronized Outcome onSipFailure(int rpMr, int sipStatus) {
+        return complete(rpMr, RpErrorPolicy.Status.ERROR, sipStatus);
     }
 
-    /** No RP outcome in time after the SIP 2xx: optimistic success, if still pending. */
-    public synchronized Outcome onTimeout(int token) {
-        if (mToken == NONE || mToken != token) {
-            return Outcome.ignored("timeout of token " + token + " already completed");
+    public synchronized Outcome onTimeout(int token, int rpMr) {
+        Outcome pending = mPending.get(rpMr);
+        if (pending == null || pending.token != token) {
+            return Outcome.ignored("timeout of completed token=" + token + " RP-MR=" + rpMr);
         }
-        return complete(RpErrorPolicy.Status.OK, 0);
+        return complete(rpMr, RpErrorPolicy.Status.OK, 0);
     }
 
-    /** The MESSAGE could not be queued. */
     public synchronized Outcome onNotSent(int token) {
-        if (mToken != token) return Outcome.ignored("token " + token + " not pending");
-        return complete(RpErrorPolicy.Status.ERROR, 0);
+        return complete(rpMrFor(token), RpErrorPolicy.Status.ERROR, 0);
     }
 
-    private String mismatch(String what, int rpMr) {
-        if (mToken == NONE) {
-            return what + " RP-MR=" + rpMr + " with no pending MO (already completed?)";
+    private int rpMrFor(int token) {
+        for (java.util.Map.Entry<Integer, Outcome> entry : mPending.entrySet()) {
+            if (entry.getValue().token == token) return entry.getKey();
         }
-        if (mRpMr != NONE && rpMr != mRpMr) {
-            return what + " RP-MR=" + rpMr + " != pending " + mRpMr;
-        }
-        return null;
+        return -1;
     }
 
-    private Outcome complete(RpErrorPolicy.Status status, int networkCode) {
-        Outcome o = new Outcome(mToken, mMessageRef, status, networkCode, null);
-        mToken = NONE;
-        mMessageRef = NONE;
-        mRpMr = NONE;
-        return o;
+    private Outcome complete(int rpMr, RpErrorPolicy.Status status, int code) {
+        Outcome pending = mPending.remove(rpMr);
+        if (pending == null) return Outcome.ignored("RP-MR=" + rpMr + " has no pending MO");
+        mRetiredUntil[rpMr] = mClock.getAsLong() + RETIRE_MS;
+        return new Outcome(pending.token, pending.messageRef, status, code, null);
     }
 }
